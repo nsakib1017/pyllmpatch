@@ -1,0 +1,12 @@
+# Core SDKs
+openai
+google-genai
+
+# Optional (recommended for local dev)
+python-dotenv
+tiktoken
+
+seaborn
+matplotlib
+pandas
+numpy

@@ -1,0 +1,472 @@
+--- samples/original_bytecode_disassembled.txt
++++ samples/patch_bytecode_disassembled.txt
+@@ -495,2 +492,2 @@
+-58 POP_JUMP_IF_FALSE 70 (to 70)
+
++58 POP_JUMP_IF_FALSE 72 (to 72)
+
+@@ -501,2 +498,2 @@
+-68 JUMP_FORWARD 60 (to 130)
+
++68 JUMP_FORWARD 282 (to 354)
+
+@@ -512 +509 @@
+-86 FOR_ITER 38 (to 126)
+
++86 FOR_ITER 38 (to 128)
+
+@@ -519,2 +516,2 @@
+-98 POP_JUMP_IF_TRUE 86 (to 86)
+
++98 POP_JUMP_IF_TRUE 88 (to 88)
+
+@@ -534,2 +531,2 @@
+-124 JUMP_ABSOLUTE 86 (to 86)
+
++124 JUMP_ABSOLUTE 88 (to 88)
+
+@@ -537,0 +535,28 @@
++130 LOAD_FAST 0 (self)
+
++132 LOAD_ATTR 12 (eq)
+
++134 LOAD_METHOD 13 (empty)
+
++136 CALL_METHOD 0 (0 positional arguments)
+
++138 POP_JUMP_IF_FALSE 344 (to 344)
+
++140 LOAD_GLOBAL 5 (time)
+
++142 LOAD_METHOD 6 (sleep)
+
++144 LOAD_CONST 5 (1)
+
++146 CALL_METHOD 1 (1 positional argument)
+
++148 POP_TOP
+
++150 SETUP_FINALLY 138 (to 294)
+
++152 LOAD_FAST 0 (self)
+
++154 LOAD_ATTR 1 (mq)
+
++156 LOAD_METHOD 2 (full)
+
++158 CALL_METHOD 0 (0 positional arguments)
+
++160 POP_JUMP_IF_TRUE 210 (to 210)
+
++162 LOAD_FAST 0 (self)
+
++164 LOAD_METHOD 14 (get_black_box)
+
++166 CALL_METHOD 0 (0 positional arguments)
+
++168 STORE_FAST 3 (blackbox)
+
++170 LOAD_FAST 3 (blackbox)
+
++172 POP_JUMP_IF_FALSE 210 (to 210)
+
+@@ -539,7 +564,17 @@
+-130 LOAD_FAST 0 (self)
+
++174 LOAD_FAST 0 (self)
+
+-132 LOAD_ATTR 9 (page)
+
++176 LOAD_ATTR 1 (mq)
+
+-134 LOAD_METHOD 10 (get)
+
++178 LOAD_METHOD 15 (put_nowait)
+
+-136 LOAD_FAST 0 (self)
+
++180 LOAD_FAST 3 (blackbox)
+
+-138 LOAD_ATTR 11 (bp_link)
+
++182 CALL_METHOD 1 (1 positional argument)
+
+-140 CALL_METHOD 1 (1 positional argument)
+
++184 POP_TOP
+
+-142 POP_TOP
+
++# Line 95
+
++186 LOAD_GLOBAL 8 (print)
+
++188 LOAD_CONST 6 (u'\uBlackBox, {}')
+
++190 LOAD_METHOD 16 (format)
+
++192 LOAD_FAST 0 (self)
+
++194 LOAD_ATTR 1 (mq)
+
++196 LOAD_METHOD 17 (qsize)
+
++198 CALL_METHOD 0 (0 positional arguments)
+
++200 CALL_METHOD 1 (1 positional argument)
+
++202 CALL_FUNCTION 1 (1 positional argument)
+
++204 POP_TOP
+
+@@ -547,38 +581,0 @@
+-144 LOAD_FAST 0 (self)
+
+-146 LOAD_ATTR 12 (eq)
+
+-148 LOAD_METHOD 13 (empty)
+
+-150 CALL_METHOD 0 (0 positional arguments)
+
+-152 POP_JUMP_IF_FALSE 356 (to 356)
+
+-154 LOAD_GLOBAL 5 (time)
+
+-156 LOAD_METHOD 6 (sleep)
+
+-158 LOAD_CONST 5 (1)
+
+-160 CALL_METHOD 1 (1 positional argument)
+
+-162 POP_TOP
+
+-164 SETUP_FINALLY 138 (to 306)
+
+-166 LOAD_FAST 0 (self)
+
+-168 LOAD_ATTR 1 (mq)
+
+-170 LOAD_METHOD 2 (full)
+
+-172 CALL_METHOD 0 (0 positional arguments)
+
+-174 POP_JUMP_IF_TRUE 222 (to 222)
+
+-176 LOAD_FAST 0 (self)
+
+-178 LOAD_METHOD 14 (get_black_box)
+
+-180 CALL_METHOD 0 (0 positional arguments)
+
+-182 STORE_FAST 3 (blackbox)
+
+-184 LOAD_FAST 3 (blackbox)
+
+-186 POP_JUMP_IF_FALSE 222 (to 222)
+
+-188 LOAD_FAST 0 (self)
+
+-190 LOAD_ATTR 1 (mq)
+
+-192 LOAD_METHOD 15 (put_nowait)
+
+-194 LOAD_FAST 3 (blackbox)
+
+-196 CALL_METHOD 1 (1 positional argument)
+
+-198 POP_TOP
+
+-200 LOAD_GLOBAL 8 (print)
+
+-202 LOAD_CONST 6 (u'\uBlackBox, {}')
+
+-204 LOAD_METHOD 16 (format)
+
+@@ -587 +584 @@
+-210 LOAD_METHOD 17 (qsize)
+
++210 LOAD_METHOD 2 (full)
+
+@@ -589,10 +586,10 @@
+-214 CALL_METHOD 1 (1 positional argument)
+
++214 POP_JUMP_IF_FALSE 260 (to 260)
+
+-216 CALL_FUNCTION 1 (1 positional argument)
+
++# Line 97
+
+-218 POP_TOP
+
++216 LOAD_FAST 0 (self)
+
+-# Line 104
+
++218 LOAD_ATTR 1 (mq)
+
+-220 LOAD_FAST 0 (self)
+
++220 LOAD_METHOD 17 (qsize)
+
+-222 LOAD_ATTR 1 (mq)
+
++222 CALL_METHOD 0 (0 positional arguments)
+
+-224 LOAD_METHOD 2 (full)
+
++224 LOAD_CONST 7 (50)
+
+-226 CALL_METHOD 0 (0 positional arguments)
+
++226 COMPARE_OP 4 (>)
+
+-228 POP_JUMP_IF_FALSE 272 (to 272)
+
++228 POP_JUMP_IF_FALSE 250 (to 250)
+
+@@ -601 +598 @@
+-234 LOAD_METHOD 17 (qsize)
+
++234 LOAD_METHOD 18 (get_nowait)
+
+@@ -603,16 +600,62 @@
+-238 LOAD_CONST 7 (50)
+
++238 POP_TOP
+
+-240 COMPARE_OP 4 (>)
+
++240 JUMP_ABSOLUTE 222 (to 222)
+
+-242 POP_JUMP_IF_FALSE 262 (to 262)
+
++# Line 99
+
+-# Line 106
+
++242 LOAD_GLOBAL 5 (time)
+
+-244 LOAD_FAST 0 (self)
+
++244 LOAD_METHOD 6 (sleep)
+
+-246 LOAD_ATTR 1 (mq)
+
++246 LOAD_CONST 5 (1)
+
+-248 LOAD_METHOD 18 (get_nowait)
+
++248 CALL_METHOD 1 (1 positional argument)
+
+-250 CALL_METHOD 0 (0 positional arguments)
+
++250 POP_TOP
+
+-252 POP_TOP
+
++# Line 100
+
+-254 JUMP_ABSOLUTE 234 (to 234)
+
++252 LOAD_FAST 0 (self)
+
+-# Line 107
+
++254 LOAD_ATTR 1 (mq)
+
+-256 LOAD_GLOBAL 5 (time)
+
++256 LOAD_METHOD 2 (full)
+
+-258 LOAD_METHOD 6 (sleep)
+
++258 CALL_METHOD 0 (0 positional arguments)
+
+-260 LOAD_CONST 5 (1)
+
++260 POP_JUMP_IF_FALSE 290 (to 290)
+
+-262 CALL_METHOD 1 (1 positional argument)
+
++# Line 101
+
+-264 POP_TOP
+
++262 LOAD_GLOBAL 8 (print)
+
++264 LOAD_CONST 8 (u'\u')
+
++266 CALL_FUNCTION 1 (1 positional argument)
+
++268 POP_TOP
+
++270 LOAD_FAST 0 (self)
+
++272 LOAD_ATTR 1 (mq)
+
++274 LOAD_METHOD 18 (get_nowait)
+
++276 CALL_METHOD 0 (0 positional arguments)
+
++278 POP_TOP
+
++280 POP_BLOCK
+
++282 JUMP_ABSOLUTE 132 (to 132)
+
++284 DUP_TOP
+
++286 LOAD_GLOBAL 19 (Exception)
+
++288 JUMP_IF_NOT_EXC_MATCH 340 (to 340)
+
++290 POP_TOP
+
++292 STORE_FAST 4 (e)
+
++294 POP_TOP
+
++296 SETUP_FINALLY 22 (to 332)
+
++298 LOAD_GLOBAL 8 (print)
+
++300 LOAD_FAST 4 (e)
+
++302 LOAD_ATTR 20 (args)
+
++304 CALL_FUNCTION 1 (1 positional argument)
+
++306 POP_TOP
+
++308 POP_BLOCK
+
++310 POP_EXCEPT
+
++312 LOAD_CONST 0 (None)
+
++314 STORE_FAST 4 (e)
+
++316 DELETE_FAST 4 (e)
+
++318 JUMP_ABSOLUTE 132 (to 132)
+
++320 LOAD_CONST 0 (None)
+
++322 STORE_FAST 4 (e)
+
++324 DELETE_FAST 4 (e)
+
++326 RERAISE
+
++328 RERAISE
+
++330 JUMP_ABSOLUTE 132 (to 132)
+
++332 LOAD_FAST 0 (self)
+
++334 LOAD_ATTR 9 (page)
+
++336 LOAD_METHOD 21 (close)
+
++338 CALL_METHOD 0 (0 positional arguments)
+
++340 POP_TOP
+
++342 LOAD_CONST 0 (None)
+
++344 RETURN_VALUE
+
+@@ -620,54 +662,0 @@
+-266 LOAD_FAST 0 (self)
+
+-268 LOAD_ATTR 1 (mq)
+
+-270 LOAD_METHOD 2 (full)
+
+-272 CALL_METHOD 0 (0 positional arguments)
+
+-274 POP_JUMP_IF_FALSE 302 (to 302)
+
+-276 LOAD_GLOBAL 8 (print)
+
+-278 LOAD_CONST 8 (u'\u')
+
+-280 CALL_FUNCTION 1 (1 positional argument)
+
+-282 POP_TOP
+
+-284 LOAD_FAST 0 (self)
+
+-286 LOAD_ATTR 1 (mq)
+
+-288 LOAD_METHOD 18 (get_nowait)
+
+-290 CALL_METHOD 0 (0 positional arguments)
+
+-292 POP_TOP
+
+-294 POP_BLOCK
+
+-296 JUMP_ABSOLUTE 144 (to 144)
+
+-298 DUP_TOP
+
+-300 LOAD_GLOBAL 19 (Exception)
+
+-302 JUMP_IF_NOT_EXC_MATCH 352 (to 352)
+
+-304 POP_TOP
+
+-306 STORE_FAST 4 (e)
+
+-308 POP_TOP
+
+-310 SETUP_FINALLY 22 (to 344)
+
+-312 LOAD_GLOBAL 8 (print)
+
+-314 LOAD_FAST 4 (e)
+
+-316 LOAD_ATTR 20 (args)
+
+-318 CALL_FUNCTION 1 (1 positional argument)
+
+-320 POP_TOP
+
+-322 POP_BLOCK
+
+-324 POP_EXCEPT
+
+-326 LOAD_CONST 0 (None)
+
+-328 STORE_FAST 4 (e)
+
+-330 DELETE_FAST 4 (e)
+
+-332 JUMP_ABSOLUTE 144 (to 144)
+
+-334 LOAD_CONST 0 (None)
+
+-336 STORE_FAST 4 (e)
+
+-338 DELETE_FAST 4 (e)
+
+-340 RERAISE
+
+-342 RERAISE
+
+-344 JUMP_ABSOLUTE 144 (to 144)
+
+-346 LOAD_FAST 0 (self)
+
+-348 LOAD_ATTR 9 (page)
+
+-350 LOAD_METHOD 21 (close)
+
+-352 CALL_METHOD 0 (0 positional arguments)
+
+-354 POP_TOP
+
+-356 LOAD_CONST 0 (None)
+
+-358 RETURN_VALUE

@@ -1,0 +1,8 @@
+.pyllmpatch/
+.python-version
+.vscode/
+*/__pycache__/
+__pycache__/
+dataset/
+.env
+results/
