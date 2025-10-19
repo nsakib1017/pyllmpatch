@@ -6,16 +6,13 @@ import seaborn as sns
 import os
 import re
 
-import sys
-import difflib  # >>> NEW
-import json     # >>> NEW
-import time     # >>> NEW
-import uuid     # >>> NEW
-from datetime import datetime, timezone  # >>> NEW
+import difflib  
+import json     
+import time     
+import uuid     
+from datetime import datetime, timezone  
 
-from typing import List, Tuple, Optional, Dict, Any  # >>> NEW
-
-import shutil
+from typing import List, Tuple, Optional, Dict, Any  
 
 from utils.token_helpers import *
 from utils.providers import *
@@ -24,8 +21,6 @@ from utils.file_helpers import *
 from utils.generate_bytecode import *
 
 from dotenv import load_dotenv
-import os
-
 load_dotenv()
 
 def read_csv_file(file_name: str) -> pd.DataFrame:
@@ -37,10 +32,6 @@ def read_csv_file(file_name: str) -> pd.DataFrame:
     return df
 
 def prepare_snippets_for_repair(previous_run_log_path: str = ""):
-    # if not previous_run_log_path:
-    #     return read_csv_file('./dataset/balanced_sample.csv')  
-    # Read prior runs (JSON lines) and current dataset (CSV)
-
     if not previous_run_log_path:
         return read_csv_file('./dataset/balanced_sample.csv')
     df_previous_log = pd.read_json(previous_run_log_path, lines=True)
@@ -54,8 +45,6 @@ def prepare_snippets_for_repair(previous_run_log_path: str = ""):
         .drop_duplicates()
     )
     df_balanced['file_hash'] = df_balanced['file_hash'].astype(str)
-
-    # Anti-join: keep rows in df_balanced whose file_hash is NOT in previous
     mask = ~df_balanced['file_hash'].isin(set(prev_hashes))
     return df_balanced.loc[mask].copy()
 
@@ -67,54 +56,32 @@ def get_error_word_message_from_content(filepath):
     SORRY_LINE_RE = re.compile(r'^\s*Sorry:\s*(\w+(?:Error|Exception))\s*:\s*(.*?)\s*\(([^,]+),\s*line\s*(\d+)\)\s*$')
     error_word = []
     messages = []
-    # last_file = None
-    # last_line = None
-    # last_ctx = None
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             s = line.rstrip("\n")
             m_file = FILE_LINE_RE.match(s)
             if m_file:
-                # last_file = m_file.group(1)
-                # try:
-                #     last_line = int(m_file.group(2))
-                # except ValueError:
-                #     last_line = None
-                # last_ctx = m_file.group(3)
                 continue
             m_err = ERROR_LINE_RE.match(s)
             if m_err:
                 error_word.append(m_err.group(1))
                 messages.append((m_err.group(2) or "").strip())
-                # last_file = None
-                # last_line = None
-                # last_ctx = None
                 break
-            # 1) Handle 'Sorry:' one-liners immediately
             m_sorry = SORRY_LINE_RE.match(line)
             if m_sorry:
                 error_word.append(m_sorry.group(1))
                 messages.append((m_sorry.group(2) or "").strip())
-                # last_file = None
-                # last_line = None
-                # last_ctx = None
                 break
             
     error_word = error_word[0] if len(error_word) > 0 else None
     message = messages[0] if len(messages) > 0 else None
-    # print(f"File: {filepath}, Error Word: {error_word}, Message: {message}")
+
     return error_word, message
 
 
 def strip_code_fences(text: str) -> str:
-    # Fences can be ``` or ~~~. Language tag (if any) is anything until the first newline.
     fence = r"(?:```|~~~)"
-    lang_until_eol = r"[^\r\n]*"  # more permissive language tag
-
-    # 1) Remove any well-formed fenced blocks, keeping just their bodies.
-    #    Opening:  fence [spaces] [language-or-empty] [spaces] [optional newline]
-    #    Body:     anything, non-greedy
-    #    Closing:  optional leading newline, same fence, optional trailing spaces
+    lang_until_eol = r"[^\r\n]*"  
     paired_re = re.compile(
         rf"(?P<f>{fence})[ \t]*{lang_until_eol}[ \t]*(?:\r?\n)?"
         rf"(?P<body>.*?)"
@@ -122,16 +89,11 @@ def strip_code_fences(text: str) -> str:
         re.DOTALL,
     )
     text = paired_re.sub(lambda m: m.group("body"), text)
-
-    # 2) Strip a lone opening fence at the very start (optional BOM),
-    #    with optional language and optional newline.
     leading_open_re = re.compile(
         rf"^\ufeff?(?:{fence})[ \t]*{lang_until_eol}[ \t]*(?:\r?\n)?",
         re.DOTALL,
     )
     text = leading_open_re.sub("", text, count=1)
-
-    # 3) Strip a lone closing fence at the very end, allowing an optional leading newline.
     trailing_close_re = re.compile(
         rf"(?:\r?\n)?(?:{fence})[ \t]*\Z",
         re.DOTALL,
@@ -142,7 +104,6 @@ def strip_code_fences(text: str) -> str:
 
 
 
-# >>> NEW: simple helpers for logging/metrics
 def _count_fences(text: str) -> int:
     return len(re.findall(r"(?:```|~~~)[^\n]*\n.*?(?:```|~~~)", text, flags=re.DOTALL))
 
@@ -175,7 +136,6 @@ def process_file_in_single_run(content: str, model: dict, error: str, previous_e
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": get_user_prompt(content, error)}
     ]
-    # >>> NEW: measure latency & tokens
     # print(prompt[1]["content"])
     t0 = time.perf_counter()
     llm_raw = make_llm_call(prompt, model=model['name'], provider=model['provider'])
@@ -295,11 +255,8 @@ def clean_error_message(error_message):
     import re
     if not error_message:
         return None
-    # Convert to lowercase
     cleaned_message = error_message.lower()
-    # Remove leading and trailing whitespace
     cleaned_message = cleaned_message.strip()
-    # Remove contents inside parentheses (including parentheses)
     cleaned_message = re.sub(r'\(.*?\)', '', cleaned_message)
     cleaned_message = cleaned_message.strip()
     return cleaned_message
@@ -314,7 +271,7 @@ def compile_new_pyc(py_file_content, py_file_dir, out_file_base_dir, version=Non
         return {"is_compiled": False, "error_description": str(e)}
 
 
-# >>> NEW: append one JSON object per line
+
 def _append_log(path: Path, record: Dict[str, Any]) -> None:
     try:
         with open(path, "a", encoding="utf-8") as f:
@@ -354,11 +311,9 @@ if __name__ == "__main__":
     df_syntax_error_balanced = df_syntax_error_balanced.sample(frac=1, random_state=42).reset_index(drop=True)  # shuffle
     # df_syntax_error_balanced = df_syntax_error_balanced.head(50) 
     print('DataFrame shape:', df_syntax_error_balanced.shape)
-    # >>> NEW: batch context
     run_id = uuid.uuid4().hex
     batch_start_ts = _now_iso()
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") 
-    # >>> NEW: where to store run logs
     LOG_BASE = Path(f"results/experiment_outputs/{ts}/{run_id}")
 
     if not LOG_BASE.exists():
@@ -388,10 +343,9 @@ if __name__ == "__main__":
         compilation_result = None
 
         max_retries = int(os.getenv("NO_OF_MAX_RETRIES")) if os.getenv("NO_OF_MAX_RETRIES") else 0  # max attempts to recompile
-        total_attempts_completed = 0  # >>> NEW
+        total_attempts_completed = 0  
         error_list = []
 
-        # >>> NEW: per-file log scaffold
         log_rec: Dict[str, Any] = {
             "run_id": run_id,
             "timestamp": _now_iso(),
@@ -418,7 +372,7 @@ if __name__ == "__main__":
             if not AFFECTED_FILE_PATH.exists():
                 AFFECTED_FILE_PATH.mkdir(parents=True, exist_ok=True)
             
-            final_code, llm_metrics = processed  # >>> NEW
+            final_code, llm_metrics = processed  
 
             # compile with timing
             t0 = time.perf_counter()
@@ -443,8 +397,6 @@ if __name__ == "__main__":
             total_attempts_completed += 1
             max_retries -= 1
 
-
-            # >>> NEW: update log after each attempt (last write wins)
             log_rec.update({
                 "fits_single_run": llm_metrics.get("fits_single_run"),
                 "chunk_count": llm_metrics.get("chunk_count"),
