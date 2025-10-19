@@ -178,7 +178,7 @@ def process_file_in_single_run(content: str, model: dict, error: str, previous_e
     # >>> NEW: measure latency & tokens
     # print(prompt[1]["content"])
     t0 = time.perf_counter()
-    llm_raw = asyncio.run(make_llm_call(prompt, model=model['name'], provider=model['provider']))
+    llm_raw = make_llm_call(prompt, model=model['name'], provider=model['provider'])
     # print(llm_raw)
     llm_elapsed_ms = int((time.perf_counter() - t0) * 1000)
     try:
@@ -228,7 +228,7 @@ def process_and_merge_chunks(chunks: List[str], model: dict, error, previous_err
         ]
         # print(prompt[1]["content"])
         t0 = time.perf_counter()
-        llm_response = asyncio.run(make_llm_call(prompt, model=model['name'], provider=model['provider']))
+        llm_response = make_llm_call(prompt, model=model['name'], provider=model['provider'])
         total_latency_ms += int((time.perf_counter() - t0) * 1000)
         llm_calls += 1
         llm_usage = llm_response.get('usage', {}) if llm_response else {}
@@ -266,27 +266,10 @@ def process_and_merge_chunks(chunks: List[str], model: dict, error, previous_err
 
 def process_file_for_syntax_error_patching(content: str, error_description, error_list, log_rec, llm=LLM_MODELS[4]) -> Optional[Tuple[str, Dict[str, Any]]]:
     log_rec.update({"provider": llm["provider"], "model_name": llm["name"]})
+    
     if content is not None:
-        system_message = {
-        "role": "system",
-        "content": """
-        You are a Python assistant focused on suggesting strategies to fix syntax errors in Python code. For each error provided, you should suggest a **single paragraph** that explains how to fix the issue and prevent similar errors. The paragraph should include:
-        1. A clear explanation of the cause of the error.
-        2. Actionable strategies for fixing the error in the code.
-        3. Brief suggestions on how to avoid this error in the future through code practices or preventive strategies.
-        Please do not provide code snippets, just the strategies and explanations in paragraph form.
-        """}
-        
-        previous_error_summary_prompt = generate_summary_prompt(error_list)
-        prompt_for_summary = [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": previous_error_summary_prompt}
-        ]
-
         does_not_fit_model = check_context_windows(content, error_description, llm)
         if not does_not_fit_model:
-            # previous_error_summary_prompt_resp = asyncio.run(make_llm_call(prompt_for_summary, model=LLM_MODELS[5]['name'], provider=LLM_MODELS[5]['provider']))
-            # previous_error_summary_prompt_raw = previous_error_summary_prompt_resp.get('content', {}) if previous_error_summary_prompt else ""
             final_code, metrics = process_file_in_single_run(content, llm, error_description)
         else:
             chunks = chunk_top_level_objects_lenient_merged(
@@ -298,8 +281,6 @@ def process_file_for_syntax_error_patching(content: str, error_description, erro
             for chunk in chunks:
                 if _count_tokens_safe(chunk) > llm['token_for_completion'] - 5000:
                     return None
-            # previous_error_summary_prompt_resp = asyncio.run(make_llm_call(prompt_for_summary, model=LLM_MODELS[5]['name'], provider=LLM_MODELS[5]['provider']))
-            # previous_error_summary_prompt_raw = previous_error_summary_prompt_resp.get('content', {}) if previous_error_summary_prompt else ""
             final_code, metrics = process_and_merge_chunks(chunks, llm, error_description)
         return final_code, metrics
     else:
@@ -406,7 +387,7 @@ if __name__ == "__main__":
         error_word = row.get("syntactic_error_word")
         compilation_result = None
 
-        max_retries = os.getenv("NO_OF_MAX_RETRIES") if os.getenv("MAX_RETRIES") else 0  # max attempts to recompile
+        max_retries = int(os.getenv("NO_OF_MAX_RETRIES")) if os.getenv("NO_OF_MAX_RETRIES") else 0  # max attempts to recompile
         total_attempts_completed = 0  # >>> NEW
         error_list = []
 
