@@ -23,7 +23,10 @@ from utils.chunk_helpers import *
 from utils.file_helpers import *
 from utils.generate_bytecode import *
 
+from dotenv import load_dotenv
+import os
 
+load_dotenv()
 
 def read_csv_file(file_name: str) -> pd.DataFrame:
     script_dir = Path(__file__).parent
@@ -403,7 +406,7 @@ if __name__ == "__main__":
         error_word = row.get("syntactic_error_word")
         compilation_result = None
 
-        max_retries = 7  # max attempts to recompile
+        max_retries = os.getenv("NO_OF_MAX_RETRIES") if os.getenv("MAX_RETRIES") else 0  # max attempts to recompile
         total_attempts_completed = 0  # >>> NEW
         error_list = []
 
