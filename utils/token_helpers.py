@@ -1,41 +1,6 @@
 import tiktoken
 from .providers import LLM_MODELS
 
-
-SUMMARY_PROMPT = """
-
-Objective:
-You are tasked with analyzing a list of errors from a Python file. Your goal is to summarize the errors and devise general strategies that can be applied to fix the issues and avoid similar errors in the future.
-
-Instructions:
-1. Error Summary:
-    -Review the provided errors and generate a concise summary of the most common issues in the list.
-    -For each error, identify the error type (e.g., syntax, runtime, logical, etc.) and the underlying cause of the error (e.g., incorrect indentation, undefined variables, incompatible types).
-2. Categorize Errors:
-    -Identify recurring patterns across the errors (e.g., repeated NameError, multiple TypeError, etc.).
-3. General Strategies for Fixing Errors:
-    -Based on the identified patterns, propose general strategies to fix each category of errors (not just for the specific errors provided, but for other potential errors of the same type).
-    -Suggest practices, or techniques that could be implemented to address these errors across the codebase (e.g., using linters, adopting type hinting, improving error handling, etc.).
-    -Include preventive strategies to avoid similar errors in the future, such as better coding practices or automation tools.
-4. Focus on Actionable Solutions:
-    -For each errors, describe practical steps that can be taken to patch this errors (e.g., consistent code style, automated tests, type checking).
-    -Highlight any tools or libraries that could help catch these errors early (e.g., flake8, mypy, pytest).
-""".strip()
-
-
-def generate_summary_prompt(errors_list: list) -> str:
-    # Convert the errors list to a string format
-    errors_str = "\n".join([f"Error {i+1}:\n{error}" for i, error in enumerate(errors_list)])
-
-    # Create the prompt template
-    prompt = f"""
-    **Errors:**
-    {errors_str}
-    """
-
-    return prompt
-
-
 # SYSTEM_PROMPT = """
 # ROLE
 # You are an automated Python syntax repair agent. Your only job is to fix syntax errors in a provided code snippet, one previously identified syntax error has been provided for you and there can be multiple other syntax errors.
@@ -72,50 +37,6 @@ def generate_summary_prompt(errors_list: list) -> str:
 # - If the snippet does not contain ANY syntax errors, then return the snippet in it's entirity without any changes.
 # """.strip()
 
-SYSTEM_PROMPT = """
-You are an expert Python programmer and code repair specialist. Your task is to analyze Python code snippets that may contain syntax errors and provide corrected versions of the code with minimal changes. You must ensure that the corrected code is syntactically valid and adheres to best practices in Python programming.
-""".strip()
-
-
-def get_previous_attempt_result(previuos_response: str, previous_error) -> str:
-    return (
-        "Additionally, as there has been a previous repair attempt, the response and the result from the attempt will be provided to help guide your current attempt.\n\n"
-        
-        "## The resulting response of the previous repair attempt was:  ##\n\n"
-        f"{previuos_response}\n\n "
-        "## And the compilation error encountered was:  ##\n"
-        f"{previous_error}\n\n"
-
-        "Keeping in mind the initial code snippet provided initially and the code snippet from previuos response and the compilation error resulting from the previous response, make a new attempt to fix the initial snippet, ensuring your response only modifies the erroring lines while keeping the rest of the program the same.\n"
-        "You are required to make the absolute minimum edit required to fix the errors within the snippet and then use the original code provided as reference to keep the error free lines unchanged and return the compilable error free python program.\n"
-    )
-
-
-def get_user_prompt(code_snippet: str, error_message: str, retry_attempt=False, previuos_response="", previous_error="") -> str:
-    return (
-        "Analyze the initial code Snippet below for possible Python syntax errors.\n"
-        "It is highly important that you find and fix every syntax error present in the snippet. \n"
-        "Apply the modifications required to fix the errors within the snippet.\n"
-
-        "## Initial Error Message was:  ##\n"
-        f"{error_message}\n\n"
-        "## Initial Code Snippet was:   ##\n"
-        f"{code_snippet}\n\n"
-        
-        "Do not add any  thinking or reasoning steps, just output the corrected code, modified only where syntax errors were identified.\n"
-        "Do not add any ```markdown```, ``python ```, ``` ```, or other formatting wrappers.\n"
-        "If no error is not present in the snippet or cannot be fixed within it, return the snippet unchanged.\n"
-        "Return only the complete, corrected code snippet (no explanations, no markdown, no extra text).\n"
-        "The error message from the initial compilation effort is provided for your reference.\n\n"
-
-        + (get_previous_attempt_result(previuos_response, previous_error) if retry_attempt else "") +  
-        
-        "Find and fix all syntax errors you can identify in the initial snippet, make the absolutely necessary modifications to ensure the code is syntactically correct and compilable.\n"
-        "Your final output must be compilable, free from all sorts of syntax errors and must be as close to the original snippet as possible (i.e., without unnecessary deletions, additions or modifications of error free lines) and with only the necessary changes made to fix the syntax errors.\n"        
-
-    )
-
-
 
 # def get_user_prompt(code_snippet: str, error_message: str, previous_error_summary_prompt="") -> str:
 #     return (
@@ -141,6 +62,97 @@ def get_user_prompt(code_snippet: str, error_message: str, retry_attempt=False, 
 #         "Error Patch Strategy:\n"
 #         f"{previous_error_summary_prompt}"
 #     )
+
+
+SYSTEM_PROMPT = """
+You are an expert Python programmer and code repair specialist. Your task is to analyze Python code snippets that may contain syntax errors and provide corrected versions of the code with minimal changes. You must ensure that the corrected code is syntactically valid and adheres to best practices in Python programming.
+""".strip()
+
+
+def get_previous_attempt_result(previuos_response: str, previous_error) -> str:
+    return (
+        "Additionally, as there has been a previous repair attempt, the response and the result from the attempt will be provided to help guide your current attempt.\n\n"
+        
+        "## The resulting response of the previous repair attempt was:  ##\n\n"
+        f"{previuos_response}\n\n "
+        "## And the compilation error encountered was:  ##\n"
+        f"{previous_error}\n\n"
+
+        "Keeping in mind the initial code snippet provided and the code snippet from previuos response along with the compilation error resulting from the previous response, make a new attempt to fix the initial snippet, ensuring your response only modifies the erroring lines while keeping the rest of the program the same.\n"
+        "You are required to make the absolute minimum edit required to fix the errors within the snippet and then use the original code provided as reference to keep the error free lines unchanged and return the compilable error free python program.\n"
+    )
+
+def get_previous_attempt_result_chunk(previuos_response: str, previous_error) -> str:
+    return (
+        "Additionally, as there has been a previous repair attempt by merging the chunks, the response and the result from the attempt will be provided to help guide your current attempt.\n\n"
+        
+        "## The resulting response of the previous repair attempt was:  ##\n\n"
+        f"{previuos_response}\n\n "
+        "## And the compilation error encountered was:  ##\n"
+        f"{previous_error}\n\n"
+
+        "Keeping in mind the initial code chunk provided and the merged code from previuos responsess along with the compilation error resulting from the previous response, make a new attempt to fix the initial code chunk again, ensuring your response only modifies the erroring lines while keeping the rest of the program the same.\n"
+        "You are required to make the absolute minimum edit required to fix the errors within the snippet and then use the original code provided as reference to keep the error free lines unchanged and return the compilable error free python program.\n"
+    )
+
+
+def get_user_prompt(code_snippet: str, error_message: str, retry_attempt=False, previuos_response="", previous_error="") -> str:
+    return (
+        "Analyze the initial code Snippet below for possible Python syntax errors.\n"
+        "It is highly important that you find and fix every syntax error present in the snippet. \n"
+        "Apply the modifications required to fix the errors within the snippet.\n"
+        "You must ensure that the corrected snippet does not introduce any new syntax errors.\n"
+
+        "## Initial Error Message was:  ##\n"
+        f"{error_message}\n\n"
+        "## Initial Code Snippet was:   ##\n"
+        f"{code_snippet}\n\n"
+        
+        "Do not add any  thinking or reasoning steps, just output the corrected code, modified only where syntax errors were identified.\n"
+        "Do not add any ```markdown```, ``python ```, ``` ```, or other formatting wrappers.\n"
+        "If no error is not present in the snippet or cannot be fixed within it, return the snippet unchanged.\n"
+        "Return only the complete, corrected code snippet (no explanations, no markdown, no extra text).\n"
+        "The error message from the initial compilation effort is provided for your reference.\n\n"
+
+        + (get_previous_attempt_result(previuos_response, previous_error) if retry_attempt else "") +  
+        
+        "Find and fix all syntax errors you can identify in the initial snippet, make the absolutely necessary modifications to ensure the code is syntactically correct and compilable.\n"
+        "You will use the original code snippet provided as reference to keep the error free lines unchanged, so that the line differences are as minimal as possible.\n"
+        "Your final output must be compilable, free from all sorts of syntax errors and must be as close to the original snippet as possible (i.e., without unnecessary deletions, additions or modifications of error free lines) and with only the necessary changes made to fix the syntax errors.\n"        
+
+    )
+
+def get_user_prompt_chunk(chunk_snippet: str, error_message: str, retry_attempt=False, previuos_response="", previous_error="") -> str:
+    return (
+        "Following is a code chunk extracted from a larger Python file, with multiple syntax errors.\n"
+        "Analyze the initial code chunk below for possible Python syntax errors.\n"
+        "It is highly important that you find and fix every syntax error present in the chunk. \n"
+        "Apply the modifications required to fix the errors within the snippet.\n"
+        "It is important to note that this chunk is part of a larger file, so ensure that your corrections maintain the integrity of the code within this context.\n"
+        "The corrected chunk will be re-integrated into the larger file.\n"
+        "You must ensure that the corrected chunk does not introduce any new syntax errors when placed back into the larger file.\n"
+        "If there are dependencies or references to code outside this chunk that affect its syntax, you must still ensure that the chunk is syntactically correct on its own.\n"
+        "If there no syntax errors present in the chunk, return the chunk unchanged.\n"
+        "The initial error message may reference lines or context outside this chunk, so focus on identifying and fixing syntax errors that are present within the provided chunk itself.\n"
+        
+        "## Initial Error Message was:  ##\n"
+        f"{error_message}\n\n"
+        "## Initial Chunk Snippet was:   ##\n"
+        f"{chunk_snippet}\n\n"
+        
+        "Do not add any  thinking or reasoning steps, just output the corrected code, modified only where syntax errors were identified.\n"
+        "Do not add any ```markdown```, ``python ```, ``` ```, or other formatting wrappers.\n"
+        "If no error is not present in the code chunk or cannot be fixed within it, return the code chunk unchanged.\n"
+        "Return only the complete, corrected code chunk (no explanations, no markdown, no extra text).\n"
+        "The error message from the initial compilation effort is provided for your reference.\n\n"
+
+        + (get_previous_attempt_result_chunk(previuos_response, previous_error) if retry_attempt else "") +  
+        
+        "Find and fix all syntax errors you can identify in the initial code chunk, make the absolutely necessary modifications to ensure the code is syntactically correct and compilable.\n"
+        "You will use the original code chunk provided as reference to keep the error free lines unchanged, so that the line differences are as minimal as possible.\n"
+        "Your final output must be compilable, free from all sorts of syntax errors and must be as close to the original snippet as possible (i.e., without unnecessary deletions, additions or modifications of error free lines) and with only the necessary changes made to fix the syntax errors.\n"        
+
+    )
 
 # --- ANSI Color Codes for Terminal Output ---
 class Colors:
