@@ -128,13 +128,13 @@ def _now_iso() -> str:  # ISO8601 with timezone naive (UTC-like)
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
-def process_file_in_single_run(content: str, model: dict, error: str, previous_error_summary_prompt="") -> Tuple[str, Dict[str, Any]]:
+def process_file_in_single_run(content: str, model: dict, error: str, retry_attempt=False, previuos_response="", previous_error="") -> Tuple[str, Dict[str, Any]]:
     """Simulates processing a file that fits in the context window."""
     model_name = f"{model['provider']} - {model['name']}"
     print(f"{Colors.OKGREEN}    -> Content fits in a single run for {model_name}. Processing...{Colors.ENDC}")
     prompt = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": get_user_prompt(content, error)}
+        {"role": "user", "content": get_user_prompt(content, error, retry_attempt, previuos_response, previous_error)}
     ]
     # print(prompt[1]["content"])
     t0 = time.perf_counter()
@@ -164,7 +164,7 @@ def process_file_in_single_run(content: str, model: dict, error: str, previous_e
     return (llm_response if llm_response else content), metrics
 
 
-def process_and_merge_chunks(chunks: List[str], model: dict, error, previous_error_summary_prompt="") -> Tuple[str, Dict[str, Any]]:
+def process_and_merge_chunks(chunks: List[str], model: dict, error, retry_attempt=False, previuos_response="", previous_error="") -> Tuple[str, Dict[str, Any]]:
     """
     Simulates sending each chunk to an LLM and then merges the results back together.
     """
@@ -172,8 +172,6 @@ def process_and_merge_chunks(chunks: List[str], model: dict, error, previous_err
     print(f"   {Colors.OKCYAN} -> Processing and merging for {len(chunks)} chunks with {model_name}...{Colors.ENDC}")
     
     corrected_chunks = []
-    total_in = 0
-    total_out = 0
     total_latency_ms = 0
     max_chunk_tokens = 0
     llm_calls = 0
@@ -184,7 +182,7 @@ def process_and_merge_chunks(chunks: List[str], model: dict, error, previous_err
         print(f"        -> Processing chunk {i+1}/{len(chunks)} ({ctoks} tokens)...")
         prompt = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": get_user_prompt(chunk, error, previous_error_summary_prompt)}
+            {"role": "user", "content": get_user_prompt(chunk, error, retry_attempt, previuos_response, previous_error)}
         ]
         # print(prompt[1]["content"])
         t0 = time.perf_counter()
@@ -218,19 +216,17 @@ def process_and_merge_chunks(chunks: List[str], model: dict, error, previous_err
         "total_token_count": getattr(llm_usage, 'total_token_count', None),
         "llm_calls": llm_calls,
         "llm_latency_ms_total": total_latency_ms,
-        # "total_input_tokens": total_in,
-        # "total_output_tokens": total_out,
     }
     return final_content, metrics
 
 
-def process_file_for_syntax_error_patching(content: str, error_description, error_list, log_rec, llm=LLM_MODELS[4]) -> Optional[Tuple[str, Dict[str, Any]]]:
+def process_file_for_syntax_error_patching(content: str, error_description, retry_attempt, previuos_response, previous_error, log_rec, llm=LLM_MODELS[4]) -> Optional[Tuple[str, Dict[str, Any]]]:
     log_rec.update({"provider": llm["provider"], "model_name": llm["name"]})
     
     if content is not None:
-        does_not_fit_model = check_context_windows(content, error_description, llm)
+        does_not_fit_model = check_context_windows(content, llm)
         if not does_not_fit_model:
-            final_code, metrics = process_file_in_single_run(content, llm, error_description)
+            final_code, metrics = process_file_in_single_run(content, llm, error_description, retry_attempt, previuos_response, previous_error)
         else:
             chunks = chunk_top_level_objects_lenient_merged(
                 content,
@@ -241,7 +237,7 @@ def process_file_for_syntax_error_patching(content: str, error_description, erro
             for chunk in chunks:
                 if _count_tokens_safe(chunk) > llm['token_for_completion'] - 5000:
                     return None
-            final_code, metrics = process_and_merge_chunks(chunks, llm, error_description)
+            final_code, metrics = process_and_merge_chunks(chunks, llm, error_description, retry_attempt, previuos_response, previous_error)
         return final_code, metrics
     else:
         return None
@@ -337,7 +333,7 @@ if __name__ == "__main__":
         path_to_err_file = res[0]
         content = read_file(path_to_err_file)
         initial_content = content
-        error_description = row.get("syntactic_error_description") 
+        initial_error_description = row.get("syntactic_error_description") 
         error_message_processed =  row.get("precessed_error_message") 
         error_word = row.get("syntactic_error_word")
         compilation_result = None
@@ -362,9 +358,12 @@ if __name__ == "__main__":
         }
             # LLM repair
         version = extract_bytecode_major_minor(content)
+        retry_attempt = False 
+        previuos_response="" 
+        previous_error=""
+        # error_description = initial_error_description
         while not is_compiled:
-            error_list.append(error_description)
-            processed = process_file_for_syntax_error_patching(content, error_description, error_list, log_rec=log_rec, llm=LLM_MODELS[4] if max_retries >= 4 else LLM_MODELS[5])
+            processed = process_file_for_syntax_error_patching(initial_content, initial_error_description, retry_attempt, previuos_response, previous_error, log_rec=log_rec, llm=LLM_MODELS[4] if max_retries >= 4 else LLM_MODELS[5])
             if processed is None:
                 break
 
@@ -385,7 +384,7 @@ if __name__ == "__main__":
                 )
                 compile_ms = int((time.perf_counter() - t0) * 1000)
                 is_compiled = compilation_result["is_compiled"]
-                error_description = compilation_result["error_description"]
+                previous_error = compilation_result["error_description"]
                 if not is_compiled:
                     print(f"{Colors.WARNING}    -> Re-compilation failed for file. Retrying.... {Colors.ENDC}")
             except Exception as e:
@@ -421,11 +420,13 @@ if __name__ == "__main__":
             elif not is_compiled:
 
                 with open(str(AFFECTED_FILE_PATH / f"syntax_failed_repaired_{res[1]}_error.txt"), "w", encoding="utf-8") as f:
-                    f.write(error_description or "Unknown error")
+                    f.write(previous_error or "Unknown error")
                     f.close()
                 error_word, error_message = get_error_word_message_from_content(str(AFFECTED_FILE_PATH / f"syntax_failed_repaired_{res[1]}_error.txt"))
                 if max_retries >= 0:
-                    content = final_code  # retry with the latest code
+                    previuos_response = final_code  # retry with the latest code
+                    # previous_error = error_description or ""
+                    retry_attempt = True
                 else:
                     print(f"{Colors.FAIL}    -> Max retries reached. Could not compile the file. {Colors.ENDC}")
                     try:

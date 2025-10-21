@@ -77,37 +77,36 @@ You are an expert Python programmer and code repair specialist. Your task is to 
 """.strip()
 
 
-def get_previous_attempt_result(previuos_response: str, previous_error: str): 
-    
-    return f"""
-            Additionally, as there has been a previous repair attempt, the response and the result from the attempt will be provided to help guide your current attempt.\n
-            The resulting response of the previous repair attempt was:\n
-            {previuos_response} \n\n 
+def get_previous_attempt_result(previuos_response: str, previous_error) -> str:
+    return (
+        "Additionally, as there has been a previous repair attempt, the response and the result from the attempt will be provided to help guide your current attempt.\n\n"
+        
+        "## The resulting response of the previous repair attempt was:  ##\n\n"
+        f"{previuos_response}\n\n "
+        "## And the compilation error encountered was:  ##\n"
+        f"{previous_error}\n\n"
 
-            And the compilation error encountered was: \n
-            {previous_error} \n\n
-
-            Keeping in mind the initial code snippet provided initially and the code snippet from previuos response and the compilation error resulting from the previous response, make a new attempt to fix the initial snippet, ensuring your response only modifies the erroring lines while keeping the rest of the program the same.\n
-            You are required to make the absolute minimum edit required to fix the errors within the snippet and then use the original code provided as reference to keep the error free lines unchanged and return the compilable error free python program.\n
-        """
+        "Keeping in mind the initial code snippet provided initially and the code snippet from previuos response and the compilation error resulting from the previous response, make a new attempt to fix the initial snippet, ensuring your response only modifies the erroring lines while keeping the rest of the program the same.\n"
+        "You are required to make the absolute minimum edit required to fix the errors within the snippet and then use the original code provided as reference to keep the error free lines unchanged and return the compilable error free python program.\n"
+    )
 
 
 def get_user_prompt(code_snippet: str, error_message: str, retry_attempt=False, previuos_response="", previous_error="") -> str:
     return (
         "Analyze the initial code Snippet below for possible Python syntax errors.\n"
         "It is highly important that you find and fix every syntax error present in the snippet. \n"
-        "Apply the absolute minimum edit required to fix the errors within the snippet.\n"
+        "Apply the modifications required to fix the errors within the snippet.\n"
 
-        "Initial Error Message was:\n"
+        "## Initial Error Message was:  ##\n"
         f"{error_message}\n\n"
-        "Initial Code Snippet was:\n"
+        "## Initial Code Snippet was:   ##\n"
         f"{code_snippet}\n\n"
         
         "Do not add any  thinking or reasoning steps, just output the corrected code, modified only where syntax errors were identified.\n"
         "Do not add any ```markdown```, ``python ```, ``` ```, or other formatting wrappers.\n"
         "If no error is not present in the snippet or cannot be fixed within it, return the snippet unchanged.\n"
-        "Return only the complete, corrected code snippet (no explanations, no markdown, no extra text).\n\n"
-        "The error message from the initial compilation effort is provided for your reference.\n"
+        "Return only the complete, corrected code snippet (no explanations, no markdown, no extra text).\n"
+        "The error message from the initial compilation effort is provided for your reference.\n\n"
 
         + (get_previous_attempt_result(previuos_response, previous_error) if retry_attempt else "") +  
         
@@ -142,14 +141,6 @@ def get_user_prompt(code_snippet: str, error_message: str, retry_attempt=False, 
 #         "Error Patch Strategy:\n"
 #         f"{previous_error_summary_prompt}"
 #     )
-
-
-# LLM_MODELS = [
-#     {'provider': 'OpenAI', 'name': 'gpt-4o', 'token_for_completion': 16384},
-#     {'provider': 'DeepSeek', 'name': 'deepseek-chat', 'token_for_completion': 8192},
-#     {'provider': 'DeepSeek', 'name': 'deepseek-reasoner', 'token_for_completion': 8192},
-#     {'provider': 'Google', 'name': 'gemini-2.5-flash-latest', 'token_for_completion': 32768}
-# ]
 
 # --- ANSI Color Codes for Terminal Output ---
 class Colors:
@@ -189,13 +180,7 @@ def generate_progress_bar(percentage: float, length: int = 20) -> str:
     bar = '█' * filled_length + '-' * (length - filled_length)
     return f"{bar_color}[{bar}]{Colors.ENDC}"
 
-def check_context_windows(content: str, error_description: str, model: dict = LLM_MODELS[0]):
-
-    user_prompt = get_user_prompt(content, error_description)
-    user_token_count = count_tokens(user_prompt)
-    sys_prompt_token_count = count_tokens(SYSTEM_PROMPT)
-    token_count = user_token_count + sys_prompt_token_count
-    
+def check_context_windows(content: str, model: dict = LLM_MODELS[0]):    
     model_name = f"{model['provider']} - {model['name']}"
     max_tokens = model['token_for_completion']
 
@@ -203,5 +188,5 @@ def check_context_windows(content: str, error_description: str, model: dict = LL
     # print(f"System prompt token count: {sys_prompt_token_count}")
     # print(f"Total token count (user + system): {token_count}")
     print(f"    -> Model: {model_name}, Max tokens for completion: {max_tokens}")
-    is_too_large = token_count > max_tokens
+    is_too_large = count_tokens(content) > max_tokens
     return is_too_large
