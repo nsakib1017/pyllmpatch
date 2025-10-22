@@ -1,5 +1,7 @@
 import tiktoken
 from .providers import LLM_MODELS
+from google import genai
+import os
 
 # SYSTEM_PROMPT = """
 # ROLE
@@ -84,9 +86,9 @@ def get_previous_attempt_result(previuos_response: str, previous_error) -> str:
 
 def get_previous_attempt_result_chunk(previuos_response: str, previous_error) -> str:
     return (
-        "Additionally, as there has been a previous repair attempt by merging the chunks, the response and the result from the attempt will be provided to help guide your current attempt.\n\n"
+        "Additionally, as there has been a previous repair attempt of the provided code chunk, the response and the result from the attempt will be provided to help guide your current attempt.\n\n"
         
-        "## The resulting response of the previous repair attempt was:  ##\n\n"
+        "## The resulting response of the previous code chunk repair attempt was:  ##\n\n"
         f"{previuos_response}\n\n "
         "## And the compilation error encountered was:  ##\n"
         f"{previous_error}\n\n"
@@ -108,6 +110,7 @@ def get_user_prompt(code_snippet: str, error_message: str, retry_attempt=False, 
         "## Initial Code Snippet was:   ##\n"
         f"{code_snippet}\n\n"
         
+        "Do not add any additional explanations, notes, comments, or metadata in your response.\n"
         "Do not add any  thinking or reasoning steps, just output the corrected code, modified only where syntax errors were identified.\n"
         "Do not add any ```markdown```, ``python ```, ``` ```, or other formatting wrappers.\n"
         "If no error is not present in the snippet or cannot be fixed within it, return the snippet unchanged.\n"
@@ -140,6 +143,7 @@ def get_user_prompt_chunk(chunk_snippet: str, error_message: str, retry_attempt=
         "## Initial Chunk Snippet was:   ##\n"
         f"{chunk_snippet}\n\n"
         
+        "Do not add any additional explanations, notes, comments, or metadata in your response.\n"
         "Do not add any  thinking or reasoning steps, just output the corrected code, modified only where syntax errors were identified.\n"
         "Do not add any ```markdown```, ``python ```, ``` ```, or other formatting wrappers.\n"
         "If no error is not present in the code chunk or cannot be fixed within it, return the code chunk unchanged.\n"
@@ -167,14 +171,20 @@ class Colors:
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
 
-def count_tokens(text: str, encoding_name: str = "cl100k_base") -> int:
+def count_tokens(text: str, encoding_name: str = "cl100k_base", model_name = "gemini-2.5-flash-lite") -> int:
     if not text:
         return 0
-    # Get the encoding for the specified model
-    encoding = tiktoken.get_encoding(encoding_name)
-    # Encode the text and count the number of tokens
-    num_tokens = len(encoding.encode(text))
-    return num_tokens
+    
+    if encoding_name == LLM_MODELS[3]['provider']:
+        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        response = client.models.count_tokens(model=model_name, contents=text)
+        return response.total_tokens
+    else:
+        # Get the encoding for the specified model
+        encoding = tiktoken.get_encoding(encoding_name)
+        # Encode the text and count the number of tokens
+        num_tokens = len(encoding.encode(text))
+        return num_tokens
 
 def generate_progress_bar(percentage: float, length: int = 20) -> str:
     """
@@ -200,5 +210,6 @@ def check_context_windows(content: str, model: dict = LLM_MODELS[0]):
     # print(f"System prompt token count: {sys_prompt_token_count}")
     # print(f"Total token count (user + system): {token_count}")
     print(f"    -> Model: {model_name}, Max tokens for completion: {max_tokens}")
-    is_too_large = count_tokens(content) > max_tokens
-    return is_too_large
+    total_tokens = count_tokens(content, model["provider"], model["name"]) 
+    print(f"    -> {model_name} token count for the provided text: {total_tokens}")
+    return total_tokens > max_tokens

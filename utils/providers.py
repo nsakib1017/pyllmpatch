@@ -7,6 +7,19 @@ from dotenv import load_dotenv
 import os
 
 load_dotenv()
+
+class Colors:
+    """Class to hold ANSI color codes for styling terminal output."""
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
 LLM_MODELS = [
     {'provider': 'OpenAI', 'name': 'gpt-4o', 'token_for_completion': 16384},
     {'provider': 'DeepSeek', 'name': 'deepseek-chat', 'token_for_completion': 8192},
@@ -101,7 +114,7 @@ async def make_gemini_call(system_text: str, user_text: str, model: str = "gemin
         return {"content": _extract_text(response), "usage": usage}
 
     except Exception as e:
-        print(f"An error occurred during the Gemini API call: {e}")
+        print(f"{Colors.FAIL}   -> An error occurred during the Gemini API call: {e}")
         return None
 
 def make_llm_call(prompt: List[dict], model: str = "gpt-4o", provider: str = "OpenAI") -> Optional[str]:
