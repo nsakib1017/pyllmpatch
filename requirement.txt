@@ -9,5 +9,10 @@ tiktoken
 python-dotenv
 
 # Optional (recommended for local dev)
-
+openpyxl
+datasets
+transformers
+scikit-learn
+sentence-transformers
+xlsxwriter
 
