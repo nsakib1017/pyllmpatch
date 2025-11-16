@@ -35,7 +35,7 @@ def prepare_snippets_for_repair(previous_run_log_path: str = ""):
     if not previous_run_log_path:
         return read_csv_file('./dataset/balanced_sample.csv')
     df_previous_log = pd.read_json(previous_run_log_path, lines=True)
-    df_balanced = read_csv_file('./dataset/balanced_sample.csv')  # your helper
+    df_balanced = read_csv_file('./dataset/decompiled_syntax_errors.csv')  # your helper
 
     # Normalize types and remove NaNs/dupes just in case
     prev_hashes = (
@@ -48,7 +48,7 @@ def prepare_snippets_for_repair(previous_run_log_path: str = ""):
     mask = ~df_balanced['file_hash'].isin(set(prev_hashes))
     return df_balanced.loc[mask].copy()
 
-BASE_DIR = Path("../decompiler_workspace")
+BASE_DIR = Path("/home/diogenes/pylingual_colaboration/pypi_downloaded")
 
 def get_error_word_message_from_content(filepath):
     FILE_LINE_RE = re.compile(r'^\s*File "([^"]+)", line (\d+)(?:, in (.+))?')
@@ -343,9 +343,11 @@ def filter_not_run_false_only_points(path: str):
     return df_all.loc[mask].copy()
 
 if __name__ == "__main__":
-    # previuos_run_log_path = Path("results/experiment_outputs/20251009T033339Z/f5d5e521eee14823961dacd3b6489f69/run_log_f5d5e521eee14823961dacd3b6489f69.jsonl")
+    previuos_run_log_path = Path("results/experiment_outputs/20251109T223554Z/482d928cb2be4eefb2c948f5740f162c/run_log_482d928cb2be4eefb2c948f5740f162c.jsonl")
     df_all = prepare_snippets_for_repair()
-    df_syntax_error_balanced = filter_not_run_false_only_points('./dataset/cleaned_results_with_no_retry.csv')
+    df_syntax_error_balanced = prepare_snippets_for_repair(previuos_run_log_path)
+    #df_syntax_error_balanced = filter_not_run_false_only_points('./dataset/cleaned_results_with_no_retry.csv')
+    # df_syntax_error_balanced = read_csv_file('./dataset/decompiled_syntax_errors.csv')
     df_syntax_error_balanced = df_syntax_error_balanced.sample(frac=1, random_state=42).reset_index(drop=True)  # shuffle
     # df_syntax_error_balanced = df_syntax_error_balanced.head(50) 
     print('DataFrame shape:', df_syntax_error_balanced.shape)
@@ -363,17 +365,19 @@ if __name__ == "__main__":
 
         is_compiled = False
         file_hash = norm_str(row.get("file_hash"))
-        file_dir = BASE_DIR / file_hash / "decompiler_output"
+        file_name = norm_str(row.get("file"))
+        file_dir = BASE_DIR / file_hash / file_name
         
 
         # highest_indented_file returns Optional[Tuple[Path, int]]
-        res = highest_indented_file(file_dir, pattern="indented_*.py")
-        header = f"\n# --- Processing Content from file: {str(res[0])} ({count_idx+1}/{len(df_syntax_error_balanced)}) --- #\n"
-        footer = f"\n# --- End of Processing Content from file: {str(res[0])} ({count_idx+1}/{len(df_syntax_error_balanced)}) --- #\n"
+        # res = highest_indented_file(file_dir, pattern="indented_*.py")
+        header = f"\n# --- Processing Content from file: {str(file_dir)} ({count_idx+1}/{len(df_syntax_error_balanced)}) --- #\n"
+        footer = f"\n# --- End of Processing Content from file: {str(file_dir)} ({count_idx+1}/{len(df_syntax_error_balanced)}) --- #\n"
 
         print(header)
-        path_to_err_file = res[0]
+        path_to_err_file = str(file_dir)
         content = read_file(path_to_err_file)
+        # print(content)
         initial_content = content
         initial_error_description = row.get("syntactic_error_description") 
         error_message_processed =  row.get("precessed_error_message") 
@@ -420,8 +424,8 @@ if __name__ == "__main__":
             try:
                 compilation_result = compile_new_pyc(
                     final_code,
-                    str(AFFECTED_FILE_PATH / f"syntax_repaired_{res[1]}.py"),
-                    str(AFFECTED_FILE_PATH / f"syntax_repaired_{res[1]}.pyc"),
+                    str(AFFECTED_FILE_PATH / f"syntax_repaired_{file_name[:-3]}.py"),
+                    str(AFFECTED_FILE_PATH / f"syntax_repaired_{file_name[:-3]}.pyc"),
                     version
                 )
                 compile_ms = int((time.perf_counter() - t0) * 1000)
@@ -457,21 +461,21 @@ if __name__ == "__main__":
                 "diff_lines": _diff_lines(final_code, initial_content),
             })
             if is_compiled:
-                log_rec.update({"path_out": str(AFFECTED_FILE_PATH / f"syntax_repaired_{res[1]}.py")})
+                log_rec.update({"path_out": str(AFFECTED_FILE_PATH / f"syntax_repaired_{file_name[:-3]}.py")})
                 _append_log(LOG_FILE, log_rec)
             elif not is_compiled:
 
-                with open(str(AFFECTED_FILE_PATH / f"syntax_failed_repaired_{res[1]}_error.txt"), "w", encoding="utf-8") as f:
+                with open(str(AFFECTED_FILE_PATH / f"syntax_failed_repaired_{file_name[:-3]}_error.txt"), "w", encoding="utf-8") as f:
                     f.write(previous_error or "Unknown error")
                     f.close()
-                error_word, error_message = get_error_word_message_from_content(str(AFFECTED_FILE_PATH / f"syntax_failed_repaired_{res[1]}_error.txt"))
+                error_word, error_message = get_error_word_message_from_content(str(AFFECTED_FILE_PATH / f"syntax_failed_repaired_{file_name[:-3]}_error.txt"))
                 if max_retries >= 0:
                     previuos_response = final_code if len(chunk_responses) == 0 else chunk_responses
                     retry_attempt = True
                 else:
                     print(f"{Colors.FAIL}    -> Max retries reached. Could not compile the file. {Colors.ENDC}")
                     try:
-                        failure_cleanup(AFFECTED_FILE_PATH, final_code, res[1], error_word, error_message)
+                        failure_cleanup(AFFECTED_FILE_PATH, final_code, file_name[:-3], error_word, error_message)
                         _append_log(LOG_FILE, log_rec)
                     except FileNotFoundError:
                         pass
