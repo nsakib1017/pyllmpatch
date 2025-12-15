@@ -6,3 +6,5 @@ __pycache__/
 dataset/
 .env
 results/
+finetuning/finetuned_models/
+finetuning/unsloth_compiled_cache/

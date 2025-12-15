@@ -7,6 +7,17 @@ pandas
 numpy
 tiktoken
 python-dotenv
+unsloth
+transformers
+trl
+accelerate
+bitsandbytes
+torch 
+#setup gpu specific pytorch for cuda
+peft
+scipy
+einops
+evaluate
 
 # Optional (recommended for local dev)
 openpyxl
