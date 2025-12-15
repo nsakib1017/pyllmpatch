@@ -65,6 +65,54 @@ import os
 #         f"{previous_error_summary_prompt}"
 #     )
 
+SYSTEM_PROMPT_FOR_LOCAL = (
+    "You are an expert Python programmer and code repair specialist. "
+    "Your task is to correct Python SYNTAX errors only.\n"
+    "Make ONLY the minimal changes strictly required for the code to parse and compile successfully.\n"
+    "Do NOT fix logic errors, runtime errors, or improve code quality unless required to resolve a syntax error.\n"
+    "Do NOT refactor, reformat, or modify any code that is already syntactically valid.\n"
+    "Preserve all error-free lines exactly as they appear in the original code.\n"
+    "The final output must be a syntactically valid Python program.\n"
+    "Output ONLY the corrected Python code.\n"
+    "Do NOT include explanations, reasoning, comments, markdown, or formatting wrappers of any kind.\n"
+    "Do NOT add any text before or after the code."
+)
+
+
+USER_PROMPT_TEMPLATE_LOCAL = (
+    "Analyze the Python code snippet below and fix all syntax errors.\n\n"
+    "Initial error message:\n"
+    "{error_message}\n\n"
+    "Initial code snippet:\n"
+    "{code_snippet}\n\n"
+    "If the code contains no syntax errors or the errors cannot be fixed, return the code unchanged."
+)
+
+
+def build_chat_messages(
+    code_snippet: str,
+    error_message: str,
+    system_prompt: str,
+    user_prompt_template: str,
+) -> list[dict]:
+    user_prompt = user_prompt_template.format(
+        error_message=error_message,
+        code_snippet=code_snippet,
+    )
+
+    messages = [
+        {
+            "role": "system",
+            "content": system_prompt.strip(),
+        },
+        {
+            "role": "user",
+            "content": user_prompt.strip(),
+        },
+    ]
+
+    return messages
+
 
 SYSTEM_PROMPT = """
 You are an expert Python programmer and code repair specialist. Your task is to analyze Python code snippets that may contain syntax errors and provide corrected versions of the code with minimal changes. You must ensure that the corrected code is syntactically valid and adheres to best practices in Python programming.
@@ -179,6 +227,12 @@ def count_tokens(text: str, encoding_name: str = "cl100k_base", model_name = "ge
         client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
         response = client.models.count_tokens(model=model_name, contents=text)
         return response.total_tokens
+    elif encoding_name == LLM_MODELS[6]['provider']:
+        # Get the encoding for the specified model
+        encoding = tiktoken.get_encoding("cl100k_base")
+        # Encode the text and count the number of tokens
+        num_tokens = len(encoding.encode(text))
+        return num_tokens
     else:
         # Get the encoding for the specified model
         encoding = tiktoken.get_encoding(encoding_name)

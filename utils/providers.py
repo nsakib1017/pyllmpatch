@@ -26,7 +26,8 @@ LLM_MODELS = [
     {'provider': 'DeepSeek', 'name': 'deepseek-reasoner', 'token_for_completion': 8192},
     {'provider': 'Google', 'name': 'gemini-2.5-pro', 'token_for_completion': 65536},
     {'provider': 'Google', 'name': 'gemini-2.5-flash-lite', 'token_for_completion': 65536},
-    {'provider': 'Google', 'name': 'gemini-2.5-flash', 'token_for_completion': 65536}
+    {'provider': 'Google', 'name': 'gemini-2.5-flash', 'token_for_completion': 65536},
+    {'provider': 'Alibaba', 'name': 'qwen-v2.5-coder-7b', 'token_for_completion': 16384}
 ]
 
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY") , base_url="https://api.openai.com/v1")

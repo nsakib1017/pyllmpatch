@@ -57,4 +57,39 @@ def read_file(file_path: Path) -> Optional[str]:
     else:
         print("No valid file path provided.")
         return None
-    
+
+
+from pathlib import Path
+from typing import Optional
+
+def fetch_context_lines(
+    file_path: Path,
+    line_number: int,
+    context: int = 10,
+) -> Optional[str]:
+    """
+    Fetch up to `context` lines above and below the given line number (1-based).
+
+    Returns a single string containing the context, or None if file/content is invalid.
+    """
+
+    content = read_file(file_path)
+    if content is None:
+        return None
+
+    lines = content.splitlines()
+
+    # Convert to 0-based index
+    idx = line_number - 1
+
+    if idx < 0 or idx >= len(lines):
+        print(f"Line number {line_number} is out of range.")
+        return None
+
+    start = max(0, idx - context)
+    end = min(len(lines), idx + context + 1)
+
+    context_lines = lines[start:end]
+
+    return "\n".join(context_lines)
+

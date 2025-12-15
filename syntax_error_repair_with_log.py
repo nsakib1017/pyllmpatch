@@ -174,19 +174,29 @@ def process_file_in_single_run(content: str, model: dict, error: str, retry_atte
     """Simulates processing a file that fits in the context window."""
     model_name = f"{model['provider']} - {model['name']}"
     print(f"{Colors.OKGREEN}    -> Content fits in a single run for {model_name}. Processing...{Colors.ENDC}")
-    prompt = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": get_user_prompt(content, error, retry_attempt, previuos_response, previous_error)}
-    ]
-    # print(prompt[1]["content"])
-    t0 = time.perf_counter()
-    llm_raw = make_llm_call(prompt, model=model['name'], provider=model['provider'])
-    # print(llm_raw)
-    llm_elapsed_ms = int((time.perf_counter() - t0) * 1000)
-    try:
-        llm_response = strip_code_fences(llm_raw) if llm_raw else content
-    except Exception:
-        llm_response = content
+    if model["name"] in ['qwen-v2.5-coder-7b']:
+        messages = build_chat_messages(
+            code_snippet=content.strip("\n"),
+            error_message=error,
+            system_prompt=SYSTEM_PROMPT_FOR_LOCAL,
+            user_prompt_template=USER_PROMPT_TEMPLATE_LOCAL,
+        )
+        print(messages)
+        sys.exit(0)
+    else:
+        prompt = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": get_user_prompt(content, error, retry_attempt, previuos_response, previous_error)}
+        ]
+        # print(prompt[1]["content"])
+        t0 = time.perf_counter()
+        llm_raw = make_llm_call(prompt, model=model['name'], provider=model['provider'])
+        # print(llm_raw)
+        llm_elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        try:
+            llm_response = strip_code_fences(llm_raw) if llm_raw else content
+        except Exception:
+            llm_response = content
 
     llm_usage = llm_raw.get('usage', {}) if llm_raw else {}
     # llm_raw = llm_response.get('content', {}) if llm_response else {}
@@ -342,12 +352,19 @@ def filter_not_run_false_only_points(path: str):
     mask = ~df_all['file_hash'].isin(set(prev_hashes))
     return df_all.loc[mask].copy()
 
+def extract_line_number(error_msg: str):
+    # Find patterns like: "line 131"
+    m = re.search(r"line\s+(\d+)", error_msg)
+    if m:
+        return int(m.group(1))
+    return None
+
 if __name__ == "__main__":
-    previuos_run_log_path = Path("results/experiment_outputs/20251109T223554Z/482d928cb2be4eefb2c948f5740f162c/run_log_482d928cb2be4eefb2c948f5740f162c.jsonl")
+    # previuos_run_log_path = Path("results/experiment_outputs/20251109T223554Z/482d928cb2be4eefb2c948f5740f162c/run_log_482d928cb2be4eefb2c948f5740f162c.jsonl")
     df_all = prepare_snippets_for_repair()
-    df_syntax_error_balanced = prepare_snippets_for_repair(previuos_run_log_path)
+    # df_syntax_error_balanced = prepare_snippets_for_repair()
     #df_syntax_error_balanced = filter_not_run_false_only_points('./dataset/cleaned_results_with_no_retry.csv')
-    # df_syntax_error_balanced = read_csv_file('./dataset/decompiled_syntax_errors.csv')
+    df_syntax_error_balanced = read_csv_file('./dataset/decompiled_syntax_errors.csv')
     df_syntax_error_balanced = df_syntax_error_balanced.sample(frac=1, random_state=42).reset_index(drop=True)  # shuffle
     # df_syntax_error_balanced = df_syntax_error_balanced.head(50) 
     print('DataFrame shape:', df_syntax_error_balanced.shape)
@@ -376,12 +393,20 @@ if __name__ == "__main__":
 
         print(header)
         path_to_err_file = str(file_dir)
-        content = read_file(path_to_err_file)
-        # print(content)
-        initial_content = content
-        initial_error_description = row.get("syntactic_error_description") 
-        error_message_processed =  row.get("precessed_error_message") 
+
+        # initial_error_description = row.get("syntactic_error_description") 
+        initial_error_description = row.get("error_description") 
+        #error_message_processed =  row.get("precessed_error_message") 
+        error_message_processed =  row.get("error_msg_clean") 
         error_word = row.get("syntactic_error_word")
+        error_line_number = extract_line_number(initial_error_description)
+        # print(f" line: {error_line_number}")
+
+        # content = read_file(path_to_err_file)
+        content = fetch_context_lines(Path(path_to_err_file), error_line_number)
+        # print(content)
+        # sys.exit(0)
+        initial_content = content
         compilation_result = None
 
         max_retries = int(os.getenv("NO_OF_MAX_RETRIES")) if os.getenv("NO_OF_MAX_RETRIES") else 0  # max attempts to recompile
@@ -409,7 +434,8 @@ if __name__ == "__main__":
         previous_error=""
         # error_description = initial_error_description
         while not is_compiled:
-            processed = process_file_for_syntax_error_patching(initial_content, initial_error_description, retry_attempt, previuos_response, previous_error, log_rec=log_rec, llm=LLM_MODELS[4] if max_retries >= 4 else LLM_MODELS[5])
+            processed = process_file_for_syntax_error_patching(initial_content, initial_error_description, retry_attempt, previuos_response, previous_error, log_rec=log_rec, llm=LLM_MODELS[6] #if max_retries >= 4 else LLM_MODELS[5]
+                                                               )
             if processed is None:
                 break
 
@@ -483,6 +509,6 @@ if __name__ == "__main__":
                         break
         count_idx += 1
         print(footer)
-        # break
+        break # Remove this break to process all files
 
         
