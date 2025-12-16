@@ -8,3 +8,4 @@ dataset/
 results/
 finetuning/finetuned_models/
 finetuning/unsloth_compiled_cache/
+finetuning/merged_model_qwen2.5_coder_7b_instruct/

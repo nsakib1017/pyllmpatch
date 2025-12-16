@@ -20,6 +20,10 @@ from utils.chunk_helpers import *
 from utils.file_helpers import *
 from utils.generate_bytecode import *
 
+from model.inference import fix_python_syntax
+from utils.indentation_fixer import *
+
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -174,33 +178,49 @@ def process_file_in_single_run(content: str, model: dict, error: str, retry_atte
     """Simulates processing a file that fits in the context window."""
     model_name = f"{model['provider']} - {model['name']}"
     print(f"{Colors.OKGREEN}    -> Content fits in a single run for {model_name}. Processing...{Colors.ENDC}")
+    context_indent = detect_context_indent(content.strip("\n"))
+    normalized_code = normalize_indentation(content.strip("\n"), context_indent)
+    t0 = time.perf_counter()
     if model["name"] in ['qwen-v2.5-coder-7b']:
         messages = build_chat_messages(
-            code_snippet=content.strip("\n"),
+            code_snippet=normalized_code,
             error_message=error,
             system_prompt=SYSTEM_PROMPT_FOR_LOCAL,
             user_prompt_template=USER_PROMPT_TEMPLATE_LOCAL,
         )
-        print(messages)
-        sys.exit(0)
+        print(content)
+        # print(normalized_code)
+        print('--------------------------------------------------')
+        llm_raw = fix_python_syntax(messages=messages)
+
+        try:
+            llm_response = strip_code_fences(llm_raw) if llm_raw else content
+        except Exception:
+            llm_response = content
+
+         #reapply_context_indent(llm_raw, context_indent)
+        
+        # sys.exit(0)
     else:
         prompt = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": get_user_prompt(content, error, retry_attempt, previuos_response, previous_error)}
         ]
         # print(prompt[1]["content"])
-        t0 = time.perf_counter()
+
         llm_raw = make_llm_call(prompt, model=model['name'], provider=model['provider'])
         # print(llm_raw)
-        llm_elapsed_ms = int((time.perf_counter() - t0) * 1000)
         try:
             llm_response = strip_code_fences(llm_raw) if llm_raw else content
         except Exception:
             llm_response = content
-
-    llm_usage = llm_raw.get('usage', {}) if llm_raw else {}
+    try:
+        llm_usage = llm_raw.get('usage', {}) if llm_raw else {}
+    except Exception:
+        llm_usage = {}
     # llm_raw = llm_response.get('content', {}) if llm_response else {}
     # llm_usage = llm_raw.get('usage', {}) if llm_raw else {}
+    llm_elapsed_ms = int((time.perf_counter() - t0) * 1000)
     metrics = {
         "fits_single_run": True,
         "llm_calls": 1,
@@ -359,6 +379,14 @@ def extract_line_number(error_msg: str):
         return int(m.group(1))
     return None
 
+
+def copy_file(src: Path | str, dst: Path | str) -> None:
+    src = Path(src)
+    dst = Path(dst)
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+
 if __name__ == "__main__":
     # previuos_run_log_path = Path("results/experiment_outputs/20251109T223554Z/482d928cb2be4eefb2c948f5740f162c/run_log_482d928cb2be4eefb2c948f5740f162c.jsonl")
     df_all = prepare_snippets_for_repair()
@@ -401,11 +429,15 @@ if __name__ == "__main__":
         error_word = row.get("syntactic_error_word")
         error_line_number = extract_line_number(initial_error_description)
         # print(f" line: {error_line_number}")
-
-        # content = read_file(path_to_err_file)
-        content = fetch_context_lines(Path(path_to_err_file), error_line_number)
+        copy_dir  = BASE_DIR / file_hash / f"copy_of_{file_name}"
+        copy_file(path_to_err_file, copy_dir)
+        whole_content = read_file(copy_dir)
+        version = extract_bytecode_major_minor(whole_content)
+        results = fetch_context_lines(Path(copy_dir), error_line_number)
         # print(content)
         # sys.exit(0)
+        if results:
+            content, start_ln, end_ln = results
         initial_content = content
         compilation_result = None
 
@@ -420,7 +452,7 @@ if __name__ == "__main__":
             "total_attempts_allowed": max_retries + 1,
             "retries_allowed": max_retries,
             "path_in": str(path_to_err_file),
-            "bytecode_version": extract_bytecode_major_minor(content),
+            "bytecode_version": version,
             # "provider": LLM_MODELS[3]["provider"],
             # "model_name": LLM_MODELS[3]["name"],
             "compile_error_word_before": error_word,
@@ -428,14 +460,14 @@ if __name__ == "__main__":
             "fences_stripped": _count_fences(content),
         }
             # LLM repair
-        version = extract_bytecode_major_minor(content)
+  
         retry_attempt = False 
         previuos_response=None 
         previous_error=""
         # error_description = initial_error_description
+        # Retry attempt logic set to false for local LLM for now
         while not is_compiled:
-            processed = process_file_for_syntax_error_patching(initial_content, initial_error_description, retry_attempt, previuos_response, previous_error, log_rec=log_rec, llm=LLM_MODELS[6] #if max_retries >= 4 else LLM_MODELS[5]
-                                                               )
+            processed = process_file_for_syntax_error_patching(initial_content, initial_error_description, False, previuos_response, previous_error, log_rec=log_rec, llm=LLM_MODELS[6])
             if processed is None:
                 break
 
@@ -444,21 +476,36 @@ if __name__ == "__main__":
                 AFFECTED_FILE_PATH.mkdir(parents=True, exist_ok=True)
             
             final_code, llm_metrics, chunk_responses = processed  
+            print(final_code)
 
             # compile with timing
             t0 = time.perf_counter()
+            compilation_candidate = final_code
+            if LLM_MODELS[6]["name"] in ['qwen-v2.5-coder-7b']:
+                compilation_candidate = reattach_context_lines(Path(copy_dir), final_code, start_ln, end_ln)
+            with open(copy_dir, "w", encoding="utf-8") as f:
+                f.write(compilation_candidate)
+                f.close()
             try:
                 compilation_result = compile_new_pyc(
-                    final_code,
+                    compilation_candidate,
                     str(AFFECTED_FILE_PATH / f"syntax_repaired_{file_name[:-3]}.py"),
                     str(AFFECTED_FILE_PATH / f"syntax_repaired_{file_name[:-3]}.pyc"),
                     version
                 )
                 compile_ms = int((time.perf_counter() - t0) * 1000)
                 is_compiled = compilation_result["is_compiled"]
-                previous_error = compilation_result["error_description"]
+                # previous_error = compilation_result["error_description"]
+                initial_error_description = compilation_result["error_description"]
                 if not is_compiled:
                     print(f"{Colors.WARNING}    -> Re-compilation failed for file. Retrying.... {Colors.ENDC}")
+                    error_line_number = extract_line_number(initial_error_description)
+                    results = fetch_context_lines(copy_dir, error_line_number)
+                    # print(content)
+                    # sys.exit(0)
+                    if results:
+                        initial_content, start_ln, end_ln = results
+                        pass
             except Exception as e:
                 compile_ms = int((time.perf_counter() - t0) * 1000)
                 print(f"{Colors.WARNING}    -> Re-compilation failed for file. Retrying.... {Colors.ENDC}")
@@ -484,10 +531,11 @@ if __name__ == "__main__":
                 "compile_latency_ms": compile_ms,
                 "compile_error_word_after": None,
                 "compile_error_message_after": None,
-                "diff_lines": _diff_lines(final_code, initial_content),
+                "diff_lines": _diff_lines(compilation_candidate, initial_content),
             })
             if is_compiled:
                 log_rec.update({"path_out": str(AFFECTED_FILE_PATH / f"syntax_repaired_{file_name[:-3]}.py")})
+                os.unlink(copy_dir)
                 _append_log(LOG_FILE, log_rec)
             elif not is_compiled:
 
@@ -496,13 +544,14 @@ if __name__ == "__main__":
                     f.close()
                 error_word, error_message = get_error_word_message_from_content(str(AFFECTED_FILE_PATH / f"syntax_failed_repaired_{file_name[:-3]}_error.txt"))
                 if max_retries >= 0:
-                    previuos_response = final_code if len(chunk_responses) == 0 else chunk_responses
+                    previuos_response = compilation_candidate if len(chunk_responses) == 0 else chunk_responses
                     retry_attempt = True
                 else:
                     print(f"{Colors.FAIL}    -> Max retries reached. Could not compile the file. {Colors.ENDC}")
                     try:
-                        failure_cleanup(AFFECTED_FILE_PATH, final_code, file_name[:-3], error_word, error_message)
+                        failure_cleanup(AFFECTED_FILE_PATH, compilation_candidate, file_name[:-3], error_word, error_message)
                         _append_log(LOG_FILE, log_rec)
+                        os.unlink(copy_dir)
                     except FileNotFoundError:
                         pass
                     finally:

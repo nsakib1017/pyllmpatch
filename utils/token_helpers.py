@@ -75,7 +75,7 @@ SYSTEM_PROMPT_FOR_LOCAL = (
     "The final output must be a syntactically valid Python program.\n"
     "Output ONLY the corrected Python code.\n"
     "Do NOT include explanations, reasoning, comments, markdown, or formatting wrappers of any kind.\n"
-    "Do NOT add any text before or after the code."
+    "Do NOT add any text before or after the code.\n"
 )
 
 
