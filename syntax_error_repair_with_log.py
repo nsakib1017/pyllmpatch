@@ -27,13 +27,8 @@ from utils.indentation_fixer import *
 from dotenv import load_dotenv
 load_dotenv()
 
-def read_csv_file(file_name: str) -> pd.DataFrame:
-    script_dir = Path(__file__).parent
-    csv_path = script_dir / file_name
-    print(csv_path)
-    print(f"Trying to read: {csv_path.resolve()}")
-    df = pd.read_csv(csv_path)
-    return df
+BASE_DIR = Path("/home/diogenes/pylingual_colaboration/pypi_downloaded")
+
 
 def prepare_snippets_for_repair(previous_run_log_path: str = ""):
     if not previous_run_log_path:
@@ -52,111 +47,12 @@ def prepare_snippets_for_repair(previous_run_log_path: str = ""):
     mask = ~df_balanced['file_hash'].isin(set(prev_hashes))
     return df_balanced.loc[mask].copy()
 
-BASE_DIR = Path("/home/diogenes/pylingual_colaboration/pypi_downloaded")
 
-def get_error_word_message_from_content(filepath):
-    FILE_LINE_RE = re.compile(r'^\s*File "([^"]+)", line (\d+)(?:, in (.+))?')
-    ERROR_LINE_RE = re.compile(r'^\s*(\w+(?:Error|Exception))(?:\s*:\s*(.*))?$')
-    SORRY_LINE_RE = re.compile(r'^\s*Sorry:\s*(\w+(?:Error|Exception))\s*:\s*(.*?)\s*\(([^,]+),\s*line\s*(\d+)\)\s*$')
-    error_word = []
-    messages = []
-    with open(filepath, "r", encoding="utf-8") as f:
-        for line in f:
-            s = line.rstrip("\n")
-            m_file = FILE_LINE_RE.match(s)
-            if m_file:
-                continue
-            m_err = ERROR_LINE_RE.match(s)
-            if m_err:
-                error_word.append(m_err.group(1))
-                messages.append((m_err.group(2) or "").strip())
-                break
-            m_sorry = SORRY_LINE_RE.match(line)
-            if m_sorry:
-                error_word.append(m_sorry.group(1))
-                messages.append((m_sorry.group(2) or "").strip())
-                break
-            
-    error_word = error_word[0] if len(error_word) > 0 else None
-    message = messages[0] if len(messages) > 0 else None
-
-    return error_word, message
-
-
-def strip_code_fences(payload: Any) -> str:
-    """
-    Strips the code fences (```python, ~~~, etc.) from a string,
-    and handles different formats like None, dict, list, bytes, etc.
-    """
-    # ---- 1) Normalize to text ------------------------------------------------
-    def _normalize(x: Any) -> str:
-        if x is None:
-            return ""
-        if isinstance(x, bytes):
-            return x.decode("utf-8", errors="ignore")
-        if isinstance(x, str):
-            return x
-        if isinstance(x, dict):
-            # Common LLM shapes
-            val = x.get("content") or x.get("text") or ""
-            if isinstance(val, bytes):
-                return val.decode("utf-8", errors="ignore")
-            return str(val) if not isinstance(val, str) else val
-        if isinstance(x, list):
-            parts = []
-            for item in x:
-                if isinstance(item, dict):
-                    v = item.get("content") or item.get("text") or ""
-                    if isinstance(v, bytes):
-                        v = v.decode("utf-8", errors="ignore")
-                    parts.append(v if isinstance(v, str) else str(v))
-                else:
-                    parts.append(str(item))
-            return "\n".join(parts)
-        return str(x)
-
-    text = _normalize(payload)
-
-    # ---- 2) Strip fences (regex patterns) ----------------------------------
-    fence = r"(?:```|~~~)"
-    lang_until_eol = r"[^\r\n]*"  # Match language until end of line
-    # Refined regex that also ensures line breaks are handled
-    paired_re = re.compile(
-        rf"(?P<f>{fence})[ \t]*{lang_until_eol}[ \t]*(?:\r?\n)?"
-        rf"(?P<body>.*?)"
-        rf"(?:\r?\n)?(?P=f)[ \t]*", re.DOTALL
-    )
-
-    # This should strip the code block properly
-    text = paired_re.sub(lambda m: m.group("body"), text)
-
-    # ---- 3) Remove leading fence at the start of the string -----------------
-    leading_open_re = re.compile(
-        rf"^\ufeff?(?:{fence})[ \t]*{lang_until_eol}[ \t]*(?:\r?\n)?",
-        re.DOTALL,
-    )
-    text = leading_open_re.sub("", text, count=1)
-
-    # ---- 4) Remove trailing fence at the end of the string -----------------
-    trailing_close_re = re.compile(
-        rf"(?:\r?\n)?(?:{fence})[ \t]*\Z",
-        re.DOTALL,
-    )
-    text = trailing_close_re.sub("", text, count=1)
-
-    return text.strip()
-
-def _count_tokens_safe(text: Optional[str], provider, model_name) -> int:
-    try:
-        return count_tokens(text or "", provider, model_name)
-    except Exception:
-        return len(text or "")
 
 def _now_iso() -> str:  # ISO8601 with timezone naive (UTC-like)
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-
-def make_call_to_local_llm(content: str, model: dict, error: str,):
+def make_call_to_local_llm(content: str,  error: str,):
     messages = build_chat_messages(code_snippet=content.strip("\n"), error_message=error, system_prompt=SYSTEM_PROMPT_FOR_LOCAL, user_prompt_template=USER_PROMPT_TEMPLATE_LOCAL)
     llm_raw = fix_python_syntax(messages=messages)
     return llm_raw
@@ -193,8 +89,8 @@ def process_file_in_single_run(content: str, model: dict, error: str) -> Tuple[s
         "llm_latency_ms_total": llm_elapsed_ms,
         "chunk_count": 1,
         "merge_passes": 0,
-        "avg_chunk_tokens": _count_tokens_safe(content, model["provider"], model["name"]),
-        "max_chunk_tokens": _count_tokens_safe(content, model["provider"], model["name"]),
+        "avg_chunk_tokens": count_tokens_safe(content, model["provider"], model["name"]),
+        "max_chunk_tokens": count_tokens_safe(content, model["provider"], model["name"]),
     }
     return (llm_response if llm_response else content), metrics
 
@@ -212,7 +108,7 @@ def process_file_in_single_run(content: str, model: dict, error: str) -> Tuple[s
 #     llm_calls = 0
 
 #     for i, chunk in enumerate(chunks):
-#         ctoks = _count_tokens_safe(chunk,  model["provider"], model["name"])
+#         ctoks = count_tokens_safe(chunk,  model["provider"], model["name"])
 #         max_chunk_tokens = max(max_chunk_tokens, ctoks)
 #         print(f"        -> Processing chunk {i+1}/{len(chunks)} ({ctoks} tokens)...")
 #         prompt = [
@@ -226,12 +122,12 @@ def process_file_in_single_run(content: str, model: dict, error: str) -> Tuple[s
 #         llm_calls += 1
 #         llm_usage = llm_response.get('usage', {}) if llm_response else {}
 #         llm_raw = llm_response.get('content', {}) if llm_response else {}
-#         # total_in += _count_tokens_safe(prompt[0]["content"]) + _count_tokens_safe(prompt[1]["content"])
+#         # total_in += count_tokens_safe(prompt[0]["content"]) + count_tokens_safe(prompt[1]["content"])
 #         try:
 #             corrected_chunk = strip_code_fences(llm_raw) if llm_raw else chunk
 #         except Exception:
 #             corrected_chunk = llm_raw
-#         # total_out += _count_tokens_safe(corrected_chunk)
+#         # total_out += count_tokens_safe(corrected_chunk)
 
 #         corrected_chunks.append(corrected_chunk)
 
@@ -244,7 +140,7 @@ def process_file_in_single_run(content: str, model: dict, error: str) -> Tuple[s
 #         "fits_single_run": False,
 #         "chunk_count": len(chunks),
 #         "merge_passes": 1,  # based on your call to chunk_top_level_objects_lenient_merged(..., extra_merge_passes=1)
-#         "avg_chunk_tokens": int(sum(_count_tokens_safe(c,  model["provider"], model["name"]) for c in chunks) / max(1, len(chunks))),
+#         "avg_chunk_tokens": int(sum(count_tokens_safe(c,  model["provider"], model["name"]) for c in chunks) / max(1, len(chunks))),
 #         "max_chunk_tokens": max_chunk_tokens,
 #         "prompt_token_count": getattr(llm_usage, 'prompt_token_count', None),
 #         "candidates_token_count": getattr(llm_usage, 'candidates_token_count', None),
@@ -257,7 +153,7 @@ def process_file_in_single_run(content: str, model: dict, error: str) -> Tuple[s
 
 def process_file_for_syntax_error_patching(initial_content: str, error_description,  log_rec={}, llm=OPEN_LLM_MODELS[0]) -> Optional[Tuple[str, Dict[str, Any]]]:
     log_rec.update({"provider": llm["provider"], "model_name": llm["name"]})
-    if initial_content is not None and not _count_tokens_safe(initial_content,  llm["provider"], llm["name"]) > llm['token_for_completion'] - 5000:
+    if initial_content is not None and not count_tokens_safe(initial_content,  llm["provider"], llm["name"]) > llm['token_for_completion'] - 5000:
             final_code, metrics = process_file_in_single_run(initial_content, llm, error_description)
             return final_code, metrics
         # else:
@@ -268,7 +164,7 @@ def process_file_for_syntax_error_patching(initial_content: str, error_descripti
         #     #     extra_merge_passes=1
         #     # )
         #     # for chunk in chunks:
-        #     #     if _count_tokens_safe(chunk,  llm["provider"], llm["name"]) > llm['token_for_completion'] - 5000:
+        #     #     if count_tokens_safe(chunk,  llm["provider"], llm["name"]) > llm['token_for_completion'] - 5000:
         #     #         return None
         #     # final_code, metrics, corrected_chunks = process_and_merge_chunks(chunks, llm, error_description, retry_attempt, previuos_response, previous_error)
         #     return None  
@@ -318,6 +214,13 @@ def failure_cleanup(affected_file_path, final_code,  idx, error_word, error_mess
     log_rec.update({"compile_error_word_after": error_word, "path_out": str(affected_file_path / f"syntax_failed_repaired_{idx}.py"), "compile_error_message_after": clean_error_message(error_message) if error_message else None,})
 
 
+def extract_line_number(error_msg: str):
+    # Find patterns like: "line 131"
+    m = re.search(r"line\s+(\d+)", error_msg)
+    if m:
+        return int(m.group(1))
+    return None
+
 def filter_not_run_false_only_points(path: str):
     df_false_only = read_csv_file(path)
     df_false_only = df_false_only[df_false_only['compiled_success'] == True]
@@ -333,20 +236,6 @@ def filter_not_run_false_only_points(path: str):
     mask = ~df_all['file_hash'].isin(set(prev_hashes))
     return df_all.loc[mask].copy()
 
-def extract_line_number(error_msg: str):
-    # Find patterns like: "line 131"
-    m = re.search(r"line\s+(\d+)", error_msg)
-    if m:
-        return int(m.group(1))
-    return None
-
-
-def copy_file(src: Path | str, dst: Path | str) -> None:
-    src = Path(src)
-    dst = Path(dst)
-
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
 
 if __name__ == "__main__":
     # previuos_run_log_path = Path("results/experiment_outputs/20251109T223554Z/482d928cb2be4eefb2c948f5740f162c/run_log_482d928cb2be4eefb2c948f5740f162c.jsonl")

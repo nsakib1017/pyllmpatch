@@ -1,6 +1,7 @@
 import tiktoken
 from .providers import LLM_MODELS, OPEN_LLM_MODELS
 from google import genai
+from typing import Optional
 import os
 
 SYSTEM_PROMPT_FOR_LOCAL = (
@@ -177,6 +178,14 @@ class Colors:
     ENDC = '\033[0m'
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
+
+
+
+def count_tokens_safe(text: Optional[str], provider, model_name) -> int:
+    try:
+        return count_tokens(text or "", provider, model_name)
+    except Exception:
+        return len(text or "")
 
 def count_tokens(text: str, encoding_name: str = "cl100k_base", model_name = "gemini-2.5-flash-lite") -> int:
     if not text:

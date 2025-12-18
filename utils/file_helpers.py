@@ -1,4 +1,5 @@
 # Read dataset_summary.csv into a pandas DataFrame
+import shutil
 import pandas as pd
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -7,7 +8,7 @@ import os
 import re
 import sys
 # import difflib
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Any
 
 
 INDENTED_RE = re.compile(r"^indented_(\d+)(?:\.[^.]+)?$")  # matches indented_12 or indented_12.py
@@ -58,6 +59,117 @@ def read_file(file_path: Path) -> Optional[str]:
     else:
         print("No valid file path provided.")
         return None
+
+def copy_file(src: Path | str, dst: Path | str) -> None:
+    src = Path(src)
+    dst = Path(dst)
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+
+
+def read_csv_file(file_name: str) -> pd.DataFrame:
+    script_dir = Path(__file__).parent
+    csv_path = script_dir / file_name
+    print(csv_path)
+    print(f"Trying to read: {csv_path.resolve()}")
+    df = pd.read_csv(csv_path)
+    return df
+
+
+def get_error_word_message_from_content(filepath):
+    FILE_LINE_RE = re.compile(r'^\s*File "([^"]+)", line (\d+)(?:, in (.+))?')
+    ERROR_LINE_RE = re.compile(r'^\s*(\w+(?:Error|Exception))(?:\s*:\s*(.*))?$')
+    SORRY_LINE_RE = re.compile(r'^\s*Sorry:\s*(\w+(?:Error|Exception))\s*:\s*(.*?)\s*\(([^,]+),\s*line\s*(\d+)\)\s*$')
+    error_word = []
+    messages = []
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.rstrip("\n")
+            m_file = FILE_LINE_RE.match(s)
+            if m_file:
+                continue
+            m_err = ERROR_LINE_RE.match(s)
+            if m_err:
+                error_word.append(m_err.group(1))
+                messages.append((m_err.group(2) or "").strip())
+                break
+            m_sorry = SORRY_LINE_RE.match(line)
+            if m_sorry:
+                error_word.append(m_sorry.group(1))
+                messages.append((m_sorry.group(2) or "").strip())
+                break
+            
+    error_word = error_word[0] if len(error_word) > 0 else None
+    message = messages[0] if len(messages) > 0 else None
+
+    return error_word, message
+
+
+def strip_code_fences(payload: Any) -> str:
+    """
+    Strips the code fences (```python, ~~~, etc.) from a string,
+    and handles different formats like None, dict, list, bytes, etc.
+    """
+    # ---- 1) Normalize to text ------------------------------------------------
+    def _normalize(x: Any) -> str:
+        if x is None:
+            return ""
+        if isinstance(x, bytes):
+            return x.decode("utf-8", errors="ignore")
+        if isinstance(x, str):
+            return x
+        if isinstance(x, dict):
+            # Common LLM shapes
+            val = x.get("content") or x.get("text") or ""
+            if isinstance(val, bytes):
+                return val.decode("utf-8", errors="ignore")
+            return str(val) if not isinstance(val, str) else val
+        if isinstance(x, list):
+            parts = []
+            for item in x:
+                if isinstance(item, dict):
+                    v = item.get("content") or item.get("text") or ""
+                    if isinstance(v, bytes):
+                        v = v.decode("utf-8", errors="ignore")
+                    parts.append(v if isinstance(v, str) else str(v))
+                else:
+                    parts.append(str(item))
+            return "\n".join(parts)
+        return str(x)
+
+    text = _normalize(payload)
+
+    # ---- 2) Strip fences (regex patterns) ----------------------------------
+    fence = r"(?:```|~~~)"
+    lang_until_eol = r"[^\r\n]*"  # Match language until end of line
+    # Refined regex that also ensures line breaks are handled
+    paired_re = re.compile(
+        rf"(?P<f>{fence})[ \t]*{lang_until_eol}[ \t]*(?:\r?\n)?"
+        rf"(?P<body>.*?)"
+        rf"(?:\r?\n)?(?P=f)[ \t]*", re.DOTALL
+    )
+
+    # This should strip the code block properly
+    text = paired_re.sub(lambda m: m.group("body"), text)
+
+    # ---- 3) Remove leading fence at the start of the string -----------------
+    leading_open_re = re.compile(
+        rf"^\ufeff?(?:{fence})[ \t]*{lang_until_eol}[ \t]*(?:\r?\n)?",
+        re.DOTALL,
+    )
+    text = leading_open_re.sub("", text, count=1)
+
+    # ---- 4) Remove trailing fence at the end of the string -----------------
+    trailing_close_re = re.compile(
+        rf"(?:\r?\n)?(?:{fence})[ \t]*\Z",
+        re.DOTALL,
+    )
+    text = trailing_close_re.sub("", text, count=1)
+
+    return text.strip()
+
+
 
 
 
