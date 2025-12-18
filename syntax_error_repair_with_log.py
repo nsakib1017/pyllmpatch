@@ -12,7 +12,7 @@ import time
 import uuid     
 from datetime import datetime, timezone  
 
-from typing import List, Tuple, Optional, Dict, Any  
+from typing import Tuple, Optional, Dict, Any  
 
 from utils.token_helpers import *
 from utils.providers import *
@@ -20,7 +20,7 @@ from utils.chunk_helpers import *
 from utils.file_helpers import *
 from utils.generate_bytecode import *
 
-from model.inference import fix_python_syntax
+from model.inference import *
 from utils.indentation_fixer import *
 
 
@@ -146,24 +146,6 @@ def strip_code_fences(payload: Any) -> str:
 
     return text.strip()
 
-
-
-
-
-def _count_fences(text: str) -> int:
-    return len(re.findall(r"(?:```|~~~)[^\n]*\n.*?(?:```|~~~)", text, flags=re.DOTALL))
-
-def _diff_lines(a: str, b: str) -> int:
-    return sum(1 for ln in difflib.ndiff(a.splitlines(), b.splitlines()) if ln[:1] in {"+", "-"})
-
-def _parse_error_type(msg: Optional[str]) -> Optional[str]:
-    if not msg:
-        return None
-    # pick first non-empty line and extract final token before ':' as error type
-    first = next((ln for ln in str(msg).splitlines() if ln.strip()), "")
-    m = re.search(r"([A-Za-z_][A-Za-z0-9_\.]*Error)\b", first)
-    return m.group(1) if m else first[:120]
-
 def _count_tokens_safe(text: Optional[str], provider, model_name) -> int:
     try:
         return count_tokens(text or "", provider, model_name)
@@ -174,60 +156,41 @@ def _now_iso() -> str:  # ISO8601 with timezone naive (UTC-like)
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
-def process_file_in_single_run(content: str, model: dict, error: str, retry_attempt=False, previuos_response="", previous_error="") -> Tuple[str, Dict[str, Any]]:
+def make_call_to_local_llm(content: str, model: dict, error: str,):
+    messages = build_chat_messages(code_snippet=content.strip("\n"), error_message=error, system_prompt=SYSTEM_PROMPT_FOR_LOCAL, user_prompt_template=USER_PROMPT_TEMPLATE_LOCAL)
+    llm_raw = fix_python_syntax(messages=messages)
+    return llm_raw
+
+def make_call_to_api_llm(content: str, model: dict, error: str):
+    prompt = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": get_user_prompt(content, error)}]
+        # print(prompt[1]["content"])
+
+    llm_raw = make_llm_call(prompt, model=model['name'], provider=model['provider'])
+    return llm_raw
+
+
+
+def process_file_in_single_run(content: str, model: dict, error: str) -> Tuple[str, Dict[str, Any]]:
     """Simulates processing a file that fits in the context window."""
     model_name = f"{model['provider']} - {model['name']}"
     print(f"{Colors.OKGREEN}    -> Content fits in a single run for {model_name}. Processing...{Colors.ENDC}")
-    context_indent = detect_context_indent(content.strip("\n"))
-    normalized_code = normalize_indentation(content.strip("\n"), context_indent)
     t0 = time.perf_counter()
-    if model["name"] in ['qwen-v2.5-coder-7b']:
-        messages = build_chat_messages(
-            code_snippet=normalized_code,
-            error_message=error,
-            system_prompt=SYSTEM_PROMPT_FOR_LOCAL,
-            user_prompt_template=USER_PROMPT_TEMPLATE_LOCAL,
-        )
-        print(content)
-        # print(normalized_code)
-        print('--------------------------------------------------')
-        llm_raw = fix_python_syntax(messages=messages)
-
-        try:
-            llm_response = strip_code_fences(llm_raw) if llm_raw else content
-        except Exception:
-            llm_response = content
-
-         #reapply_context_indent(llm_raw, context_indent)
-        
-        # sys.exit(0)
+    if model["name"] in {m["name"] for m in OPEN_LLM_MODELS}:
+        llm_raw = make_call_to_local_llm(content, model, error)
     else:
-        prompt = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": get_user_prompt(content, error, retry_attempt, previuos_response, previous_error)}
-        ]
-        # print(prompt[1]["content"])
-
-        llm_raw = make_llm_call(prompt, model=model['name'], provider=model['provider'])
-        # print(llm_raw)
-        try:
-            llm_response = strip_code_fences(llm_raw) if llm_raw else content
-        except Exception:
-            llm_response = content
+        llm_raw = make_call_to_api_llm(content, model, error)
     try:
-        llm_usage = llm_raw.get('usage', {}) if llm_raw else {}
+        llm_response = strip_code_fences(llm_raw) if llm_raw else content
     except Exception:
-        llm_usage = {}
-    # llm_raw = llm_response.get('content', {}) if llm_response else {}
-    # llm_usage = llm_raw.get('usage', {}) if llm_raw else {}
+        llm_response = content
+
     llm_elapsed_ms = int((time.perf_counter() - t0) * 1000)
     metrics = {
         "fits_single_run": True,
         "llm_calls": 1,
         "llm_latency_ms_total": llm_elapsed_ms,
-        "prompt_token_count": getattr(llm_usage, 'prompt_token_count', None),
-        "candidates_token_count": getattr(llm_usage, 'candidates_token_count', None),
-        "total_token_count": getattr(llm_usage, 'total_token_count', None),
         "chunk_count": 1,
         "merge_passes": 0,
         "avg_chunk_tokens": _count_tokens_safe(content, model["provider"], model["name"]),
@@ -236,81 +199,79 @@ def process_file_in_single_run(content: str, model: dict, error: str, retry_atte
     return (llm_response if llm_response else content), metrics
 
 
-def process_and_merge_chunks(chunks: List[str], model: dict, error, retry_attempt=False, previuos_chunks=[], previous_error="") -> Tuple[str, Dict[str, Any]]:
-    """
-    Simulates sending each chunk to an LLM and then merges the results back together.
-    """
-    model_name = f"{model['provider']} - {model['name']}"
-    print(f"   {Colors.OKCYAN} -> Processing and merging for {len(chunks)} chunks with {model_name}...{Colors.ENDC}")
+# def process_and_merge_chunks(chunks: List[str], model: dict, error, retry_attempt=False, previuos_chunks=[], previous_error="") -> Tuple[str, Dict[str, Any]]:
+#     """
+#     Simulates sending each chunk to an LLM and then merges the results back together.
+#     """
+#     model_name = f"{model['provider']} - {model['name']}"
+#     print(f"   {Colors.OKCYAN} -> Processing and merging for {len(chunks)} chunks with {model_name}...{Colors.ENDC}")
     
-    corrected_chunks = []
-    total_latency_ms = 0
-    max_chunk_tokens = 0
-    llm_calls = 0
+#     corrected_chunks = []
+#     total_latency_ms = 0
+#     max_chunk_tokens = 0
+#     llm_calls = 0
 
-    for i, chunk in enumerate(chunks):
-        ctoks = _count_tokens_safe(chunk,  model["provider"], model["name"])
-        max_chunk_tokens = max(max_chunk_tokens, ctoks)
-        print(f"        -> Processing chunk {i+1}/{len(chunks)} ({ctoks} tokens)...")
-        prompt = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": get_user_prompt_chunk(chunk, error, retry_attempt, previuos_chunks[i] if previuos_chunks and len(previuos_chunks) > 0 else "", previous_error)}
-        ]
-        print(prompt[1]["content"])
-        t0 = time.perf_counter()
-        llm_response = make_llm_call(prompt, model=model['name'], provider=model['provider'])
-        total_latency_ms += int((time.perf_counter() - t0) * 1000)
-        llm_calls += 1
-        llm_usage = llm_response.get('usage', {}) if llm_response else {}
-        llm_raw = llm_response.get('content', {}) if llm_response else {}
-        # total_in += _count_tokens_safe(prompt[0]["content"]) + _count_tokens_safe(prompt[1]["content"])
-        try:
-            corrected_chunk = strip_code_fences(llm_raw) if llm_raw else chunk
-        except Exception:
-            corrected_chunk = llm_raw
-        # total_out += _count_tokens_safe(corrected_chunk)
+#     for i, chunk in enumerate(chunks):
+#         ctoks = _count_tokens_safe(chunk,  model["provider"], model["name"])
+#         max_chunk_tokens = max(max_chunk_tokens, ctoks)
+#         print(f"        -> Processing chunk {i+1}/{len(chunks)} ({ctoks} tokens)...")
+#         prompt = [
+#             {"role": "system", "content": SYSTEM_PROMPT},
+#             {"role": "user", "content": get_user_prompt_chunk(chunk, error, retry_attempt, previuos_chunks[i] if previuos_chunks and len(previuos_chunks) > 0 else "", previous_error)}
+#         ]
+#         print(prompt[1]["content"])
+#         t0 = time.perf_counter()
+#         llm_response = make_llm_call(prompt, model=model['name'], provider=model['provider'])
+#         total_latency_ms += int((time.perf_counter() - t0) * 1000)
+#         llm_calls += 1
+#         llm_usage = llm_response.get('usage', {}) if llm_response else {}
+#         llm_raw = llm_response.get('content', {}) if llm_response else {}
+#         # total_in += _count_tokens_safe(prompt[0]["content"]) + _count_tokens_safe(prompt[1]["content"])
+#         try:
+#             corrected_chunk = strip_code_fences(llm_raw) if llm_raw else chunk
+#         except Exception:
+#             corrected_chunk = llm_raw
+#         # total_out += _count_tokens_safe(corrected_chunk)
 
-        corrected_chunks.append(corrected_chunk)
+#         corrected_chunks.append(corrected_chunk)
 
-    final_content = "\n".join(corrected_chunks)
+#     final_content = "\n".join(corrected_chunks)
 
-    print(f"    {Colors.OKGREEN}    -> All chunks processed and merged.{Colors.ENDC}")
-    print(f"    -> Final merged content token count: {count_tokens(final_content, model['provider'], model['name'])}")
+#     print(f"    {Colors.OKGREEN}    -> All chunks processed and merged.{Colors.ENDC}")
+#     print(f"    -> Final merged content token count: {count_tokens(final_content, model['provider'], model['name'])}")
 
-    metrics = {
-        "fits_single_run": False,
-        "chunk_count": len(chunks),
-        "merge_passes": 1,  # based on your call to chunk_top_level_objects_lenient_merged(..., extra_merge_passes=1)
-        "avg_chunk_tokens": int(sum(_count_tokens_safe(c,  model["provider"], model["name"]) for c in chunks) / max(1, len(chunks))),
-        "max_chunk_tokens": max_chunk_tokens,
-        "prompt_token_count": getattr(llm_usage, 'prompt_token_count', None),
-        "candidates_token_count": getattr(llm_usage, 'candidates_token_count', None),
-        "total_token_count": getattr(llm_usage, 'total_token_count', None),
-        "llm_calls": llm_calls,
-        "llm_latency_ms_total": total_latency_ms,
-    }
-    return final_content, metrics, corrected_chunks
+#     metrics = {
+#         "fits_single_run": False,
+#         "chunk_count": len(chunks),
+#         "merge_passes": 1,  # based on your call to chunk_top_level_objects_lenient_merged(..., extra_merge_passes=1)
+#         "avg_chunk_tokens": int(sum(_count_tokens_safe(c,  model["provider"], model["name"]) for c in chunks) / max(1, len(chunks))),
+#         "max_chunk_tokens": max_chunk_tokens,
+#         "prompt_token_count": getattr(llm_usage, 'prompt_token_count', None),
+#         "candidates_token_count": getattr(llm_usage, 'candidates_token_count', None),
+#         "total_token_count": getattr(llm_usage, 'total_token_count', None),
+#         "llm_calls": llm_calls,
+#         "llm_latency_ms_total": total_latency_ms,
+#     }
+#     return final_content, metrics, corrected_chunks
 
 
-def process_file_for_syntax_error_patching(initial_content: str, error_description, retry_attempt, previuos_response, previous_error, log_rec, llm=LLM_MODELS[4]) -> Optional[Tuple[str, Dict[str, Any]]]:
+def process_file_for_syntax_error_patching(initial_content: str, error_description,  log_rec={}, llm=OPEN_LLM_MODELS[0]) -> Optional[Tuple[str, Dict[str, Any]]]:
     log_rec.update({"provider": llm["provider"], "model_name": llm["name"]})
-    corrected_chunks = []
-    if initial_content is not None:
-        does_not_fit_model = check_context_windows(initial_content, llm)
-        if not does_not_fit_model:
-            final_code, metrics = process_file_in_single_run(initial_content, llm, error_description, retry_attempt, previuos_response, previous_error)
-        else:
-            chunks = chunk_top_level_objects_lenient_merged(
-                initial_content,
-                max_tokens_per_chunk=llm['token_for_completion'] - 5000,
-                headroom_tokens=1000,
-                extra_merge_passes=1
-            )
-            for chunk in chunks:
-                if _count_tokens_safe(chunk,  llm["provider"], llm["name"]) > llm['token_for_completion'] - 5000:
-                    return None
-            final_code, metrics, corrected_chunks = process_and_merge_chunks(chunks, llm, error_description, retry_attempt, previuos_response, previous_error)
-        return final_code, metrics, corrected_chunks
+    if initial_content is not None and not _count_tokens_safe(initial_content,  llm["provider"], llm["name"]) > llm['token_for_completion'] - 5000:
+            final_code, metrics = process_file_in_single_run(initial_content, llm, error_description)
+            return final_code, metrics
+        # else:
+        #     # chunks = chunk_top_level_objects_lenient_merged(
+        #     #     initial_content,
+        #     #     max_tokens_per_chunk=llm['token_for_completion'] - 5000,
+        #     #     headroom_tokens=1000,
+        #     #     extra_merge_passes=1
+        #     # )
+        #     # for chunk in chunks:
+        #     #     if _count_tokens_safe(chunk,  llm["provider"], llm["name"]) > llm['token_for_completion'] - 5000:
+        #     #         return None
+        #     # final_code, metrics, corrected_chunks = process_and_merge_chunks(chunks, llm, error_description, retry_attempt, previuos_response, previous_error)
+        #     return None  
     else:
         return None
 
@@ -428,16 +389,15 @@ if __name__ == "__main__":
         error_message_processed =  row.get("error_msg_clean") 
         error_word = row.get("syntactic_error_word")
         error_line_number = extract_line_number(initial_error_description)
-        # print(f" line: {error_line_number}")
+
         copy_dir  = BASE_DIR / file_hash / f"copy_of_{file_name}"
         copy_file(path_to_err_file, copy_dir)
         whole_content = read_file(copy_dir)
         version = extract_bytecode_major_minor(whole_content)
-        results = fetch_context_lines(Path(copy_dir), error_line_number)
-        # print(content)
-        # sys.exit(0)
-        if results:
-            content, start_ln, end_ln = results
+
+        syntax_context = fetch_syntax_context(copy_dir, error_line_number)
+        if syntax_context:
+            content, start_ln, end_ln, base_indent = syntax_context
         initial_content = content
         compilation_result = None
 
@@ -457,7 +417,6 @@ if __name__ == "__main__":
             # "model_name": LLM_MODELS[3]["name"],
             "compile_error_word_before": error_word,
             "compile_error_description_before": error_message_processed,
-            "fences_stripped": _count_fences(content),
         }
             # LLM repair
   
@@ -467,7 +426,7 @@ if __name__ == "__main__":
         # error_description = initial_error_description
         # Retry attempt logic set to false for local LLM for now
         while not is_compiled:
-            processed = process_file_for_syntax_error_patching(initial_content, initial_error_description, False, previuos_response, previous_error, log_rec=log_rec, llm=LLM_MODELS[6])
+            processed = process_file_for_syntax_error_patching(initial_content, initial_error_description, log_rec=log_rec, llm=OPEN_LLM_MODELS[0])
             if processed is None:
                 break
 
@@ -475,14 +434,14 @@ if __name__ == "__main__":
             if not AFFECTED_FILE_PATH.exists():
                 AFFECTED_FILE_PATH.mkdir(parents=True, exist_ok=True)
             
-            final_code, llm_metrics, chunk_responses = processed  
-            print(final_code)
+            final_code, llm_metrics = processed  
 
             # compile with timing
             t0 = time.perf_counter()
-            compilation_candidate = final_code
-            if LLM_MODELS[6]["name"] in ['qwen-v2.5-coder-7b']:
-                compilation_candidate = reattach_context_lines(Path(copy_dir), final_code, start_ln, end_ln)
+
+            final_code=align_indentation(final_code, base_indent)
+            compilation_candidate = reattach_block(copy_dir, final_code, start_ln, end_ln) if len(final_code.strip()) > 0 else read_file(copy_dir) if len(read_file(copy_dir))> 0 else read_file(path_to_err_file)
+
             with open(copy_dir, "w", encoding="utf-8") as f:
                 f.write(compilation_candidate)
                 f.close()
@@ -500,16 +459,14 @@ if __name__ == "__main__":
                 if not is_compiled:
                     print(f"{Colors.WARNING}    -> Re-compilation failed for file. Retrying.... {Colors.ENDC}")
                     error_line_number = extract_line_number(initial_error_description)
-                    results = fetch_context_lines(copy_dir, error_line_number)
-                    # print(content)
-                    # sys.exit(0)
-                    if results:
-                        initial_content, start_ln, end_ln = results
+                    syntax_context = fetch_syntax_context(copy_dir, error_line_number)
+
+                    if syntax_context:
+                        initial_content, start_ln, end_ln, base_indent = syntax_context
                         pass
             except Exception as e:
                 compile_ms = int((time.perf_counter() - t0) * 1000)
                 print(f"{Colors.WARNING}    -> Re-compilation failed for file. Retrying.... {Colors.ENDC}")
-                # error_description = str(e)
 
 
             total_attempts_completed += 1
@@ -517,21 +474,20 @@ if __name__ == "__main__":
 
             log_rec.update({
                 "fits_single_run": llm_metrics.get("fits_single_run"),
-                "chunk_count": llm_metrics.get("chunk_count"),
-                "merge_passes": llm_metrics.get("merge_passes"),
+                # "chunk_count": llm_metrics.get("chunk_count"),
+                # "merge_passes": llm_metrics.get("merge_passes"),
                 "avg_chunk_tokens": llm_metrics.get("avg_chunk_tokens"),
                 "max_chunk_tokens": llm_metrics.get("max_chunk_tokens"),
                 "llm_calls": llm_metrics.get("llm_calls"),
                 "llm_latency_ms_total": llm_metrics.get("llm_latency_ms_total"),
-                "prompt_token_count": llm_metrics.get("prompt_token_count"),
-                "candidates_token_count": llm_metrics.get("candidates_token_count"),
-                "total_token_count": llm_metrics.get("total_token_count"),
+                # "prompt_token_count": llm_metrics.get("prompt_token_count"),
+                # "candidates_token_count": llm_metrics.get("candidates_token_count"),
+                # "total_token_count": llm_metrics.get("total_token_count"),
                 "compiled_success": bool(is_compiled),
                 "total_attempts_completed": total_attempts_completed,
                 "compile_latency_ms": compile_ms,
                 "compile_error_word_after": None,
                 "compile_error_message_after": None,
-                "diff_lines": _diff_lines(compilation_candidate, initial_content),
             })
             if is_compiled:
                 log_rec.update({"path_out": str(AFFECTED_FILE_PATH / f"syntax_repaired_{file_name[:-3]}.py")})
@@ -540,13 +496,14 @@ if __name__ == "__main__":
             elif not is_compiled:
 
                 with open(str(AFFECTED_FILE_PATH / f"syntax_failed_repaired_{file_name[:-3]}_error.txt"), "w", encoding="utf-8") as f:
-                    f.write(previous_error or "Unknown error")
+                    f.write(initial_error_description or "Unknown error")
                     f.close()
                 error_word, error_message = get_error_word_message_from_content(str(AFFECTED_FILE_PATH / f"syntax_failed_repaired_{file_name[:-3]}_error.txt"))
-                if max_retries >= 0:
-                    previuos_response = compilation_candidate if len(chunk_responses) == 0 else chunk_responses
-                    retry_attempt = True
-                else:
+
+                if max_retries < 0:
+                #     previuos_response = compilation_candidate if len(chunk_responses) == 0 else chunk_responses
+                #     retry_attempt = True
+                # else:
                     print(f"{Colors.FAIL}    -> Max retries reached. Could not compile the file. {Colors.ENDC}")
                     try:
                         failure_cleanup(AFFECTED_FILE_PATH, compilation_candidate, file_name[:-3], error_word, error_message)
@@ -558,6 +515,7 @@ if __name__ == "__main__":
                         break
         count_idx += 1
         print(footer)
-        break # Remove this break to process all files
+
+        #break # Remove this break to process all files
 
         

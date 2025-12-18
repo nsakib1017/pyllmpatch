@@ -11,6 +11,8 @@ from typing import List, Tuple, Optional
 
 
 INDENTED_RE = re.compile(r"^indented_(\d+)(?:\.[^.]+)?$")  # matches indented_12 or indented_12.py
+INDENT_RE = re.compile(r"^(\s*)\S")
+DEF_CLASS_PREFIXES = ("def ", "class ", "async def ")
 
 def highest_indented_file(
     directory: Path | str,
@@ -58,23 +60,57 @@ def read_file(file_path: Path) -> Optional[str]:
         return None
 
 
-from pathlib import Path
-from typing import Optional
 
-from pathlib import Path
-from typing import Optional, Tuple
+def leading_spaces(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
 
-def fetch_context_lines(
-    file_path: Path,
-    line_number: int,
-    context: int = 10,
-) -> Optional[Tuple[str, int, int]]:
+
+def is_def_or_class(line: str) -> bool:
+    stripped = line.lstrip()
+    return stripped.startswith(DEF_CLASS_PREFIXES) and stripped.rstrip().endswith(":")
+
+
+def strip_base_indent(lines: list[str], base_indent: str) -> list[str]:
+    indent_len = len(base_indent)
+    stripped = []
+    for l in lines:
+        if l.startswith(base_indent):
+            stripped.append(l[indent_len:])
+        else:
+            stripped.append(l)
+    return stripped
+
+
+
+def compute_base_indent(lines: List[str]) -> str:
     """
-    Fetch up to `context` lines above and below the given line number (1-based).
+    Compute the minimum indentation of non-empty lines.
+    This is the indentation that must be preserved when reattaching.
+    """
+    indents = [
+        leading_spaces(l)
+        for l in lines
+        if l.strip()
+    ]
+    if not indents:
+        return ""
+    return " " * min(indents)
+
+
+# -------------------------
+# Core extractor
+# -------------------------
+
+def fetch_syntax_context(
+    file_path: Path,
+    error_line: int,
+    fallback_upward_lines: int = 100,
+) -> Optional[Tuple[str, int, int, str]]:
+    """
+    Fetch syntax context with indentation normalization.
 
     Returns:
-        (context_text, start_line_number, end_line_number)
-        or None if file/content is invalid.
+        (normalized_context_text, start_line, end_line, base_indent)
     """
 
     content = read_file(file_path)
@@ -82,75 +118,142 @@ def fetch_context_lines(
         return None
 
     lines = content.splitlines()
-
-    # Convert to 0-based index
-    idx = line_number - 1
+    idx = error_line - 1
 
     if idx < 0 or idx >= len(lines):
-        print(f"Line number {line_number} is out of range.")
         return None
 
-    start_idx = max(0, idx - context)
-    end_idx = min(len(lines) - 1, idx + context)
+    error_indent = leading_spaces(lines[idx])
 
-    context_lines = lines[start_idx : end_idx + 1]
+    # -------------------------
+    # 1️⃣ Enclosing function/class
+    # -------------------------
+    start_idx = None
+    block_indent = None
 
-    # Convert back to 1-based line numbers
-    start_line_no = start_idx + 1
-    end_line_no = end_idx + 1
+    for i in range(idx, -1, -1):
+        line = lines[i]
+        if not line.strip():
+            continue
 
-    return "\n".join(context_lines), start_line_no, end_line_no
+        indent = leading_spaces(line)
 
+        if indent < error_indent and is_def_or_class(line):
+            start_idx = i
+            block_indent = indent
+            break
 
-def reattach_context_lines(
-    file_path: Path,
-    new_snippet: str,
-    start_line: int,
-    end_line: int,
-    *,
-    newline: str = "\n",
-) -> Optional[str]:
-    """
-    Replace lines [start_line, end_line] (1-based, inclusive) in file_path
-    with new_snippet.
+    if start_idx is not None:
+        end_idx = start_idx + 1
+        for j in range(start_idx + 1, len(lines)):
+            line = lines[j]
+            if not line.strip():
+                continue
+            if leading_spaces(line) <= block_indent:
+                end_idx = j - 1
+                break
+        else:
+            end_idx = len(lines) - 1
 
-    Returns the updated full file content as a string,
-    or None if the operation fails.
-    """
+        block_lines = lines[start_idx:end_idx + 1]
+        base_indent = compute_base_indent(block_lines)
 
-    try:
-        original = file_path.read_text(encoding="utf-8")
-    except Exception as e:
-        print(f"Failed to read file {file_path}: {e}")
-        return None
+        normalized_lines = strip_base_indent(block_lines, base_indent)
 
-    lines = original.splitlines()
-
-    # Validate range
-    if start_line < 1 or end_line < start_line or end_line > len(lines):
-        print(
-            f"Invalid line range: {start_line}–{end_line} "
-            f"(file has {len(lines)} lines)"
+        return (
+            "\n".join(normalized_lines), 
+            start_idx + 1,
+            end_idx + 1,
+            base_indent,                
         )
-        return None
 
-    # Convert to 0-based indices
-    start_idx = start_line - 1
-    end_idx = end_line     # slicing end is exclusive
+    # -------------------------
+    # 2️⃣ Root-level block
+    # -------------------------
+    start_idx = idx
+    for i in range(idx, -1, -1):
+        if lines[i].strip() and leading_spaces(lines[i]) == 0:
+            start_idx = i
+            break
 
-    # Normalize new snippet into lines
-    new_lines = new_snippet.splitlines()
+    end_idx = start_idx + 1
+    for j in range(start_idx + 1, len(lines)):
+        if lines[j].strip() and leading_spaces(lines[j]) == 0:
+            end_idx = j - 1
+            break
+    else:
+        end_idx = len(lines) - 1
 
-    # Patch
-    updated_lines = (
-        lines[:start_idx]
-        + new_lines
-        + lines[end_idx:]
+    expanded_start = max(0, start_idx - fallback_upward_lines)
+    block_lines = lines[expanded_start:end_idx + 1]
+    base_indent = compute_base_indent(block_lines)
+
+    normalized_lines = strip_base_indent(block_lines, base_indent)
+
+    return (
+        "\n".join(normalized_lines),      # 👈 normalized
+        expanded_start + 1,
+        end_idx + 1,
+        base_indent,
     )
 
-    updated_content = newline.join(updated_lines)
 
-    return updated_content
+def normalize_lines(text: str) -> List[str]:
+    return text.splitlines()
+
+
+def apply_base_indent(lines: List[str], base_indent: str) -> List[str]:
+    """
+    Apply base indentation to all non-empty lines.
+    """
+    return [
+        (base_indent + l if l.strip() else l)
+        for l in lines
+    ]
+
+
+def align_indentation(
+    patched_block: str,
+    base_indent: str,
+) -> str:
+    """
+    Align indentation of patched_block to match original_block.
+    """
+
+    patched_lines = normalize_lines(patched_block)
+
+    # Reapply original indentation
+    aligned = apply_base_indent(patched_lines, base_indent)
+
+    return "\n".join(aligned)
 
 
 
+def reattach_block(
+    file_path: Path,
+    start_line: int,
+    end_line: int,
+    new_block: str,
+    backup: bool = False,
+) -> None:
+    """
+    Replace lines [start_line, end_line] with new_block.
+    Creates a backup if requested.
+    """
+
+    content = file_path.read_text(encoding="utf-8")
+    lines = content.splitlines()
+
+    if backup:
+        backup_path = file_path.with_suffix(file_path.suffix + ".bak")
+        backup_path.write_text(content, encoding="utf-8")
+
+    new_lines = new_block.splitlines()
+
+    updated = (
+        lines[: start_line - 1]
+        + new_lines
+        + lines[end_line:]
+    )
+
+    file_path.write_text("\n".join(updated) + "\n", encoding="utf-8")
