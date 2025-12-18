@@ -438,9 +438,18 @@ if __name__ == "__main__":
 
             # compile with timing
             t0 = time.perf_counter()
+            final_code = final_code.strip()
 
-            final_code=align_indentation(final_code, base_indent)
-            compilation_candidate = reattach_block(copy_dir, final_code, start_ln, end_ln) if len(final_code.strip()) > 0 else read_file(copy_dir) if len(read_file(copy_dir))> 0 else read_file(path_to_err_file)
+            if final_code:
+                final_code=align_indentation(final_code, base_indent)
+                compilation_candidate = reattach_block(copy_dir,start_ln,end_ln,final_code)
+            else:
+                copied_content = read_file(copy_dir)
+                if copied_content:
+                    compilation_candidate = copied_content
+                else:
+                    compilation_candidate = read_file(path_to_err_file)
+
 
             with open(copy_dir, "w", encoding="utf-8") as f:
                 f.write(compilation_candidate)
