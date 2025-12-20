@@ -32,9 +32,9 @@ BASE_DIR = Path("/home/diogenes/pylingual_colaboration/pypi_downloaded")
 
 def prepare_snippets_for_repair(previous_run_log_path: str = ""):
     if not previous_run_log_path:
-        return read_csv_file('./dataset/balanced_sample.csv')
+        return read_csv_file('../dataset/balanced_sample.csv')
     df_previous_log = pd.read_json(previous_run_log_path, lines=True)
-    df_balanced = read_csv_file('./dataset/decompiled_syntax_errors.csv')  # your helper
+    df_balanced = read_csv_file('../dataset/decompiled_syntax_errors.csv')  # your helper
 
     # Normalize types and remove NaNs/dupes just in case
     prev_hashes = (
@@ -74,13 +74,16 @@ def process_file_in_single_run(content: str, model: dict, error: str) -> Tuple[s
     print(f"{Colors.OKGREEN}    -> Content fits in a single run for {model_name}. Processing...{Colors.ENDC}")
     t0 = time.perf_counter()
     if model["name"] in {m["name"] for m in OPEN_LLM_MODELS}:
-        llm_raw = make_call_to_local_llm(content, model, error)
+        llm_raw = make_call_to_local_llm(content, error)
     else:
         llm_raw = make_call_to_api_llm(content, model, error)
     try:
         llm_response = strip_code_fences(llm_raw) if llm_raw else content
     except Exception:
         llm_response = content
+    
+    # print(llm_response)
+    # sys.exit(0)
 
     llm_elapsed_ms = int((time.perf_counter() - t0) * 1000)
     metrics = {
@@ -242,7 +245,7 @@ if __name__ == "__main__":
     df_all = prepare_snippets_for_repair()
     # df_syntax_error_balanced = prepare_snippets_for_repair()
     #df_syntax_error_balanced = filter_not_run_false_only_points('./dataset/cleaned_results_with_no_retry.csv')
-    df_syntax_error_balanced = read_csv_file('./dataset/decompiled_syntax_errors.csv')
+    df_syntax_error_balanced = read_csv_file('../dataset/decompiled_syntax_errors.csv')
     df_syntax_error_balanced = df_syntax_error_balanced.sample(frac=1, random_state=42).reset_index(drop=True)  # shuffle
     # df_syntax_error_balanced = df_syntax_error_balanced.head(50) 
     print('DataFrame shape:', df_syntax_error_balanced.shape)
@@ -331,7 +334,8 @@ if __name__ == "__main__":
 
             if final_code:
                 final_code=align_indentation(final_code, base_indent)
-                compilation_candidate = reattach_block(copy_dir,start_ln,end_ln,final_code)
+                reattach_block(copy_dir,start_ln,end_ln,final_code)
+                compilation_candidate = read_file(copy_dir)
             else:
                 copied_content = read_file(copy_dir)
                 if copied_content:
@@ -339,10 +343,6 @@ if __name__ == "__main__":
                 else:
                     compilation_candidate = read_file(path_to_err_file)
 
-
-            with open(copy_dir, "w", encoding="utf-8") as f:
-                f.write(compilation_candidate)
-                f.close()
             try:
                 compilation_result = compile_new_pyc(
                     compilation_candidate,

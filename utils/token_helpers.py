@@ -11,7 +11,8 @@ SYSTEM_PROMPT_FOR_LOCAL = (
     "Do NOT fix logic errors, runtime errors, or improve code quality unless required to resolve a syntax error.\n"
     "Do NOT refactor, reformat, or modify any code that is already syntactically valid.\n"
     "If there are orphaned break, continue, statements without the corresponding loop you can add a dummy one to address this invalid syntax.\n"
-    "You must always look for other syntax errors that are pPRESENT beyond the one mentioned in the error message, and fix them with minimal modification to the snippet.\n",
+    "You must always look for other syntax errors that are PRESENT beyond the one mentioned in the error message, and fix them with minimal modification to the snippet.\n",
+    "If there are missing try/except blocks that are causing syntax errors, you can add some pass statement in the added block to fix the error and make the snippet syntactically valid.\n",
     "Preserve all error-free lines exactly as they appear in the original code.\n"
     "The final output must be a syntactically valid Python program.\n"
     "Output ONLY the corrected Python code.\n"
@@ -82,11 +83,11 @@ def build_chat_messages(
     messages = [
         {
             "role": "system",
-            "content": system_prompt.strip(),
+            "content": str(system_prompt).strip(),
         },
         {
             "role": "user",
-            "content": user_prompt.strip(),
+            "content": str(user_prompt).strip(),
         },
     ]
 
@@ -203,7 +204,7 @@ def count_tokens(text: str, encoding_name: str = "cl100k_base", model_name = "ge
             num_tokens = len(encoding.encode(text))
             return num_tokens
         except Exception as e:
-            print(f"{Colors.FAIL}    -> Correct encoding not found for model {model_name} with encoding {encoding_name}. Trying default encoding.")
+            # print(f"{Colors.WARNING}    -> Correct encoding not found for model {model_name} with encoding {encoding_name}. Trying default encoding.")
             encoding = tiktoken.get_encoding("cl100k_base")
             # Encode the text and count the number of tokens
             num_tokens = len(encoding.encode(text))
