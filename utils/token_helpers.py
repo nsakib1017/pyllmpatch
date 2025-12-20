@@ -5,53 +5,80 @@ from typing import Optional
 import os
 
 SYSTEM_PROMPT_FOR_LOCAL = (
-    "You are an expert Python programmer and code repair specialist. "
-    "Your task is to correct Python SYNTAX errors only.\n"
-    "Make ONLY the minimal changes strictly required for the code to parse and compile successfully.\n"
-    "Do NOT fix logic errors, runtime errors, or improve code quality unless required to resolve a syntax error.\n"
-    "Do NOT refactor, reformat, or modify any code that is already syntactically valid.\n"
-    "If there are orphaned break, continue, statements without the corresponding loop you can add a dummy one to address this invalid syntax.\n"
-    "You must always look for other syntax errors that are PRESENT beyond the one mentioned in the error message, and fix them with minimal modification to the snippet.\n",
-    "If there are missing try/except blocks that are causing syntax errors, you can add some pass statement in the added block to fix the error and make the snippet syntactically valid.\n",
-    "Preserve all error-free lines exactly as they appear in the original code.\n"
-    "The final output must be a syntactically valid Python program.\n"
-    "Output ONLY the corrected Python code.\n"
-    "You can add missing try/except blocks with necessary/missing codes to fix the error described.\n",
-    "You can add colons, parentheses, quotes, or other syntax elements as needed \n"
-    "Do NOT include explanations, reasoning, comments, markdown, or formatting wrappers of any kind.\n"
-    "Do NOT add any text before or after the code.\n"
-)
+    "You are an expert Python programmer and syntax repair specialist.\n"
+    "Your task is to fix Python SYNTAX errors only.\n\n"
 
-SYSTEM_PROMPT_FOR_LOCAL_ALIGNMENT = (
-    "You are an expert Python programmer and code alignment specialist. "
-    "You will be given an ORIGINAL Python code snippet that contains the correct indentation and whitespace context, "
-    "and a PATCHED Python code snippet that fixes syntax errors but may have incorrect or missing indentation.\n"
-    "Your task is to apply the indentation and leading whitespace structure from the ORIGINAL code snippet to the PATCHED code snippet.\n"
-    "You must preserve the exact indentation levels (spaces or tabs) from the ORIGINAL code wherever possible.\n"
-    "For lines that were modified or newly introduced in the PATCHED snippet, infer their indentation by matching the logical parent block "
-    "and surrounding indentation levels in the ORIGINAL snippet.\n"
-    "Make ONLY the minimal indentation changes strictly required for the code to parse and compile successfully.\n"
-    "Do NOT change code logic, control flow, identifiers, or line ordering.\n"
-    "Do NOT refactor, reformat, or modify any code other than leading whitespace.\n"
-    "Preserve all error-free lines exactly as they appear in the ORIGINAL code.\n"
-    "Assume indentation levels in lines ABOVE the error locations in the ORIGINAL snippet are reliable and must be treated as ground truth.\n"
-    "If indentation ambiguity exists, choose the indentation that allows the code to parse successfully while remaining consistent with the ORIGINAL snippet.\n"
-    "The final output must be a syntactically valid Python program.\n"
-    "Output ONLY the final Python code.\n"
-    "Do NOT include explanations, reasoning, comments, markdown, diff markers, or formatting wrappers of any kind.\n"
+    "Make ONLY the minimal changes strictly required for the code to parse and compile successfully.\n"
+    "Do NOT fix logic errors, runtime errors, or improve code quality unless doing so is absolutely necessary to resolve a syntax error.\n"
+    "Do NOT refactor, reformat, rename symbols, or modify any code that is already syntactically valid.\n\n"
+
+    "The provided error message is for reference only and may point to the wrong line. "
+    "You must inspect surrounding lines and earlier code to identify the true root cause of any syntax error.\n\n"
+
+    "If there are orphaned 'break', 'continue', or similar statements that cause invalid syntax, "
+    "you may add the smallest possible syntactic wrapper (such as a dummy loop) solely to make the code syntactically valid.\n"
+
+    "If missing or incomplete try/except blocks cause syntax errors, "
+    "you may add the minimal required structure (including 'pass' where necessary) to restore syntactic correctness.\n\n"
+
+    "You must also fix any OTHER syntax errors present in the snippet beyond the one mentioned in the error message, "
+    "as long as they can be resolved with minimal changes.\n\n"
+
+    "Preserve all error-free lines exactly as they appear in the original code, including indentation.\n"
+    "The final output must be a syntactically valid Python program.\n\n"
+
+    "Output ONLY the corrected Python code.\n"
+    "Do NOT include explanations, reasoning, comments, markdown, or formatting wrappers of any kind.\n"
     "Do NOT add any text before or after the code."
 )
 
 
+SYSTEM_PROMPT_FOR_ROOT_CAUSE_ANALYSIS = (
+    "You are an expert Python compiler and syntax error analyst.\n"
+    "Your task is to analyze a Python code snippet and identify the ROOT CAUSE of the syntax error "
+    "described in the error message.\n"
+    "The error description is provided for reference only and may point to an incorrect line, "
+    "as Python syntax errors often originate from earlier lines or unclosed constructs.\n"
+    "In addition to the reported error, you must also identify and explain any OTHER Python syntax errors "
+    "present in the snippet that would prevent it from parsing or compiling successfully.\n"
+    "You must reason about parser state, including unclosed parentheses or blocks, invalid indentation, "
+    "misplaced control-flow statements, missing delimiters, or structurally invalid constructs.\n"
+    "Your output must explain WHAT the syntax errors are and WHY they occur, focusing on how the Python "
+    "parser interprets the code.\n"
+    "Do NOT propose fixes and do NOT output any code.\n"
+    "Provide a concise explanation in 5–6 complete sentences.\n"
+    "Do NOT include bullet points, markdown, formatting, or any text outside the explanation.\n"
+    "Focus strictly on syntactic structure, not runtime behavior or logical correctness."
+)
+
+
+USER_PROMPT_TEMPLATE_ROOT_CAUSE = (
+    "Analyze the Python code snippet below to determine the ROOT CAUSE of the syntax error described, "
+    "and to identify any OTHER syntax errors present in the snippet.\n\n"
+    "Error description (for reference only; the reported line may be incorrect):\n"
+    "{error_message}\n\n"
+    "Code snippet:\n"
+    "{code_snippet}\n\n"
+    "Explain what the primary syntax error is and why it occurs, and also explain any additional "
+    "syntax errors that would prevent the code from parsing or compiling successfully. "
+    "Your explanation must be 5–6 complete sentences. "
+    "Do not suggest fixes and do not output any code."
+)
+
 
 USER_PROMPT_TEMPLATE_LOCAL = (
     "Analyze the Python code snippet below and fix all syntax errors.\n\n"
-    "Initial error message:\n"
+    "Initial error message (for reference only; it may point to the wrong line):\n"
     "{error_message}\n\n"
     "Initial code snippet:\n"
     "{code_snippet}\n\n"
+    "Explanation of the root cause of the syntax error (CONTEXT ONLY — do not repeat or paraphrase):\n"
+    "{current_explanation}\n\n"
+    "Apply minimal syntax-only fixes based on the code and the explanation above.\n"
+    "Output ONLY the corrected Python code.\n"
     "If the code contains no syntax errors or the errors cannot be fixed, return the code unchanged."
 )
+
 
 USER_PROMPT_TEMPLATE_LOCAL_ALIGNMENT = (
     "You are given two Python code snippets.\n\n"
@@ -74,11 +101,14 @@ def build_chat_messages(
     error_message: str,
     system_prompt: str,
     user_prompt_template: str,
+    current_explanation: Optional[str] = None,
 ) -> list[dict]:
-    user_prompt = user_prompt_template.format(
-        error_message=error_message,
-        code_snippet=code_snippet,
-    )
+    format_kwargs = { "error_message": error_message,   "code_snippet": code_snippet,}
+
+    if current_explanation is not None:
+        format_kwargs["current_explanation"] = current_explanation
+
+    user_prompt = user_prompt_template.format(**format_kwargs)
 
     messages = [
         {

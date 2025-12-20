@@ -52,9 +52,16 @@ def prepare_snippets_for_repair(previous_run_log_path: str = ""):
 def _now_iso() -> str:  # ISO8601 with timezone naive (UTC-like)
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-def make_call_to_local_llm(content: str,  error: str,):
-    messages = build_chat_messages(code_snippet=content.strip("\n"), error_message=error, system_prompt=SYSTEM_PROMPT_FOR_LOCAL, user_prompt_template=USER_PROMPT_TEMPLATE_LOCAL)
+def make_call_to_local_llm(content: str,  error: str, current_explanation: str):
+    messages = build_chat_messages(code_snippet=content.strip("\n"), error_message=error, system_prompt=SYSTEM_PROMPT_FOR_LOCAL, user_prompt_template=USER_PROMPT_TEMPLATE_LOCAL, current_explanation=current_explanation)
     llm_raw = fix_python_syntax(messages=messages)
+    return llm_raw
+
+
+def explain_current_code_syntax_error(content: str, error: str) -> str:
+    messages = build_chat_messages(code_snippet=content.strip("\n"), error_message=error, system_prompt=SYSTEM_PROMPT_FOR_ROOT_CAUSE_ANALYSIS, user_prompt_template=USER_PROMPT_TEMPLATE_ROOT_CAUSE)
+    llm_raw = fix_python_syntax(messages=messages)
+    # print("Explanation of syntax error root cause:\n", llm_raw)
     return llm_raw
 
 def make_call_to_api_llm(content: str, model: dict, error: str):
@@ -73,8 +80,9 @@ def process_file_in_single_run(content: str, model: dict, error: str) -> Tuple[s
     model_name = f"{model['provider']} - {model['name']}"
     print(f"{Colors.OKGREEN}    -> Content fits in a single run for {model_name}. Processing...{Colors.ENDC}")
     t0 = time.perf_counter()
+    current_explanation = explain_current_code_syntax_error(content, error)
     if model["name"] in {m["name"] for m in OPEN_LLM_MODELS}:
-        llm_raw = make_call_to_local_llm(content, error)
+        llm_raw = make_call_to_local_llm(content, error, current_explanation)
     else:
         llm_raw = make_call_to_api_llm(content, model, error)
     try:
