@@ -1,4 +1,5 @@
 # Read dataset_summary.csv into a pandas DataFrame
+import gc
 import pandas as pd
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -232,26 +233,26 @@ def extract_line_number(error_msg: str):
         return int(m.group(1))
     return None
 
-def filter_not_run_false_only_points(path: str):
-    df_false_only = read_csv_file(path)
-    df_false_only = df_false_only[df_false_only['compiled_success'] == True]
-    prev_hashes = (
-        df_false_only['file_hash']
-        .dropna()
-        .astype(str)
-        .drop_duplicates()
-    )
-    df_all['file_hash'] = df_all['file_hash'].astype(str)
+# def filter_not_run_false_only_points(path: str):
+#     df_false_only = read_csv_file(path)
+#     df_false_only = df_false_only[df_false_only['compiled_success'] == True]
+#     prev_hashes = (
+#         df_false_only['file_hash']
+#         .dropna()
+#         .astype(str)
+#         .drop_duplicates()
+#     )
+#     df_all['file_hash'] = df_all['file_hash'].astype(str)
 
-    # Anti-join: keep rows in df_balanced whose file_hash is NOT in previous
-    mask = ~df_all['file_hash'].isin(set(prev_hashes))
-    return df_all.loc[mask].copy()
+#     # Anti-join: keep rows in df_balanced whose file_hash is NOT in previous
+#     mask = ~df_all['file_hash'].isin(set(prev_hashes))
+#     return df_all.loc[mask].copy()
 
 
 if __name__ == "__main__":
     # previuos_run_log_path = Path("results/experiment_outputs/20251109T223554Z/482d928cb2be4eefb2c948f5740f162c/run_log_482d928cb2be4eefb2c948f5740f162c.jsonl")
-    df_all = prepare_snippets_for_repair()
-    # df_syntax_error_balanced = prepare_snippets_for_repair()
+    # df_all = prepare_snippets_for_repair()
+    # df_syntax_error_balanced = prepare_snippets_for_repair(Path("./results/experiment_outputs/20251223T180639Z/d82b101116224c3b89c37902cdb29415/run_log_d82b101116224c3b89c37902cdb29415.jsonl"))
     #df_syntax_error_balanced = filter_not_run_false_only_points('./dataset/cleaned_results_with_no_retry.csv')
     df_syntax_error_balanced = read_csv_file('../dataset/decompiled_syntax_errors.csv')
     df_syntax_error_balanced = df_syntax_error_balanced.sample(frac=1, random_state=42).reset_index(drop=True)  # shuffle
@@ -326,6 +327,11 @@ if __name__ == "__main__":
         # error_description = initial_error_description
         # Retry attempt logic set to false for local LLM for now
         while not is_compiled:
+            # Trigger garbage collection
+            gc.collect()
+
+            # Clear GPU cache
+            torch.cuda.empty_cache()
             processed = process_file_for_syntax_error_patching(initial_content, initial_error_description, log_rec=log_rec, llm=OPEN_LLM_MODELS[0])
             if processed is None:
                 break
