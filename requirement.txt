@@ -12,7 +12,6 @@ transformers
 trl
 accelerate
 bitsandbytes
-torch 
 #setup gpu specific pytorch for cuda
 peft
 scipy
