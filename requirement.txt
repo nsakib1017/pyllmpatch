@@ -12,16 +12,16 @@ transformers
 trl
 accelerate
 bitsandbytes
-#setup gpu specific pytorch for cuda
+#setup gpu specific pytorch for cuda, install triton from source as well
 peft
 scipy
 einops
 evaluate
+uv
 
 # Optional (recommended for local dev)
 openpyxl
 datasets
-transformers
 scikit-learn
 sentence-transformers
 xlsxwriter

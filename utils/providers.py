@@ -31,7 +31,7 @@ LLM_MODELS = [
 
 OPEN_LLM_MODELS =  [
     {'provider': 'Alibaba', 'name': 'qwen2.5-coder-7b', 'token_for_completion': 16384},
-    {'provider': 'Alibaba', 'name': 'qwen2.5-coder-34b', 'token_for_completion': 16384}
+    {'provider': 'Alibaba', 'name': 'qwen2.5-coder-32b', 'token_for_completion': 16384}
 ]
 
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY") , base_url="https://api.openai.com/v1")

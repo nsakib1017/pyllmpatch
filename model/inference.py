@@ -1,11 +1,10 @@
 # model/inference.py
-import torch
 from model.loader import load_model_once
 import contextlib
 import os
 import sys
 
-MODEL_PATH = "/home/diogenes/pylingual_colaboration/pylingual_download/code/finetuning/merged_model_qwen2.5_coder_7b_instruct"
+MODEL_PATH = "/home/mxs220189/pylingual_collaboration/pylingual_download/code/finetuning/merged_model_qwen2.5_coder_32b_instruct_15_epochs"
 
 # SYSTEM_PROMPT = (
 #     "You are an expert Python programmer and code repair specialist. "

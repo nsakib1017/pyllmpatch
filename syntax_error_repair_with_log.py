@@ -28,7 +28,7 @@ from utils.indentation_fixer import *
 from dotenv import load_dotenv
 load_dotenv()
 
-BASE_DIR = Path("/home/diogenes/pylingual_colaboration/pypi_downloaded")
+BASE_DIR = Path("/home/mxs220189/pylingual_collaboration/pypi_downloaded")
 
 
 def prepare_snippets_for_repair(previous_run_log_path: str = ""):
@@ -163,7 +163,7 @@ def process_file_in_single_run(content: str, model: dict, error: str) -> Tuple[s
 #     return final_content, metrics, corrected_chunks
 
 
-def process_file_for_syntax_error_patching(initial_content: str, error_description,  log_rec={}, llm=OPEN_LLM_MODELS[0]) -> Optional[Tuple[str, Dict[str, Any]]]:
+def process_file_for_syntax_error_patching(initial_content: str, error_description,  log_rec={}, llm=OPEN_LLM_MODELS[1]) -> Optional[Tuple[str, Dict[str, Any]]]:
     log_rec.update({"provider": llm["provider"], "model_name": llm["name"]})
     if initial_content is not None and not count_tokens_safe(initial_content,  llm["provider"], llm["name"]) > llm['token_for_completion'] - 5000:
             final_code, metrics = process_file_in_single_run(initial_content, llm, error_description)
@@ -327,12 +327,7 @@ if __name__ == "__main__":
         # error_description = initial_error_description
         # Retry attempt logic set to false for local LLM for now
         while not is_compiled:
-            # Trigger garbage collection
-            gc.collect()
-
-            # Clear GPU cache
-            torch.cuda.empty_cache()
-            processed = process_file_for_syntax_error_patching(initial_content, initial_error_description, log_rec=log_rec, llm=OPEN_LLM_MODELS[0])
+            processed = process_file_for_syntax_error_patching(initial_content, initial_error_description, log_rec=log_rec, llm=OPEN_LLM_MODELS[1])
             if processed is None:
                 break
 
