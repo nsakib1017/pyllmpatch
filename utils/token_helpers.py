@@ -21,6 +21,9 @@ SYSTEM_PROMPT_FOR_LOCAL = (
     "If missing or incomplete try/except blocks cause syntax errors, "
     "you may add the minimal required structure (including 'pass' where necessary) to restore syntactic correctness.\n\n"
 
+    "If missing or incomplete match statements cause syntax errors, "
+    "you may add the minimal required structure a default case (i.e., case _:, including 'pass' where necessary) to restore syntactic correctness.\n\n"
+
     "You must also fix any OTHER syntax errors present in the snippet beyond the one mentioned in the error message, "
     "as long as they can be resolved with minimal changes.\n\n"
 
@@ -43,6 +46,7 @@ SYSTEM_PROMPT_FOR_ROOT_CAUSE_ANALYSIS = (
     "present in the snippet that would prevent it from parsing or compiling successfully.\n"
     "You must reason about parser state, including unclosed parentheses or blocks, invalid indentation, "
     "misplaced control-flow statements, missing delimiters, or structurally invalid constructs.\n"
+    "You must look out for missing try/except blocks, orphaned 'break' or 'continue' statements, match statements without cases, and any other syntax issues that would cause the code to fail to parse.\n"
     "Your output must explain WHAT the syntax errors are and WHY they occur, focusing on how the Python "
     "parser interprets the code.\n"
     "Do NOT propose fixes and do NOT output any code.\n"

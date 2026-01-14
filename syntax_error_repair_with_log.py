@@ -33,7 +33,8 @@ BASE_DIR = Path("/home/mxs220189/pylingual_collaboration/pypi_downloaded")
 
 def prepare_snippets_for_repair(previous_run_log_path: str = ""):
     if not previous_run_log_path:
-        return read_csv_file('../dataset/balanced_sample.csv')
+        # return read_csv_file('../dataset/balanced_sample.csv')
+        return read_csv_file('../dataset/decompiled_syntax_errors.csv')
     df_previous_log = pd.read_json(previous_run_log_path, lines=True)
     df_balanced = read_csv_file('../dataset/decompiled_syntax_errors.csv')  # your helper
 
@@ -53,8 +54,16 @@ def prepare_snippets_for_repair(previous_run_log_path: str = ""):
 def _now_iso() -> str:  # ISO8601 with timezone naive (UTC-like)
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-def make_call_to_local_llm(content: str,  error: str, current_explanation: str):
+def make_call_to_local_llm(content: str,  error: str, current_explanation: str, affected_file_path: Path):
     messages = build_chat_messages(code_snippet=content.strip("\n"), error_message=error, system_prompt=SYSTEM_PROMPT_FOR_LOCAL, user_prompt_template=USER_PROMPT_TEMPLATE_LOCAL, current_explanation=current_explanation)
+
+    if not affected_file_path.exists():
+                affected_file_path.mkdir(parents=True, exist_ok=True)
+
+    out_path = affected_file_path / "last_message_to_llm_for_file.json"
+    with open(str(out_path), "w", encoding="utf-8") as f:
+        json.dump(messages, f, ensure_ascii=False, indent=2, default=str)
+
     llm_raw = fix_python_syntax(messages=messages)
     return llm_raw
 
@@ -76,14 +85,14 @@ def make_call_to_api_llm(content: str, model: dict, error: str):
 
 
 
-def process_file_in_single_run(content: str, model: dict, error: str) -> Tuple[str, Dict[str, Any]]:
+def process_file_in_single_run(content: str, model: dict, error: str, affected_file_path: Path) -> Tuple[str, Dict[str, Any]]:
     """Simulates processing a file that fits in the context window."""
     model_name = f"{model['provider']} - {model['name']}"
     print(f"{Colors.OKGREEN}    -> Content fits in a single run for {model_name}. Processing...{Colors.ENDC}")
     t0 = time.perf_counter()
     current_explanation = explain_current_code_syntax_error(content, error)
     if model["name"] in {m["name"] for m in OPEN_LLM_MODELS}:
-        llm_raw = make_call_to_local_llm(content, error, current_explanation)
+        llm_raw = make_call_to_local_llm(content, error, current_explanation, affected_file_path)
     else:
         llm_raw = make_call_to_api_llm(content, model, error)
     try:
@@ -163,10 +172,10 @@ def process_file_in_single_run(content: str, model: dict, error: str) -> Tuple[s
 #     return final_content, metrics, corrected_chunks
 
 
-def process_file_for_syntax_error_patching(initial_content: str, error_description,  log_rec={}, llm=OPEN_LLM_MODELS[1]) -> Optional[Tuple[str, Dict[str, Any]]]:
+def process_file_for_syntax_error_patching(initial_content: str, error_description, affected_file_path: Path, log_rec={}, llm=OPEN_LLM_MODELS[1]) -> Optional[Tuple[str, Dict[str, Any]]]:
     log_rec.update({"provider": llm["provider"], "model_name": llm["name"]})
     if initial_content is not None and not count_tokens_safe(initial_content,  llm["provider"], llm["name"]) > llm['token_for_completion'] - 5000:
-            final_code, metrics = process_file_in_single_run(initial_content, llm, error_description)
+            final_code, metrics = process_file_in_single_run(initial_content, llm, error_description, affected_file_path)
             return final_code, metrics
         # else:
         #     # chunks = chunk_top_level_objects_lenient_merged(
@@ -250,11 +259,11 @@ def extract_line_number(error_msg: str):
 
 
 if __name__ == "__main__":
-    # previuos_run_log_path = Path("results/experiment_outputs/20251109T223554Z/482d928cb2be4eefb2c948f5740f162c/run_log_482d928cb2be4eefb2c948f5740f162c.jsonl")
+    previuos_run_log_path = Path("results/experiment_outputs/20260112T194554Z/c4311d685a734ec59e3483c318b2a7a5/run_log_c4311d685a734ec59e3483c318b2a7a5.jsonl")
     # df_all = prepare_snippets_for_repair()
-    # df_syntax_error_balanced = prepare_snippets_for_repair(Path("./results/experiment_outputs/20251223T180639Z/d82b101116224c3b89c37902cdb29415/run_log_d82b101116224c3b89c37902cdb29415.jsonl"))
+    df_syntax_error_balanced = prepare_snippets_for_repair(str(previuos_run_log_path))
     #df_syntax_error_balanced = filter_not_run_false_only_points('./dataset/cleaned_results_with_no_retry.csv')
-    df_syntax_error_balanced = read_csv_file('../dataset/decompiled_syntax_errors.csv')
+    # df_syntax_error_balanced = read_csv_file('../dataset/decompiled_syntax_errors.csv')
     df_syntax_error_balanced = df_syntax_error_balanced.sample(frac=1, random_state=42).reset_index(drop=True)  # shuffle
     # df_syntax_error_balanced = df_syntax_error_balanced.head(50) 
     print('DataFrame shape:', df_syntax_error_balanced.shape)
@@ -327,7 +336,7 @@ if __name__ == "__main__":
         # error_description = initial_error_description
         # Retry attempt logic set to false for local LLM for now
         while not is_compiled:
-            processed = process_file_for_syntax_error_patching(initial_content, initial_error_description, log_rec=log_rec, llm=OPEN_LLM_MODELS[1])
+            processed = process_file_for_syntax_error_patching(initial_content, initial_error_description, Path(LOG_BASE / file_hash), log_rec=log_rec, llm=OPEN_LLM_MODELS[1])
             if processed is None:
                 break
 
