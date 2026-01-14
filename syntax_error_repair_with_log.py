@@ -28,15 +28,14 @@ from utils.indentation_fixer import *
 from dotenv import load_dotenv
 load_dotenv()
 
-BASE_DIR = Path(str(os.getenv("BASE_DIR")))
+BASE_DIR_PYTHON_FILES = Path(str(os.getenv("BASE_DIR_PYTHON_FILES")))
 
 
 def prepare_snippets_for_repair(previous_run_log_path: str = ""):
     if not previous_run_log_path:
-        # return read_csv_file('../dataset/balanced_sample.csv')
-        return read_csv_file(str(os.getenv("BASE_DATASET_PATH")))
+        return read_csv_file(f"{os.getenv('PROJECT_ROOT_DIR')}/dataset/{os.getenv('BASE_DATASET_NAME')}") 
     df_previous_log = pd.read_json(previous_run_log_path, lines=True)
-    df_balanced = read_csv_file(str(os.getenv("BASE_DATASET_PATH")))  # your helper
+    df_balanced = read_csv_file(f"{os.getenv('PROJECT_ROOT_DIR')}/dataset/{os.getenv('BASE_DATASET_NAME')}")
 
     # Normalize types and remove NaNs/dupes just in case
     prev_hashes = (
@@ -242,26 +241,11 @@ def extract_line_number(error_msg: str):
         return int(m.group(1))
     return None
 
-# def filter_not_run_false_only_points(path: str):
-#     df_false_only = read_csv_file(path)
-#     df_false_only = df_false_only[df_false_only['compiled_success'] == True]
-#     prev_hashes = (
-#         df_false_only['file_hash']
-#         .dropna()
-#         .astype(str)
-#         .drop_duplicates()
-#     )
-#     df_all['file_hash'] = df_all['file_hash'].astype(str)
-
-#     # Anti-join: keep rows in df_balanced whose file_hash is NOT in previous
-#     mask = ~df_all['file_hash'].isin(set(prev_hashes))
-#     return df_all.loc[mask].copy()
-
 
 if __name__ == "__main__":
     previuos_run_log_path = Path(str(os.getenv("PREVIOUS_RUN_LOG_PATH"))) if os.getenv("PREVIOUS_RUN_LOG_PATH") else None
     # df_all = prepare_snippets_for_repair()
-    df_syntax_error_balanced = prepare_snippets_for_repair(str(previuos_run_log_path))
+    df_syntax_error_balanced = prepare_snippets_for_repair(str(previuos_run_log_path) if previuos_run_log_path else "")
     #df_syntax_error_balanced = filter_not_run_false_only_points('./dataset/cleaned_results_with_no_retry.csv')
     # df_syntax_error_balanced = read_csv_file('../dataset/decompiled_syntax_errors.csv')
     df_syntax_error_balanced = df_syntax_error_balanced.sample(frac=1, random_state=42).reset_index(drop=True)  # shuffle
@@ -282,7 +266,7 @@ if __name__ == "__main__":
         is_compiled = False
         file_hash = norm_str(row.get("file_hash"))
         file_name = norm_str(row.get("file"))
-        file_dir = BASE_DIR / file_hash / file_name
+        file_dir = BASE_DIR_PYTHON_FILES / file_hash / file_name
         
 
         # highest_indented_file returns Optional[Tuple[Path, int]]
@@ -300,7 +284,7 @@ if __name__ == "__main__":
         error_word = row.get("syntactic_error_word")
         error_line_number = extract_line_number(initial_error_description)
 
-        copy_dir  = BASE_DIR / file_hash / f"copy_of_{file_name}"
+        copy_dir  = BASE_DIR_PYTHON_FILES / file_hash / f"copy_of_{file_name}"
         copy_file(path_to_err_file, copy_dir)
         whole_content = read_file(copy_dir)
         version = extract_bytecode_major_minor(whole_content)

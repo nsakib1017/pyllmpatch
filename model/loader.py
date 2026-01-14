@@ -22,7 +22,7 @@ def load_model_once(
         model_path,
         trust_remote_code=True,
         local_files_only=True,
-        fix_mistral_regex=True,  # ✅ FIX
+        fix_mistral_regex=True,
     )
 
     model = AutoModelForCausalLM.from_pretrained(
