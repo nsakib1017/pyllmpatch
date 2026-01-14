@@ -4,8 +4,6 @@ import contextlib
 import os
 import sys
 
-MODEL_PATH = "/home/mxs220189/pylingual_collaboration/pylingual_download/code/finetuning/merged_model_qwen2.5_coder_32b_instruct_15_epochs"
-
 # SYSTEM_PROMPT = (
 #     "You are an expert Python programmer and code repair specialist. "
 #     "Fix ONLY Python syntax errors. "
@@ -14,12 +12,12 @@ MODEL_PATH = "/home/mxs220189/pylingual_collaboration/pylingual_download/code/fi
 # )
 
 
-def fix_python_syntax(*, messages) -> str:
+def call_llm_with_message(*, messages, model_path) -> str:
     """
     Run inference using the merged model.
     """
 
-    model, tokenizer = load_model_once(model_path=MODEL_PATH,)
+    model, tokenizer = load_model_once(model_path=model_path,)
 
     # messages = [
     #     {"role": "system", "content": SYSTEM_PROMPT},

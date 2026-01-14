@@ -28,15 +28,15 @@ from utils.indentation_fixer import *
 from dotenv import load_dotenv
 load_dotenv()
 
-BASE_DIR = Path("/home/mxs220189/pylingual_collaboration/pypi_downloaded")
+BASE_DIR = Path(str(os.getenv("BASE_DIR")))
 
 
 def prepare_snippets_for_repair(previous_run_log_path: str = ""):
     if not previous_run_log_path:
         # return read_csv_file('../dataset/balanced_sample.csv')
-        return read_csv_file('../dataset/decompiled_syntax_errors.csv')
+        return read_csv_file(str(os.getenv("BASE_DATASET_PATH")))
     df_previous_log = pd.read_json(previous_run_log_path, lines=True)
-    df_balanced = read_csv_file('../dataset/decompiled_syntax_errors.csv')  # your helper
+    df_balanced = read_csv_file(str(os.getenv("BASE_DATASET_PATH")))  # your helper
 
     # Normalize types and remove NaNs/dupes just in case
     prev_hashes = (
@@ -54,7 +54,7 @@ def prepare_snippets_for_repair(previous_run_log_path: str = ""):
 def _now_iso() -> str:  # ISO8601 with timezone naive (UTC-like)
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-def make_call_to_local_llm(content: str,  error: str, current_explanation: str, affected_file_path: Path):
+def make_call_to_local_llm(content: str,  error: str, current_explanation: str, affected_file_path: Path, model_path: str):
     messages = build_chat_messages(code_snippet=content.strip("\n"), error_message=error, system_prompt=SYSTEM_PROMPT_FOR_LOCAL, user_prompt_template=USER_PROMPT_TEMPLATE_LOCAL, current_explanation=current_explanation)
 
     if not affected_file_path.exists():
@@ -64,13 +64,13 @@ def make_call_to_local_llm(content: str,  error: str, current_explanation: str, 
     with open(str(out_path), "w", encoding="utf-8") as f:
         json.dump(messages, f, ensure_ascii=False, indent=2, default=str)
 
-    llm_raw = fix_python_syntax(messages=messages)
+    llm_raw = call_llm_with_message(messages=messages, model_path=model_path)
     return llm_raw
 
 
-def explain_current_code_syntax_error(content: str, error: str) -> str:
+def explain_current_code_syntax_error(content: str, error: str, model_path: str) -> str:
     messages = build_chat_messages(code_snippet=content.strip("\n"), error_message=error, system_prompt=SYSTEM_PROMPT_FOR_ROOT_CAUSE_ANALYSIS, user_prompt_template=USER_PROMPT_TEMPLATE_ROOT_CAUSE)
-    llm_raw = fix_python_syntax(messages=messages)
+    llm_raw = call_llm_with_message(messages=messages, model_path=model_path)
     # print("Explanation of syntax error root cause:\n", llm_raw)
     return llm_raw
 
@@ -90,9 +90,9 @@ def process_file_in_single_run(content: str, model: dict, error: str, affected_f
     model_name = f"{model['provider']} - {model['name']}"
     print(f"{Colors.OKGREEN}    -> Content fits in a single run for {model_name}. Processing...{Colors.ENDC}")
     t0 = time.perf_counter()
-    current_explanation = explain_current_code_syntax_error(content, error)
+    current_explanation = explain_current_code_syntax_error(content, error, model["model_path"])
     if model["name"] in {m["name"] for m in OPEN_LLM_MODELS}:
-        llm_raw = make_call_to_local_llm(content, error, current_explanation, affected_file_path)
+        llm_raw = make_call_to_local_llm(content, error, current_explanation, affected_file_path, model["model_path"])
     else:
         llm_raw = make_call_to_api_llm(content, model, error)
     try:
@@ -259,7 +259,7 @@ def extract_line_number(error_msg: str):
 
 
 if __name__ == "__main__":
-    previuos_run_log_path = Path("results/experiment_outputs/20260112T194554Z/c4311d685a734ec59e3483c318b2a7a5/run_log_c4311d685a734ec59e3483c318b2a7a5.jsonl")
+    previuos_run_log_path = Path(str(os.getenv("PREVIOUS_RUN_LOG_PATH"))) if os.getenv("PREVIOUS_RUN_LOG_PATH") else None
     # df_all = prepare_snippets_for_repair()
     df_syntax_error_balanced = prepare_snippets_for_repair(str(previuos_run_log_path))
     #df_syntax_error_balanced = filter_not_run_false_only_points('./dataset/cleaned_results_with_no_retry.csv')
@@ -325,7 +325,7 @@ if __name__ == "__main__":
             "bytecode_version": version,
             # "provider": LLM_MODELS[3]["provider"],
             # "model_name": LLM_MODELS[3]["name"],
-            "compile_error_word_before": error_word,
+            # "compile_error_word_before": error_word,
             "compile_error_description_before": error_message_processed,
         }
             # LLM repair
@@ -336,7 +336,7 @@ if __name__ == "__main__":
         # error_description = initial_error_description
         # Retry attempt logic set to false for local LLM for now
         while not is_compiled:
-            processed = process_file_for_syntax_error_patching(initial_content, initial_error_description, Path(LOG_BASE / file_hash), log_rec=log_rec, llm=OPEN_LLM_MODELS[1])
+            processed = process_file_for_syntax_error_patching(initial_content, initial_error_description, Path(LOG_BASE / file_hash), log_rec=log_rec, llm=OPEN_LLM_MODELS[0])
             if processed is None:
                 break
 
