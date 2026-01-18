@@ -369,3 +369,11 @@ def reattach_block(
     )
 
     file_path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+
+
+
+def create_file_from_response(
+    file_path: Path,
+    content: str,
+) -> None:
+    file_path.write_text(content + "\n", encoding="utf-8")

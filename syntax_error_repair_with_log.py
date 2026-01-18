@@ -289,10 +289,10 @@ if __name__ == "__main__":
         whole_content = read_file(copy_dir)
         version = extract_bytecode_major_minor(whole_content)
 
-        syntax_context = fetch_syntax_context(copy_dir, error_line_number)
-        if syntax_context:
-            content, start_ln, end_ln, base_indent = syntax_context
-        initial_content = content
+        # syntax_context = fetch_syntax_context(copy_dir, error_line_number)
+        # if syntax_context:
+        #     content, start_ln, end_ln, base_indent = syntax_context
+        # initial_content = content
         compilation_result = None
 
         max_retries = int(os.getenv("NO_OF_MAX_RETRIES")) if os.getenv("NO_OF_MAX_RETRIES") else 0  # max attempts to recompile
@@ -320,9 +320,18 @@ if __name__ == "__main__":
         # error_description = initial_error_description
         # Retry attempt logic set to false for local LLM for now
         while not is_compiled:
-            processed = process_file_for_syntax_error_patching(initial_content, initial_error_description, Path(LOG_BASE / file_hash), log_rec=log_rec, llm=OPEN_LLM_MODELS[0])
+            with_pin_point = False
+            processed = process_file_for_syntax_error_patching(initial_content, initial_error_description, Path(LOG_BASE / file_hash), log_rec=log_rec, llm=OPEN_LLM_MODELS[1])
             if processed is None:
-                break
+                syntax_context = fetch_syntax_context(copy_dir, error_line_number)
+                if syntax_context:
+                    content, start_ln, end_ln, base_indent = syntax_context
+                    initial_content = content
+                    processed = process_file_for_syntax_error_patching(initial_content, initial_error_description, Path(LOG_BASE / file_hash), log_rec=log_rec, llm=OPEN_LLM_MODELS[1])
+                    if processed is None:
+                        break
+                    else:
+                        with_pin_point = True
 
             AFFECTED_FILE_PATH = LOG_BASE / file_hash
             if not AFFECTED_FILE_PATH.exists():
@@ -335,9 +344,12 @@ if __name__ == "__main__":
             final_code = final_code.strip()
 
             if final_code:
-                final_code=align_indentation(final_code, base_indent)
-                reattach_block(copy_dir,start_ln,end_ln,final_code)
-                compilation_candidate = read_file(copy_dir)
+                if with_pin_point:
+                    final_code = align_indentation(final_code, base_indent)
+                    reattach_block(copy_dir,start_ln,end_ln,final_code)
+                    compilation_candidate = read_file(copy_dir)
+                else:  
+                    compilation_candidate = create_file_from_response(copy_dir, final_code)
             else:
                 copied_content = read_file(copy_dir)
                 if copied_content:
@@ -394,7 +406,6 @@ if __name__ == "__main__":
                 os.unlink(copy_dir)
                 _append_log(LOG_FILE, log_rec)
             elif not is_compiled:
-
                 with open(str(AFFECTED_FILE_PATH / f"syntax_failed_repaired_{file_name[:-3]}_error.txt"), "w", encoding="utf-8") as f:
                     f.write(initial_error_description or "Unknown error")
                     f.close()
