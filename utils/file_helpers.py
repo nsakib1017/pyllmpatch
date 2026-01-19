@@ -209,24 +209,40 @@ def compute_base_indent(lines: List[str]) -> str:
     return " " * min(indents)
 
 
-# -------------------------
-# Core extractor
-# -------------------------
+
+def build_triple_quote_mask(lines):
+    """
+    Returns a list[bool] where True means the line is inside a triple-quoted string.
+    """
+    in_triple = False
+    triple_char = None
+    mask = [False] * len(lines)
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+
+        # Count occurrences to handle """ text """ on one line
+        for quote in ('"""', "'''"):
+            count = stripped.count(quote)
+            if count % 2 == 1:
+                if not in_triple:
+                    in_triple = True
+                    triple_char = quote
+                elif quote == triple_char:
+                    in_triple = False
+                    triple_char = None
+
+        mask[i] = in_triple
+
+    return mask
 
 def fetch_syntax_context(
     file_path: Path,
     error_line: int,
-    fallback_upward_lines: int = 100,
-) -> Optional[Tuple[str, int, int, str]]:
-    """
-    Fetch syntax context with indentation normalization.
-
-    Returns:
-        (normalized_context_text, start_line, end_line, base_indent)
-    """
+) -> Optional[Tuple[str, int, int, int]]:
 
     content = read_file(file_path)
-    if content is None:
+    if not content:
         return None
 
     lines = content.splitlines()
@@ -235,80 +251,76 @@ def fetch_syntax_context(
     if idx < 0 or idx >= len(lines):
         return None
 
+    triple_mask = build_triple_quote_mask(lines)
+
+    def is_anchor(line: str, i: int) -> bool:
+        if triple_mask[i]:
+            return False
+        s = line.lstrip()
+        return s.startswith("@") or is_def_or_class(line)
+
+    def is_top_level_anchor(line: str, i: int) -> bool:
+        return (
+            not triple_mask[i]
+            and line.strip()
+            and leading_spaces(line) == 0
+            and (line.lstrip().startswith("@") or is_def_or_class(line))
+        )
+
     error_indent = leading_spaces(lines[idx])
 
-    # -------------------------
-    # 1️⃣ Enclosing function/class
-    # -------------------------
-    start_idx = None
-    block_indent = None
+    # ----------------------------------------------
+    # Case 1: Error inside an indented region
+    # ----------------------------------------------
+    if error_indent > 0:
+        start_idx = 0
+        for i in range(idx, -1, -1):
+            if lines[i].strip() and is_anchor(lines[i], i):
+                start_idx = i
+                break
 
-    for i in range(idx, -1, -1):
-        line = lines[i]
-        if not line.strip():
-            continue
-
-        indent = leading_spaces(line)
-
-        if indent < error_indent and is_def_or_class(line):
-            start_idx = i
-            block_indent = indent
-            break
-
-    if start_idx is not None:
-        end_idx = start_idx + 1
-        for j in range(start_idx + 1, len(lines)):
-            line = lines[j]
-            if not line.strip():
-                continue
-            if leading_spaces(line) <= block_indent:
+        end_idx = len(lines) - 1
+        for j in range(idx + 1, len(lines)):
+            if is_top_level_anchor(lines[j], j):
                 end_idx = j - 1
                 break
-        else:
-            end_idx = len(lines) - 1
 
         block_lines = lines[start_idx:end_idx + 1]
         base_indent = compute_base_indent(block_lines)
-
-        normalized_lines = strip_base_indent(block_lines, base_indent)
+        normalized = strip_base_indent(block_lines, base_indent)
 
         return (
-            "\n".join(normalized_lines), 
+            "\n".join(normalized),
             start_idx + 1,
             end_idx + 1,
-            base_indent,                
+            base_indent,
         )
 
-    # -------------------------
-    # 2️⃣ Root-level block
-    # -------------------------
-    start_idx = idx
-    for i in range(idx, -1, -1):
-        if lines[i].strip() and leading_spaces(lines[i]) == 0:
+    # ----------------------------------------------
+    # Case 2: Global-scope error
+    # ----------------------------------------------
+    start_idx = 0
+    for i in range(idx - 1, -1, -1):
+        if is_top_level_anchor(lines[i], i):
             start_idx = i
             break
 
-    end_idx = start_idx + 1
-    for j in range(start_idx + 1, len(lines)):
-        if lines[j].strip() and leading_spaces(lines[j]) == 0:
+    end_idx = len(lines) - 1
+    for j in range(idx + 1, len(lines)):
+        if is_top_level_anchor(lines[j], j):
             end_idx = j - 1
             break
-    else:
-        end_idx = len(lines) - 1
 
-    expanded_start = max(0, start_idx - fallback_upward_lines)
-    block_lines = lines[expanded_start:end_idx + 1]
+    block_lines = lines[start_idx:end_idx + 1]
     base_indent = compute_base_indent(block_lines)
-
-    normalized_lines = strip_base_indent(block_lines, base_indent)
+    normalized = strip_base_indent(block_lines, base_indent)
 
     return (
-        "\n".join(normalized_lines),      # 👈 normalized
-        expanded_start + 1,
+        "\n".join(normalized),
+        start_idx + 1,
         end_idx + 1,
         base_indent,
     )
-
 
 def normalize_lines(text: str) -> List[str]:
     return text.splitlines()
@@ -376,4 +388,5 @@ def create_file_from_response(
     file_path: Path,
     content: str,
 ) -> None:
-    file_path.write_text(content + "\n", encoding="utf-8")
+    content = content.splitlines()
+    file_path.write_text("\n".join(content) + "\n", encoding="utf-8")

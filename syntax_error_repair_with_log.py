@@ -28,30 +28,54 @@ from utils.indentation_fixer import *
 from dotenv import load_dotenv
 load_dotenv()
 
+
+RepairResult = Tuple[str, Dict[str, Any], bool, Optional[int], Optional[int], Optional[int]]
+
+
+
 BASE_DIR_PYTHON_FILES = Path(str(os.getenv("BASE_DIR_PYTHON_FILES")))
 
-
-def prepare_snippets_for_repair(previous_run_log_path: str = ""):
+def prepare_snippets_for_repair(
+    previous_run_log_path: str = "",
+    only_previously_failed: bool = False,
+):
     if not previous_run_log_path:
-        return read_csv_file(f"{os.getenv('PROJECT_ROOT_DIR')}/dataset/{os.getenv('BASE_DATASET_NAME')}") 
+        return read_csv_file(
+            f"{os.getenv('PROJECT_ROOT_DIR')}/dataset/{os.getenv('BASE_DATASET_NAME')}"
+        )
+
     df_previous_log = pd.read_json(previous_run_log_path, lines=True)
-    df_balanced = read_csv_file(f"{os.getenv('PROJECT_ROOT_DIR')}/dataset/{os.getenv('BASE_DATASET_NAME')}")
+    df_balanced = read_csv_file(
+        f"{os.getenv('PROJECT_ROOT_DIR')}/dataset/{os.getenv('BASE_DATASET_NAME')}"
+    )
 
     # Normalize types and remove NaNs/dupes just in case
-    prev_hashes = (
-        df_previous_log['file_hash']
-        .dropna()
-        .astype(str)
-        .drop_duplicates()
-    )
-    df_balanced['file_hash'] = df_balanced['file_hash'].astype(str)
-    mask = ~df_balanced['file_hash'].isin(set(prev_hashes))
+    df_previous_log["file_hash"] = df_previous_log["file_hash"].astype(str)
+    df_balanced["file_hash"] = df_balanced["file_hash"].astype(str)
+
+    if only_previously_failed:
+        # File hashes that never compiled successfully
+        success_by_file = (
+            df_previous_log
+            .groupby("file_hash")["compiled_success"]
+            .any()
+        )
+        failed_hashes = success_by_file[~success_by_file].index
+        mask = df_balanced["file_hash"].isin(set(failed_hashes))
+    else:
+        # Original behavior: exclude all previously seen file_hashes
+        prev_hashes = (
+            df_previous_log["file_hash"]
+            .dropna()
+            .drop_duplicates()
+        )
+        mask = ~df_balanced["file_hash"].isin(set(prev_hashes))
+
     return df_balanced.loc[mask].copy()
 
 
-
-def _now_iso() -> str:  # ISO8601 with timezone naive (UTC-like)
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 def make_call_to_local_llm(content: str,  error: str, current_explanation: str, affected_file_path: Path, model_path: str):
     messages = build_chat_messages(code_snippet=content.strip("\n"), error_message=error, system_prompt=SYSTEM_PROMPT_FOR_LOCAL, user_prompt_template=USER_PROMPT_TEMPLATE_LOCAL, current_explanation=current_explanation)
@@ -241,16 +265,95 @@ def extract_line_number(error_msg: str):
         return int(m.group(1))
     return None
 
+def attempt_repair(
+    *,
+    copy_dir: Path,
+    error_description: str,
+    log_base: Path,
+    file_hash: str,
+    llm,
+    log_rec: Dict[str, Any],
+    strategy_state: Dict[str, Dict[str, Any]],
+    try_whole_file: bool = False,
+) -> Optional[RepairResult]:
+    strategies = ["syntax_context"]
+    if try_whole_file:
+        strategies.append("whole_file")
+
+    for strategy in strategies:
+        state = strategy_state.get(strategy)
+        if not state:
+            continue
+
+        processed = None
+        with_pin_point = False
+        start_ln = None
+        end_ln = None
+        base_indent = None
+
+        if not try_whole_file:
+            error_line = extract_line_number(error_description)
+            syntax_context = fetch_syntax_context(copy_dir, error_line)
+
+            if not syntax_context:
+                state["failures"] += 1
+                continue
+
+            initial_content, start_ln, end_ln, base_indent = syntax_context
+            with_pin_point = True
+
+            if not initial_content:
+                with_pin_point = False
+                initial_content = read_file(copy_dir)
+
+            processed = process_file_for_syntax_error_patching(
+                initial_content,
+                error_description,
+                log_base / file_hash,
+                log_rec=log_rec,
+                llm=llm,
+            )
+
+        elif try_whole_file:
+            initial_content = read_file(copy_dir)
+            processed = process_file_for_syntax_error_patching(
+                initial_content,
+                error_description,
+                log_base / file_hash,
+                log_rec=log_rec,
+                llm=llm,
+            )
+
+        if processed is None:
+            state["failures"] += 1
+            continue
+
+        # success
+        state["failures"] = 0
+
+        final_code, llm_metrics = processed
+
+        return (
+            final_code,
+            llm_metrics,
+            with_pin_point,
+            start_ln,
+            end_ln,
+            base_indent,
+        )
+
+    return None
+
+
+
 
 if __name__ == "__main__":
     previuos_run_log_path = Path(str(os.getenv("PREVIOUS_RUN_LOG_PATH"))) if os.getenv("PREVIOUS_RUN_LOG_PATH") else None
-    # df_all = prepare_snippets_for_repair()
-    df_syntax_error_balanced = prepare_snippets_for_repair(str(previuos_run_log_path) if previuos_run_log_path else "")
-    #df_syntax_error_balanced = filter_not_run_false_only_points('./dataset/cleaned_results_with_no_retry.csv')
-    # df_syntax_error_balanced = read_csv_file('../dataset/decompiled_syntax_errors.csv')
+    df_syntax_error_balanced = prepare_snippets_for_repair(str(previuos_run_log_path) if previuos_run_log_path else "", only_previously_failed=True)
     df_syntax_error_balanced = df_syntax_error_balanced.sample(frac=1, random_state=42).reset_index(drop=True)  # shuffle
-    # df_syntax_error_balanced = df_syntax_error_balanced.head(50) 
+    
     print('DataFrame shape:', df_syntax_error_balanced.shape)
+    
     run_id = uuid.uuid4().hex
     batch_start_ts = _now_iso()
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") 
@@ -282,17 +385,12 @@ if __name__ == "__main__":
         #error_message_processed =  row.get("precessed_error_message") 
         error_message_processed =  row.get("error_msg_clean") 
         error_word = row.get("syntactic_error_word")
-        error_line_number = extract_line_number(initial_error_description)
+        # error_line_number = extract_line_number(initial_error_description)
 
         copy_dir  = BASE_DIR_PYTHON_FILES / file_hash / f"copy_of_{file_name}"
         copy_file(path_to_err_file, copy_dir)
         whole_content = read_file(copy_dir)
         version = extract_bytecode_major_minor(whole_content)
-
-        # syntax_context = fetch_syntax_context(copy_dir, error_line_number)
-        # if syntax_context:
-        #     content, start_ln, end_ln, base_indent = syntax_context
-        # initial_content = content
         compilation_result = None
 
         max_retries = int(os.getenv("NO_OF_MAX_RETRIES")) if os.getenv("NO_OF_MAX_RETRIES") else 0  # max attempts to recompile
@@ -320,36 +418,37 @@ if __name__ == "__main__":
         # error_description = initial_error_description
         # Retry attempt logic set to false for local LLM for now
         while not is_compiled:
-            with_pin_point = False
-            processed = process_file_for_syntax_error_patching(initial_content, initial_error_description, Path(LOG_BASE / file_hash), log_rec=log_rec, llm=OPEN_LLM_MODELS[1])
-            if processed is None:
-                syntax_context = fetch_syntax_context(copy_dir, error_line_number)
-                if syntax_context:
-                    content, start_ln, end_ln, base_indent = syntax_context
-                    initial_content = content
-                    processed = process_file_for_syntax_error_patching(initial_content, initial_error_description, Path(LOG_BASE / file_hash), log_rec=log_rec, llm=OPEN_LLM_MODELS[1])
-                    if processed is None:
-                        break
-                    else:
-                        with_pin_point = True
+            try:
+                final_code, llm_metrics, with_pin_point, start_ln, end_ln, base_indent = attempt_repair(
+                    copy_dir=copy_dir, 
+                    error_description=initial_error_description, 
+                    log_base=LOG_BASE, 
+                    file_hash=file_hash, 
+                    llm=OPEN_LLM_MODELS[1], 
+                    log_rec=log_rec,
+                    strategy_state={"syntax_context": {"failures": 0}, "whole_file": {"failures": 0},},
+                    try_whole_file= True if (total_attempts_completed > (int(max_retries/2) - 1)) else False
+                )
+            except Exception as e:
+                print(f"Error during repair attempt: {e}")
+                break
 
             AFFECTED_FILE_PATH = LOG_BASE / file_hash
             if not AFFECTED_FILE_PATH.exists():
                 AFFECTED_FILE_PATH.mkdir(parents=True, exist_ok=True)
-            
-            final_code, llm_metrics = processed  
 
             # compile with timing
             t0 = time.perf_counter()
             final_code = final_code.strip()
-
+            # print(with_pin_point, final_code)
             if final_code:
                 if with_pin_point:
                     final_code = align_indentation(final_code, base_indent)
                     reattach_block(copy_dir,start_ln,end_ln,final_code)
-                    compilation_candidate = read_file(copy_dir)
                 else:  
-                    compilation_candidate = create_file_from_response(copy_dir, final_code)
+                    create_file_from_response(copy_dir, final_code)
+                
+                compilation_candidate = read_file(copy_dir)
             else:
                 copied_content = read_file(copy_dir)
                 if copied_content:
@@ -370,12 +469,6 @@ if __name__ == "__main__":
                 initial_error_description = compilation_result["error_description"]
                 if not is_compiled:
                     print(f"{Colors.WARNING}    -> Re-compilation failed for file. Retrying.... {Colors.ENDC}")
-                    error_line_number = extract_line_number(initial_error_description)
-                    syntax_context = fetch_syntax_context(copy_dir, error_line_number)
-
-                    if syntax_context:
-                        initial_content, start_ln, end_ln, base_indent = syntax_context
-                        pass
             except Exception as e:
                 compile_ms = int((time.perf_counter() - t0) * 1000)
                 print(f"{Colors.WARNING}    -> Re-compilation failed for file. Retrying.... {Colors.ENDC}")
@@ -412,9 +505,6 @@ if __name__ == "__main__":
                 error_word, error_message = get_error_word_message_from_content(str(AFFECTED_FILE_PATH / f"syntax_failed_repaired_{file_name[:-3]}_error.txt"))
 
                 if max_retries < 0:
-                #     previuos_response = compilation_candidate if len(chunk_responses) == 0 else chunk_responses
-                #     retry_attempt = True
-                # else:
                     print(f"{Colors.FAIL}    -> Max retries reached. Could not compile the file. {Colors.ENDC}")
                     try:
                         failure_cleanup(AFFECTED_FILE_PATH, compilation_candidate, file_name[:-3], error_word, error_message)
