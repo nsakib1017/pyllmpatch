@@ -468,10 +468,10 @@ if __name__ == "__main__":
                 # previous_error = compilation_result["error_description"]
                 initial_error_description = compilation_result["error_description"]
                 if not is_compiled:
-                    print(f"{Colors.WARNING}    -> Re-compilation failed for file. Retrying.... {Colors.ENDC}")
+                    print(f"{Colors.WARNING}    -> Re-compilation failed for file. Retrying ({total_attempts_completed}/{max_retries+1}).... {Colors.ENDC}")
             except Exception as e:
                 compile_ms = int((time.perf_counter() - t0) * 1000)
-                print(f"{Colors.WARNING}    -> Re-compilation failed for file. Retrying.... {Colors.ENDC}")
+                print(f"{Colors.WARNING}    -> Re-compilation failed for file. Retrying ({total_attempts_completed}/{max_retries+1}).... {Colors.ENDC}")
 
 
             total_attempts_completed += 1
