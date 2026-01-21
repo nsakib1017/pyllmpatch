@@ -25,4 +25,5 @@ datasets
 scikit-learn
 sentence-transformers
 xlsxwriter
+rapidfuzz
 
