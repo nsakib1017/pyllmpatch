@@ -75,7 +75,7 @@ if __name__ == "__main__":
     print("🧩 Starting decompiled file comparison")
     print("=" * 80)
 
-    df = read_csv_file("../dataset/decompiled_syntax_errors.csv")
+    df = read_csv_file("../../dataset/decompiled_syntax_errors.csv")
     total_rows = len(df)
     print(f"Total records to process: {total_rows}\n")
 
@@ -83,10 +83,9 @@ if __name__ == "__main__":
         file_hash = row["file_hash"]
         file_name = row["file"]
         raw_name = file_name.split(".")[0].replace("decompiled_", "")
-
         path1 = Path(
-            f"../results/experiment_outputs/20260119T061529Z/"
-            f"7513fc1ec4f14913978152d2ffe3de37/"
+            f"../../results/experiment_outputs/20251224T045257Z/"
+            f"938dc4c31bbc44c5aed8ac2b69cf2185/"
             f"{file_hash}/syntax_repaired_{file_name}"
         )
         path2 = Path(
@@ -144,7 +143,7 @@ if __name__ == "__main__":
     results_df = pd.DataFrame(results)
     save_csv_file(
         results_df,
-        Path("../dataset/decompiled_comparison_results_qwen34b_best.csv")
+        Path("../../dataset/decompiled_comparison_results_qwen_7b_enhanced.csv")
     )
 
     print("\n📊 Results preview:")

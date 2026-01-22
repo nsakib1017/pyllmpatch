@@ -28,7 +28,7 @@ def setup_environment():
     print("CUDA available:", torch.cuda.is_available())
 
 
-MODEL_NAME = "unsloth/Qwen2.5-Coder-7B-Instruct"
+MODEL_NAME = "unsloth/Llama-3.3-70B-Instruct-bnb-4bit"
 MAX_SEQ_LENGTH = 32768
 LOAD_IN_4BIT = True
 DTYPE = None
@@ -204,7 +204,7 @@ def create_trainer(
             per_device_train_batch_size=4,
             gradient_accumulation_steps=4,
             warmup_steps=5,
-            num_train_epochs=5,
+            num_train_epochs=15,
             eval_strategy="steps",
             eval_steps=100,
             save_strategy="steps",

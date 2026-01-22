@@ -8,4 +8,4 @@ dataset/
 results/
 finetuning/finetuned_models/
 finetuning/unsloth_compiled_cache/
-finetuning/best_models/
+finetuning/merged_models/
