@@ -30,8 +30,10 @@ LLM_MODELS = [
 ]
 
 OPEN_LLM_MODELS =  [
-    {'provider': 'Alibaba', 'name': 'qwen2.5-coder-7b', 'token_for_completion': 16384, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_model_qwen2.5_coder_7b_instruct"},
-    {'provider': 'Alibaba', 'name': 'qwen2.5-coder-32b', 'token_for_completion': 32768, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_model_qwen2.5_coder_32b_instruct_15_epochs"}
+    {'provider': 'Alibaba', 'name': 'qwen2.5-coder-7b', 'token_for_completion': 16384, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/merged_model_qwen2.5_coder_7b_instruct"},
+    {'provider': 'Alibaba', 'name': 'qwen2.5-coder-32b', 'token_for_completion': 32768, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/merged_model_qwen2.5_coder_32b_instruct_15_epochs"},
+    {'provider': 'IBM', 'name': 'granite-4.0-1b', 'token_for_completion': 16384, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/unsloth/granite-4.0-1b/run_1769129689"},
+    {'provider': 'MistralAI', 'name': 'mistral-7b-instruct', 'token_for_completion': 16384, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/unsloth/mistral-7b-instruct-v0.3/run_1769076402"}
 ]
 
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY") , base_url="https://api.openai.com/v1")

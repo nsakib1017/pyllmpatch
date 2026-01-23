@@ -84,20 +84,16 @@ USER_PROMPT_TEMPLATE_LOCAL = (
 )
 
 
-USER_PROMPT_TEMPLATE_LOCAL_ALIGNMENT = (
-    "You are given two Python code snippets.\n\n"
-    "ORIGINAL code snippet (this defines the correct indentation and whitespace context):\n"
-    "{original_code_snippet}\n\n"
-    "PATCHED code snippet (this fixes syntax errors but may have incorrect indentation):\n"
-    "{modified_code_snippet}\n\n"
-    "Your task is to align the PATCHED code snippet so that its indentation and leading whitespace "
-    "match the ORIGINAL code snippet as closely as possible.\n"
-    "Preserve all indentation from the ORIGINAL snippet for unchanged lines.\n"
-    "Infer indentation for modified lines using the surrounding indentation structure in the ORIGINAL snippet.\n"
-    "Do NOT modify code logic, content, or structure beyond indentation.\n"
-    "Return ONLY the final aligned Python code."
+USER_PROMPT_TEMPLATE_LOCAL_WITHOUT_EXPLANATION = (
+    "Analyze the Python code snippet below and fix all syntax errors.\n\n"
+    "Initial error message (for reference only; it may point to the wrong line):\n"
+    "{error_message}\n\n"
+    "Initial code snippet:\n"
+    "{code_snippet}\n\n"
+    "Apply minimal syntax-only fixes based on the code above.\n"
+    "Output ONLY the corrected Python code.\n"
+    "If the code contains no syntax errors or the errors cannot be fixed, return the code unchanged."
 )
-
 
 
 def build_chat_messages(
@@ -105,11 +101,11 @@ def build_chat_messages(
     error_message: str,
     system_prompt: str,
     user_prompt_template: str,
-    current_explanation: Optional[str] = None,
+    current_explanation: Optional[str] = "",
 ) -> list[dict]:
     format_kwargs = { "error_message": error_message,   "code_snippet": code_snippet,}
 
-    if current_explanation is not None:
+    if  len(current_explanation) > 0:
         format_kwargs["current_explanation"] = current_explanation
 
     user_prompt = user_prompt_template.format(**format_kwargs)
@@ -127,30 +123,6 @@ def build_chat_messages(
 
     return messages
 
-
-def build_chat_messages_alignment(
-    original_code_snippet: str,
-    modified_code_snippet: str,
-    system_prompt: str,
-    user_prompt_template: str,
-) -> list[dict]:
-    user_prompt = user_prompt_template.format(
-        original_code_snippet=original_code_snippet,
-        modified_code_snippet=modified_code_snippet,
-    )
-
-    messages = [
-        {
-            "role": "system",
-            "content": system_prompt.strip(),
-        },
-        {
-            "role": "user",
-            "content": user_prompt.strip(),
-        },
-    ]
-
-    return messages
 
 
 SYSTEM_PROMPT = """

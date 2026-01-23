@@ -236,7 +236,107 @@ def build_triple_quote_mask(lines):
 
     return mask
 
-def fetch_syntax_context(
+
+def fetch_based_on_lines(
+    file_path: Path,
+    error_line: int,
+    fallback_upward_lines: int = 100,
+) -> Optional[Tuple[str, int, int, str]]:
+    """
+    Fetch syntax context with indentation normalization.
+
+    Returns:
+        (normalized_context_text, start_line, end_line, base_indent)
+    """
+
+    content = read_file(file_path)
+    if content is None:
+        return None
+
+    lines = content.splitlines()
+    idx = error_line - 1
+
+    if idx < 0 or idx >= len(lines):
+        return None
+
+    error_indent = leading_spaces(lines[idx])
+
+    # -------------------------
+    # 1️⃣ Enclosing function/class
+    # -------------------------
+    start_idx = None
+    block_indent = None
+
+    for i in range(idx, -1, -1):
+        line = lines[i]
+        if not line.strip():
+            continue
+
+        indent = leading_spaces(line)
+
+        if indent < error_indent and is_def_or_class(line):
+            start_idx = i
+            block_indent = indent
+            break
+
+    if start_idx is not None:
+        end_idx = start_idx + 1
+        for j in range(start_idx + 1, len(lines)):
+            line = lines[j]
+            if not line.strip():
+                continue
+            if leading_spaces(line) <= block_indent:
+                end_idx = j - 1
+                break
+        else:
+            end_idx = len(lines) - 1
+
+        block_lines = lines[start_idx:end_idx + 1]
+        base_indent = compute_base_indent(block_lines)
+
+        normalized_lines = strip_base_indent(block_lines, base_indent)
+
+        return (
+            "\n".join(normalized_lines), 
+            start_idx + 1,
+            end_idx + 1,
+            base_indent,                
+        )
+
+    # -------------------------
+    # 2️⃣ Root-level block
+    # -------------------------
+    start_idx = idx
+    for i in range(idx, -1, -1):
+        if lines[i].strip() and leading_spaces(lines[i]) == 0:
+            start_idx = i
+            break
+
+    end_idx = start_idx + 1
+    for j in range(start_idx + 1, len(lines)):
+        if lines[j].strip() and leading_spaces(lines[j]) == 0:
+            end_idx = j - 1
+            break
+    else:
+        end_idx = len(lines) - 1
+
+    expanded_start = max(0, start_idx - fallback_upward_lines)
+    block_lines = lines[expanded_start:end_idx + 1]
+    base_indent = compute_base_indent(block_lines)
+
+    normalized_lines = strip_base_indent(block_lines, base_indent)
+
+    return (
+        "\n".join(normalized_lines),      # 👈 normalized
+        expanded_start + 1,
+        end_idx + 1,
+        base_indent,
+    )
+
+
+
+
+def fetch_based_on_blocks(
     file_path: Path,
     error_line: int,
 ) -> Optional[Tuple[str, int, int, int]]:
@@ -321,6 +421,25 @@ def fetch_syntax_context(
         end_idx + 1,
         base_indent,
     )
+
+
+def fetch_syntax_context(
+    file_path: Path,
+    error_line: int,
+    outer_idx: int = 0,
+) -> Optional[Tuple[str, int, int, int]]:
+
+    if outer_idx == 2:
+        return fetch_based_on_blocks(
+            file_path,
+            error_line,
+        )
+    else:
+        return fetch_based_on_lines(
+            file_path,
+            error_line,
+        )
+    
 
 def normalize_lines(text: str) -> List[str]:
     return text.splitlines()
