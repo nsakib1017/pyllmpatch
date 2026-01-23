@@ -200,7 +200,7 @@ def create_trainer(
         max_seq_length=MAX_SEQ_LENGTH,
         dataset_num_proc=2,
         packing=False,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=3, early_stopping_threshold=1e-4)],
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=3, early_stopping_threshold=1e-3)],
         args=TrainingArguments(
             per_device_train_batch_size=4,
             gradient_accumulation_steps=4,
