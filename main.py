@@ -424,7 +424,7 @@ if __name__ == "__main__":
                         error_description=initial_error_description,
                         log_base=LOG_BASE,
                         file_hash=file_hash,
-                        llm=OPEN_LLM_MODELS[0],
+                        llm=OPEN_LLM_MODELS[3],
                         log_rec=log_rec,
                         strategy_state={"syntax_context": {"failures": 0}, "whole_file": {"failures": 0}},
                         try_whole_file=True if (total_attempts_completed > (int(max_retries/2) - 1)) else False,
