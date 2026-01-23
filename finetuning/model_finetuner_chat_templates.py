@@ -27,8 +27,14 @@ def setup_environment():
     load_dotenv()
     print("CUDA available:", torch.cuda.is_available())
 
+<<<<<<< HEAD
 #unsloth/GLM-4.7-Flash
 MODEL_NAME = "unsloth/phi-4-reasoning"
+=======
+
+#unsloth/phi-4-reasoning
+MODEL_NAME = "unsloth/granite-4.0-1b"
+>>>>>>> ece690c (tested granite)
 MAX_SEQ_LENGTH = 32768
 LOAD_IN_4BIT = True
 DTYPE = None
