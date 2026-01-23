@@ -16,9 +16,9 @@ from sklearn.model_selection import train_test_split
 from unsloth import FastLanguageModel, is_bfloat16_supported
 
 from trl import SFTTrainer
-from transformers import TrainingArguments
+from transformers import TrainingArguments, EarlyStoppingCallback
 from functools import partial
-
+from unsloth.chat_templates import get_chat_template
 # ===============================
 # Environment & Globals
 # ===============================
@@ -27,8 +27,8 @@ def setup_environment():
     load_dotenv()
     print("CUDA available:", torch.cuda.is_available())
 
-
-MODEL_NAME = "unsloth/Llama-3.3-70B-Instruct-bnb-4bit"
+#unsloth/GLM-4.7-Flash
+MODEL_NAME = "unsloth/phi-4-reasoning"
 MAX_SEQ_LENGTH = 32768
 LOAD_IN_4BIT = True
 DTYPE = None
@@ -200,6 +200,7 @@ def create_trainer(
         max_seq_length=MAX_SEQ_LENGTH,
         dataset_num_proc=2,
         packing=False,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=3, early_stopping_threshold=1e-4)],
         args=TrainingArguments(
             per_device_train_batch_size=4,
             gradient_accumulation_steps=4,
@@ -236,6 +237,8 @@ def create_trainer(
 def main():
     setup_environment()
     model, tokenizer = load_model_and_tokenizer()
+
+    # tokenizer = get_chat_template(tokenizer, chat_template = "gemma-3",)
 
     df = read_csv_file(f"{os.getenv('PROJECT_ROOT_DIR')}/dataset/{os.getenv('DATASET_PATH_FOR_FINETUNING_NAME')}")
     df = clean_dataset(df)
