@@ -417,9 +417,9 @@ if __name__ == "__main__":
             previous_error = ""
 
             while not is_compiled:
-                # try:
+                try:
                     # print(OPEN_LLM_MODELS[0]['model_path'])
-                final_code, llm_metrics, with_pin_point, start_ln, end_ln, base_indent = attempt_repair(
+                    final_code, llm_metrics, with_pin_point, start_ln, end_ln, base_indent = attempt_repair(
                         copy_dir=copy_dir,
                         error_description=initial_error_description,
                         log_base=LOG_BASE,
@@ -430,9 +430,9 @@ if __name__ == "__main__":
                         try_whole_file=True if (total_attempts_completed > (int(max_retries/2) - 1)) else False,
                         outer_idx=outer_idx,
                     )
-                # except Exception as e:
-                #     print(f"Error during repair attempt: {e}")
-                #     break
+                except Exception as e:
+                    print(f"Error during repair attempt: {e}")
+                    break
 
                 AFFECTED_FILE_PATH = LOG_BASE / file_hash
                 if not AFFECTED_FILE_PATH.exists():
@@ -515,5 +515,5 @@ if __name__ == "__main__":
 
             count_idx += 1
             print(footer)
-            break  # for testing only one file per outer loop
+            # break  # for testing only one file per outer loop
 
