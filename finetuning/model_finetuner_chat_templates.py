@@ -29,7 +29,7 @@ def setup_environment():
 
 
 #unsloth/phi-4-reasoning
-MODEL_NAME = "unsloth/granite-4.0-1b"
+MODEL_NAME = "unsloth/GLM-4.7-Flash"
 MAX_SEQ_LENGTH = 32768
 LOAD_IN_4BIT = True
 DTYPE = None
