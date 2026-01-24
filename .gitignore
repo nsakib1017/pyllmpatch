@@ -1,4 +1,4 @@
-.pyllmpatch/
+.pyllmpatch
 .python-version
 .vscode/
 */__pycache__/
@@ -9,3 +9,4 @@ results/
 finetuning/finetuned_models/
 finetuning/unsloth_compiled_cache/
 finetuning/merged_models/
+unsloth_compiled_cache
