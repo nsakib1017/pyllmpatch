@@ -34,7 +34,7 @@ RepairResult = Tuple[str, Dict[str, Any], bool, Optional[int], Optional[int], Op
 
 
 BASE_DIR_PYTHON_FILES = Path(str(os.getenv("BASE_DIR_PYTHON_FILES")))
-MAX_EXAMPLE_RUNTIME_SEC = 2 * 60 * 60  # 2 hours
+MAX_EXAMPLE_RUNTIME_SEC = int(float(os.getenv("MAX_EXAMPLE_RUNTIME_MIN")) * 60 * 60)
 def prepare_snippets_for_repair(
     previous_run_log_path: str = "",
     only_previously_failed: bool = False,
@@ -506,6 +506,8 @@ if __name__ == "__main__":
                     print(f"{Colors.FAIL}    -> Max retries reached. Could not compile the file. {Colors.ENDC}")
                     try:
                         failure_cleanup(AFFECTED_FILE_PATH, compilation_candidate, file_name[:-3], error_word, error_message)
+                        if elapsed > MAX_EXAMPLE_RUNTIME_SEC:
+                            log_rec.update({"compiled_success": None})
                         _append_log(LOG_FILE, log_rec)
                         os.unlink(copy_dir)
                     except FileNotFoundError:
