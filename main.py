@@ -77,7 +77,7 @@ def prepare_snippets_for_repair(
 def _now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-def make_call_to_local_llm(content: str,  error: str, current_explanation: str, affected_file_path: Path, model_path: str,):
+def make_call_to_local_llm(content: str,  error: str, current_explanation: str, affected_file_path: Path, model_path: str, max_tokens: int):
     messages = build_chat_messages(code_snippet=content.strip("\n"), error_message=error, system_prompt=SYSTEM_PROMPT_FOR_LOCAL, user_prompt_template=USER_PROMPT_TEMPLATE_LOCAL if len(current_explanation) > 0 else USER_PROMPT_TEMPLATE_LOCAL_WITHOUT_EXPLANATION, current_explanation=current_explanation)
 
     if not affected_file_path.exists():
@@ -87,13 +87,13 @@ def make_call_to_local_llm(content: str,  error: str, current_explanation: str, 
     with open(str(out_path), "w", encoding="utf-8") as f:
         json.dump(messages, f, ensure_ascii=False, indent=2, default=str)
 
-    llm_raw = call_llm_with_message(messages=messages, model_path=model_path)
+    llm_raw = call_llm_with_message(messages=messages, model_path=model_path, max_tokens=max_tokens)
     return llm_raw
 
 
-def explain_current_code_syntax_error(content: str, error: str, model_path: str) -> str:
+def explain_current_code_syntax_error(content: str, error: str, model_path: str, max_tokens: int) -> str:
     messages = build_chat_messages(code_snippet=content.strip("\n"), error_message=error, system_prompt=SYSTEM_PROMPT_FOR_ROOT_CAUSE_ANALYSIS, user_prompt_template=USER_PROMPT_TEMPLATE_ROOT_CAUSE)
-    llm_raw = call_llm_with_message(messages=messages, model_path=model_path)
+    llm_raw = call_llm_with_message(messages=messages, model_path=model_path, max_tokens=max_tokens)
     # print("Explanation of syntax error root cause:\n", llm_raw)
     return llm_raw
 
@@ -114,10 +114,10 @@ def process_file_in_single_run(content: str, model: dict, error: str, affected_f
     print(f"{Colors.OKGREEN}    -> Content fits in a single run for {model_name}. Processing...{Colors.ENDC}")
     t0 = time.perf_counter()
 
-    current_explanation = explain_current_code_syntax_error(content, error, model["model_path"]) if outer_idx != 0 else ""
+    current_explanation = explain_current_code_syntax_error(content, error, model["model_path"], model['token_for_completion']) if outer_idx != 0 else ""
     # print(f"    -> Explanation of current syntax error:\n{current_explanation}\n", outer_idx)
     if model["name"] in {m["name"] for m in OPEN_LLM_MODELS}:
-        llm_raw = make_call_to_local_llm(content, error, current_explanation, affected_file_path, model["model_path"])
+        llm_raw = make_call_to_local_llm(content, error, current_explanation, affected_file_path, model["model_path"], model['token_for_completion'])
     else:
         llm_raw = make_call_to_api_llm(content, model, error)
     try:

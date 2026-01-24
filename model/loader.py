@@ -10,6 +10,7 @@ def load_model_once(
     *,
     model_path: str,
     device_map: str = "auto",
+    max_tokens: int
 ):
     """
     Load the merged model and tokenizer exactly once.
@@ -22,7 +23,7 @@ def load_model_once(
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_path,
-        max_seq_length=32768,
+        max_seq_length=max_tokens,
         dtype=None,
         load_in_4bit=True,
         device_map={"": "cuda:0"},

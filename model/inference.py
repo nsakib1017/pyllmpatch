@@ -1,12 +1,12 @@
 # model/inference.py
 from model.loader import load_model_once
 
-def call_llm_with_message(*, messages, model_path) -> str:
+def call_llm_with_message(*, messages, model_path, max_tokens) -> str:
     """
     Run inference using the merged model.
     """
 
-    model, tokenizer = load_model_once(model_path=model_path,)
+    model, tokenizer = load_model_once(model_path=model_path, max_tokens=max_tokens)
     inputs = tokenizer.apply_chat_template( messages, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt",).to(model.device)
-    outputs = model.generate(**inputs, max_new_tokens=32768)
+    outputs = model.generate(**inputs, max_new_tokens=max_tokens)
     return tokenizer.decode(outputs[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True)
