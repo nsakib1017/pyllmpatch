@@ -29,8 +29,8 @@ def setup_environment():
 
 
 #unsloth/phi-4-reasoning
-MODEL_NAME = "unsloth/GLM-4.7-Flash"
-MAX_SEQ_LENGTH = 32768
+MODEL_NAME = "unsloth/Phi-4-unsloth-bnb-4bit"
+MAX_SEQ_LENGTH = 16384
 LOAD_IN_4BIT = True
 DTYPE = None
 
@@ -39,13 +39,31 @@ RANDOM_SEED = 42
 
 
 SYSTEM_PROMPT = (
-    "You are an expert Python programmer and code repair specialist. "
-    "Your task is to correct Python SYNTAX errors only.\n"
+    "You are an expert Python programmer and syntax repair specialist.\n"
+    "Your task is to fix Python SYNTAX errors only.\n\n"
+
     "Make ONLY the minimal changes strictly required for the code to parse and compile successfully.\n"
-    "Do NOT fix logic errors, runtime errors, or improve code quality unless required to resolve a syntax error.\n"
-    "Do NOT refactor, reformat, or modify any code that is already syntactically valid.\n"
-    "Preserve all error-free lines exactly as they appear in the original code.\n"
-    "The final output must be a syntactically valid Python program.\n"
+    "Do NOT fix logic errors, runtime errors, or improve code quality unless doing so is absolutely necessary to resolve a syntax error.\n"
+    "Do NOT refactor, reformat, rename symbols, or modify any code that is already syntactically valid.\n\n"
+
+    "The provided error message is for reference only and may point to the wrong line. "
+    "You must inspect surrounding lines and earlier code to identify the true root cause of any syntax error.\n\n"
+
+    "If there are orphaned 'break', 'continue', or similar statements that cause invalid syntax, "
+    "you may add the smallest possible syntactic wrapper (such as a dummy loop) solely to make the code syntactically valid.\n"
+
+    "If missing or incomplete try/except blocks cause syntax errors, "
+    "you may add the minimal required structure (including 'pass' where necessary) to restore syntactic correctness.\n\n"
+
+    "If missing or incomplete match statements cause syntax errors, "
+    "you may add the minimal required structure a default case (i.e., case _:, including 'pass' where necessary) to restore syntactic correctness.\n\n"
+
+    "You must also fix any OTHER syntax errors present in the snippet beyond the one mentioned in the error message, "
+    "as long as they can be resolved with minimal changes.\n\n"
+
+    "Preserve all error-free lines exactly as they appear in the original code, including indentation.\n"
+    "The final output must be a syntactically valid Python program.\n\n"
+
     "Output ONLY the corrected Python code.\n"
     "Do NOT include explanations, reasoning, comments, markdown, or formatting wrappers of any kind.\n"
     "Do NOT add any text before or after the code."
@@ -73,6 +91,10 @@ def load_model_and_tokenizer():
         load_in_4bit=LOAD_IN_4BIT,
         device_map={"": "cuda:0"},
     )
+    # model.to("cuda")
+
+    tokenizer = get_chat_template(tokenizer,chat_template = "phi-4",)
+
 
     model = FastLanguageModel.get_peft_model(
         model,

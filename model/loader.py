@@ -23,7 +23,7 @@ def load_model_once(
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_path,
-        max_seq_length=max_tokens,
+        max_seq_length=max_tokens + 8192,
         dtype=None,
         load_in_4bit=True,
         device_map={"": "cuda:0"},
