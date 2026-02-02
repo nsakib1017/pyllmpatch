@@ -9,7 +9,9 @@ import re
 import sys
 # import difflib
 from typing import List, Tuple, Optional, Any
+from dotenv import load_dotenv
 
+load_dotenv()
 
 INDENTED_RE = re.compile(r"^indented_(\d+)(?:\.[^.]+)?$")  # matches indented_12 or indented_12.py
 INDENT_RE = re.compile(r"^(\s*)\S")
@@ -518,12 +520,12 @@ LIST_OF_LOG_FILES = {
         "flash-lite":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20251022T022513Z/e2648c12511c48558c29f4c5300aa6fe/run_log_e2648c12511c48558c29f4c5300aa6fe.jsonl",
         "pro":f"{os.getenv('PROJECT_ROOT_DIR')}/logs/run_log_9c729f3ab91c42f39b74e51fd102ebf2.jsonl", 
         },
-    "qwen_7b": {
+    "qwen-7b": {
         "config_0":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20260124T220209Z/d622ad5599af48dba5cf4d3435eb0545/run_log_d622ad5599af48dba5cf4d3435eb0545_with_config_0.jsonl",
         "config_1":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20260124T220209Z/59ab85724c794122905a946c15baa405/run_log_59ab85724c794122905a946c15baa405_with_config_1.jsonl",
         "config_2":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20260124T220209Z/b9c48dc9529b4cc4812337f5cd92f047/run_log_b9c48dc9529b4cc4812337f5cd92f047_with_config_2.jsonl",
         },
-    "qwen_32b": {
+    "qwen-32b": {
         "config_0":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20260129T025137Z/294cecf0e82049b58bc599cf48d0622b/run_log_294cecf0e82049b58bc599cf48d0622b_with_config_0.jsonl",
         "config_1":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20260129T025137Z/3ef782858fa24527bb5a4755d31d169d/run_log_3ef782858fa24527bb5a4755d31d169d_with_config_1.jsonl",
         "config_2":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20260129T025137Z/4ce329173d8e4307876d20bf4f7b5f33/run_log_4ce329173d8e4307876d20bf4f7b5f33_with_config_2.jsonl",
@@ -531,12 +533,12 @@ LIST_OF_LOG_FILES = {
     "deepseek-r1": {
         "config_0":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20260124T212519Z/f52db77b7dc349a3bbc2615801c94643/run_log_f52db77b7dc349a3bbc2615801c94643_with_config_0.jsonl",
         "config_1":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20260124T212519Z/f16e38fb574f41fb90efe88e5af39907/run_log_f16e38fb574f41fb90efe88e5af39907_with_config_1.jsonl",
-        "config_2":None,
+        "config_2":"",
         },
     "granite": {
         "config_0":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20260124T175015Z/b3f723500e5c47168ee6d851e8aee71f/run_log_b3f723500e5c47168ee6d851e8aee71f_with_config_0.jsonl",
         "config_1":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20260124T175015Z/0a2b899e13b54024af5d59612a2e9802/run_log_0a2b899e13b54024af5d59612a2e9802_with_config_1.jsonl",
-        "config_2":None,
+        "config_2":"",
         },
     "mistral": {
         "config_0":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20260124T191624Z/3ea156e177624726b401d3c54a475539/run_log_3ea156e177624726b401d3c54a475539_with_config_0.jsonl",

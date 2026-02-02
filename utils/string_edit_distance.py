@@ -75,8 +75,13 @@ if __name__ == "__main__":
 
     models = LIST_OF_LOG_FILES.keys()
     print(f"Available models for logs: {models}\n")
-    sys.exit(0)
+    for model in models:
+        print(f" - {model}:")
+        for config, path in LIST_OF_LOG_FILES[model].items():
+            # print(path)
+            print(f"    - {config}: {path if Path(path).is_file() else 'MISSING FILE'}")
 
+    sys.exit(0)
     print("=" * 80)
     print("🧩 Starting decompiled file comparison")
     print("=" * 80)
