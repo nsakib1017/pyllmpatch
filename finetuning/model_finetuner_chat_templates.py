@@ -29,7 +29,7 @@ def setup_environment():
 
 
 #unsloth/phi-4-reasoning
-MODEL_NAME = "unsloth/Phi-4-unsloth-bnb-4bit"
+MODEL_NAME = "unsloth/codellama-34b-bnb-4bit"
 MAX_SEQ_LENGTH = 16384
 LOAD_IN_4BIT = True
 DTYPE = None

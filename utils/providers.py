@@ -36,8 +36,8 @@ OPEN_LLM_MODELS =  [
     {'provider': 'MistralAI', 'name': 'mistral-7b-instruct', 'token_for_completion': 8192, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/unsloth/mistral-7b-instruct-v0.3/run_1769076402"},
     {'provider': 'DeepSeek', 'name': 'DeepSeek-R1-0528-Qwen3-8B', 'token_for_completion': 32768, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth/DeepSeek-R1-0528-Qwen3-8B/run_1769125567/checkpoint-300"},
     {'provider': 'Microsoft', 'name': 'phi-4', 'token_for_completion': 16384, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth/Phi-4-unsloth-bnb-4bit/run_1769294194/checkpoint-300"},
-    {'provider': 'OpenAI', 'name': 'gpt-oss-20b', 'token_for_completion': 32768, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth/gpt-oss-20b/run_1769125385/checkpoint-800"},
-    {'provider': 'Meta', 'name': 'llama-3.3-70b', 'token_for_completion': 32768, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth/Llama-3.3-70B-Instruct-bnb-4bit/run_1769058870/checkpoint-200"},
+    # {'provider': 'OpenAI', 'name': 'gpt-oss-20b', 'token_for_completion': 32768, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth/gpt-oss-20b/run_1769125385/checkpoint-800"},
+    # {'provider': 'Meta', 'name': 'codellama-34b', 'token_for_completion': 16384, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth/codellama-34b-bnb-4bit/run_1769663638/checkpoint-200"},
     # {'provider': 'Google', 'name': 'gemma-3-12b-it-unsloth-bnb-4bit', 'token_for_completion': 32768, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth/gemma-3-12b-it-unsloth-bnb-4bit/run_1769095208/checkpoint-200"}
 ]
 
