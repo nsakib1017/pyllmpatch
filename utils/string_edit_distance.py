@@ -58,6 +58,26 @@ def read_csv_file(file_name: str) -> pd.DataFrame:
     return df
 
 
+
+def read_jsonl_file(file_name: str) -> pd.DataFrame:
+    if "__file__" in globals():
+        base_dir = Path(__file__).resolve().parent
+    else:
+        base_dir = Path.cwd()
+
+    jsonl_path = base_dir / file_name
+
+    print(f"📄 JSONL path: {jsonl_path.resolve()}")
+
+    if not jsonl_path.exists():
+        raise FileNotFoundError(f"❌ JSONL file not found: {jsonl_path}")
+
+    df = pd.read_json(jsonl_path, lines=True)
+
+    print(f"✅ Loaded JSONL with {len(df)} rows × {len(df.columns)} columns.")
+
+    return df
+
 def save_csv_file(df: pd.DataFrame, file_name: Path):
     df.to_csv(file_name, index=False)
     print(f"\n💾 Results saved to: {file_name.resolve()}")
@@ -68,92 +88,75 @@ def save_csv_file(df: pd.DataFrame, file_name: Path):
 # -------------------------
 
 if __name__ == "__main__":
-
-    # Early cutoff: distances larger than this are "far enough"
     MAX_DIST = 5000
-    results = []
 
     models = LIST_OF_LOG_FILES.keys()
-    print(f"Available models for logs: {models}\n")
+
     for model in models:
-        print(f" - {model}:")
         for config, path in LIST_OF_LOG_FILES[model].items():
-            # print(path)
-            print(f"    - {config}: {path if Path(path).is_file() else 'MISSING FILE'}")
+            
+            if not Path(path).is_file():
+                continue
 
-    sys.exit(0)
-    print("=" * 80)
-    print("🧩 Starting decompiled file comparison")
-    print("=" * 80)
+            print("=" * 80)
+            print("🧩 Starting decompiled file comparison")
+            print("=" * 80)
 
-    df = read_csv_file("../../dataset/decompiled_syntax_errors.csv")
-    total_rows = len(df)
-    print(f"Total records to process: {total_rows}\n")
+            df = read_csv_file(f"{os.getenv('PROJECT_ROOT_DIR')}/dataset/decompiled_syntax_errors.csv")
+            df_log = read_jsonl_file(path)
+            total_rows = len(df)
 
-    for idx, row in df.iterrows():
-        file_hash = row["file_hash"]
-        file_name = row["file"]
-        raw_name = file_name.split(".")[0].replace("decompiled_", "")
-        path1 = Path(
-            f"../../results/experiment_outputs/20251224T045257Z/"
-            f"938dc4c31bbc44c5aed8ac2b69cf2185/"
-            f"{file_hash}/syntax_repaired_{file_name}"
-        )
-        path2 = Path(
-            f"{os.getenv('BASE_DIR_PYTHON_FILES')}/{file_hash}/{file_name}"
-        )
-        path3 = Path(
-            f"{os.getenv('BASE_DIR_PYTHON_FILES')}/{file_hash}/{raw_name}.py"
-        )
+            results = []
 
-        print("-" * 80)
-        print(f"[{idx+1}/{total_rows}] 🔍 Hash: {file_hash}")
+            for idx, row in df.iterrows():
+                df_log_success = df_log[df_log["compiled_success"] == True]
+                file_hash = row["file_hash"]
+                file_name = row["file"]
+                if file_hash not in df_log_success["file_hash"].values:
+                    continue
 
-        d32 = None
-        d31 = None
-        status = "OK"
+                raw_name = file_name.split(".")[0].replace("decompiled_", "")
 
-        missing = [str(p) for p in (path1, path2, path3) if not p.is_file()]
-        if missing:
-            print("❌ Missing files:")
-            for m in missing:
-                print(f"   - {m}")
-            status = "missing"
-        else:
-            try:
-                s1 = strip_comments_and_whitespace(read_text(path1))
-                s2 = strip_comments_and_whitespace(read_text(path2))
-                s3 = strip_comments_and_whitespace(read_text(path3))
+                path1 = Path(f"{Path(path).parent}/{file_hash}/syntax_repaired_{file_name}")
+                path2 = Path(f"{os.getenv('BASE_DIR_PYTHON_FILES')}/{file_hash}/{file_name}")
+                path3 = Path(f"{os.getenv('BASE_DIR_PYTHON_FILES')}/{file_hash}/{raw_name}.py")
 
-                # Fast C++ Levenshtein with early cutoff
-                d32 = Levenshtein.distance(s3, s2, score_cutoff=MAX_DIST)
-                d31 = Levenshtein.distance(s3, s1, score_cutoff=MAX_DIST)
+                d32 = None
+                d31 = None
+                status = "OK"
 
-                print(f"✅ Distance (lookup vs decompiled): {d32}")
-                print(f"✅ Distance (lookup vs repaired)  : {d31}")
+                missing = [str(p) for p in (path1, path2, path3) if not p.is_file()]
+                if missing:
+                    status = "missing"
+                else:
+                    try:
+                        s1 = strip_comments_and_whitespace(read_text(path1))
+                        s2 = strip_comments_and_whitespace(read_text(path2))
+                        s3 = strip_comments_and_whitespace(read_text(path3))
 
-            except Exception as e:
-                print(f"⚠️ Error during processing: {e}")
-                status = "error"
+                        d32 = Levenshtein.distance(s3, s2, score_cutoff=MAX_DIST)
+                        d31 = Levenshtein.distance(s3, s1, score_cutoff=MAX_DIST)
 
-        results.append({
-            "file_hash": file_hash,
-            "decompiled_file_name": file_name,
-            "raw_file_name": path3.name,
-            "d_lookup_vs_decompiled": d32,
-            "d_lookup_vs_repaired": d31,
-            "status": status,
-        })
+                    except Exception:
+                        status = "error"
 
-    print("\n" + "=" * 80)
-    print("🏁 Finished processing all comparisons.")
-    print("=" * 80)
+                # ✅ append ONCE per row
+                results.append({
+                    "file_hash": file_hash,
+                    "decompiled_file_name": file_name,
+                    "raw_file_name": path3.name,
+                    "d_lookup_vs_decompiled": d32,
+                    "d_lookup_vs_repaired": d31,
+                    "status": status,
+                })
 
-    results_df = pd.DataFrame(results)
-    save_csv_file(
-        results_df,
-        Path("../../dataset/decompiled_comparison_results_qwen_7b_enhanced.csv")
-    )
+            results_df = pd.DataFrame(results)
+            out_path = Path(
+                f"{os.getenv('PROJECT_ROOT_DIR')}/dataset/"
+                f"decompiled_comparison_results_{model}_{config}.csv"
+            )
+            save_csv_file(results_df, out_path)
 
-    print("\n📊 Results preview:")
-    print(results_df.head())
+            print("=" * 80)
+            print("🧩 Ending decompiled file comparison")
+            print("=" * 80)

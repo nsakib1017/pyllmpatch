@@ -517,8 +517,8 @@ def create_file_from_response(
 LIST_OF_LOG_FILES = {
     "gemini": {
         "flash":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20251110T012915Z/daf95c71075048e1b3458c3c109344fd/run_log_daf95c71075048e1b3458c3c109344fd.jsonl",
-        "flash-lite":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20251022T022513Z/e2648c12511c48558c29f4c5300aa6fe/run_log_e2648c12511c48558c29f4c5300aa6fe.jsonl",
-        "pro":f"{os.getenv('PROJECT_ROOT_DIR')}/logs/run_log_9c729f3ab91c42f39b74e51fd102ebf2.jsonl", 
+        # "flash-lite":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20251022T022513Z/e2648c12511c48558c29f4c5300aa6fe/run_log_e2648c12511c48558c29f4c5300aa6fe.jsonl",
+        # "pro":f"{os.getenv('PROJECT_ROOT_DIR')}/logs/run_log_9c729f3ab91c42f39b74e51fd102ebf2.jsonl", 
         },
     "qwen-7b": {
         "config_0":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20260124T220209Z/d622ad5599af48dba5cf4d3435eb0545/run_log_d622ad5599af48dba5cf4d3435eb0545_with_config_0.jsonl",
