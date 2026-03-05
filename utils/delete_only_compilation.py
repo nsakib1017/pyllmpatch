@@ -1,17 +1,12 @@
 from __future__ import annotations
 
 import io
-import os
 import re
 import tokenize
-from dataclasses import dataclass, asdict
-from pathlib import Path
+from collections import deque
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-
-# --------------------------------------------------------------------
-# 1) Deletion-only tool (uses your injected compile + parsers)
-# --------------------------------------------------------------------
 
 CompileOracle = Callable[[str, str, str, Optional[Any]], Dict[str, Any]]
 LineExtractor = Callable[[str], Optional[int]]
@@ -29,6 +24,8 @@ class DeletionAttempt:
     deleted_end: int
     reason: str
     remaining_lines: int
+    escalate_level: int
+    bucket: str
 
 
 def delete_lines_until_compilable_with_oracle(
@@ -37,7 +34,6 @@ def delete_lines_until_compilable_with_oracle(
     extract_line_number: LineExtractor,
     get_error_word_message_from_content: ErrWordMsgParser,
     *,
-    # paths aligned with your main loop
     out_py_path: str,
     out_pyc_path: str,
     version: Optional[Any] = None,
@@ -48,17 +44,18 @@ def delete_lines_until_compilable_with_oracle(
     err_txt_path: Optional[str] = None,
 ) -> Tuple[str, List[DeletionAttempt], Dict[str, Any]]:
     """
-    Deletion-only repair that is aligned with your pipeline:
+    Deletion-only repair (line deletions only), driven by your compile oracle.
 
-    - compile_check is compile_new_pyc(content, py_file_dir, out_file_base_dir, version)
-      where py_file_dir is the output .py path and out_file_base_dir is the output .pyc path.
-
-    - We reuse your error parsing by writing error_description to err_txt_path and calling
-      get_error_word_message_from_content(err_txt_path). That gives (error_word, message).
-      We then use extract_line_number(message) first, then fallback to extract_line_number(error_description).
+    Improvements vs earlier version:
+      1) Escalation no longer depends only on exact (msg, lineno) repeats.
+         It also escalates when there's "no progress" even if messages change:
+           - lineno stays within a small band for many iterations
+           - error bucket stays mostly the same for many iterations
+      2) When the bucket suggests UNCLOSED constructs, tokenizer-based candidates
+         are prioritized automatically (by how candidates are ordered in generator).
 
     Returns:
-      fixed_code, deletion_log, last_compile_result
+      fixed_text, deletion_log, last_compile_result
     """
     lines = _split_keepends(py_file_content)
     original_line_count = len(lines)
@@ -66,10 +63,10 @@ def delete_lines_until_compilable_with_oracle(
     seen_counts: Dict[Tuple[str, int], int] = {}
     escalate_level = 0
 
-    def parse_error(err_desc: str) -> Tuple[str, str, int]:
-        """
-        Returns (err_word, msg, lineno)
-        """
+    recent_linenos: deque[int] = deque(maxlen=8)
+    recent_buckets: deque[str] = deque(maxlen=8)
+
+    def parse_error(err_desc: str) -> Tuple[str, str, Optional[int]]:
         err_desc = (err_desc or "").strip()
 
         err_word = None
@@ -78,10 +75,9 @@ def delete_lines_until_compilable_with_oracle(
 
         if err_txt_path:
             try:
-                Path(err_txt_path).parent.mkdir(parents=True, exist_ok=True)
+                # write err txt so your existing parser can read it
                 with open(err_txt_path, "w", encoding="utf-8") as f:
                     f.write(err_desc or "Unknown error")
-
                 err_word, msg = get_error_word_message_from_content(err_txt_path)
                 if msg:
                     ln = extract_line_number(msg)
@@ -92,17 +88,13 @@ def delete_lines_until_compilable_with_oracle(
             ln = extract_line_number(err_desc)
 
         if not isinstance(ln, int):
-            ln = None
-
+            ln = None  
         return err_word or "CompileError", (msg or err_desc or "").strip(), ln
 
     last_compile_res: Dict[str, Any] = {"is_compiled": False, "error_description": None}
 
     for it in range(1, max_iters + 1):
         src = "".join(lines)
-
-        # IMPORTANT: compile_check signature in your project:
-        # compile_new_pyc(content, py_file_dir(.py), out_file_base_dir(.pyc), version)
         last_compile_res = compile_check(src, out_py_path, out_pyc_path, version)
 
         if bool(last_compile_res.get("is_compiled", False)):
@@ -125,13 +117,36 @@ def delete_lines_until_compilable_with_oracle(
         lineno = _clamp(lineno, 1, n)
         end_lineno = lineno
 
+        # -------------------------
+        # Escalation logic (updated)
+        # -------------------------
         sig = (msg, lineno)
         seen_counts[sig] = seen_counts.get(sig, 0) + 1
         if seen_counts[sig] in (3, 6, 10):
             escalate_level = min(3, escalate_level + 1)
 
-        pseudo = _PseudoError(msg=msg, lineno=lineno, end_lineno=end_lineno)
-        candidates = _generate_candidates(lines, pseudo, base_window=base_window, escalate_level=escalate_level)
+        bucket = _bucketize(msg)
+        recent_linenos.append(lineno)
+        recent_buckets.append(bucket)
+
+        # Escalate on "no progress" even if msg changes
+        if len(recent_linenos) == recent_linenos.maxlen:
+            if max(recent_linenos) - min(recent_linenos) <= 3:
+                escalate_level = min(3, escalate_level + 1)
+
+        if len(recent_buckets) == recent_buckets.maxlen:
+            # Mostly the same bucket (or toggling between two)
+            if len(set(recent_buckets)) <= 2:
+                escalate_level = min(3, escalate_level + 1)
+
+        pseudo = _PseudoError(msg=msg, lineno=lineno, end_lineno=end_lineno, bucket=bucket)
+
+        candidates = _generate_candidates(
+            lines,
+            pseudo,
+            base_window=base_window,
+            escalate_level=escalate_level,
+        )
 
         chosen: Optional[Tuple[int, int, str]] = None
         chosen_applied = False
@@ -159,14 +174,16 @@ def delete_lines_until_compilable_with_oracle(
                 chosen_applied = True
                 break
 
+            # Best-effort: prefer a move in extracted line number
             trial_desc = (trial_res.get("error_description") or "").strip()
             tln = extract_line_number(trial_desc) if trial_desc else None
-            if isinstance(tln, int) and (trial_desc, tln) != sig:
-                chosen = (s, e, reason + " (changes error)")
-                lines = trial_lines
-                last_compile_res = trial_res
-                chosen_applied = True
-                break
+            if isinstance(tln, int):
+                if (trial_desc, tln) != sig:
+                    chosen = (s, e, reason + " (changes error)")
+                    lines = trial_lines
+                    last_compile_res = trial_res
+                    chosen_applied = True
+                    break
 
         if not chosen_applied:
             if smallest is None:
@@ -187,22 +204,37 @@ def delete_lines_until_compilable_with_oracle(
                 deleted_end=e,
                 reason=reason,
                 remaining_lines=len(lines),
+                escalate_level=escalate_level,
+                bucket=bucket,
             )
         )
 
     final_text = "".join(lines)
-    # Ensure final compile status is accurate and writes the final outputs
     last_compile_res = compile_check(final_text, out_py_path, out_pyc_path, version)
     return final_text, attempts, last_compile_res
 
 
-# ---------------- internals ----------------
+# -------------------------------------------------------------------
+# Internals
+# -------------------------------------------------------------------
 
 class _PseudoError:
-    def __init__(self, msg: str, lineno: int, end_lineno: int):
+    def __init__(self, msg: str, lineno: int, end_lineno: int, bucket: str):
         self.msg = msg
         self.lineno = lineno
         self.end_lineno = end_lineno
+        self.bucket = bucket
+
+
+def _bucketize(err_msg: str) -> str:
+    m = (err_msg or "").lower()
+    if any(s in m for s in ["was never closed", "unexpected eof", "unterminated", "eol while scanning"]):
+        return "UNCLOSED"
+    if any(s in m for s in ["expected ':'", "expected an indented block", "unexpected indent", "unindent does not match", "indentation"]):
+        return "BLOCK"
+    if "invalid syntax" in m:
+        return "GENERIC"
+    return "OTHER"
 
 
 def _split_keepends(text: str) -> List[str]:
@@ -249,35 +281,6 @@ def _line_has_backslash_cont(lines: List[str], lineno: int) -> bool:
     return cur.rstrip().endswith("\\")
 
 
-def _looks_like_block_problem(msg_l: str) -> bool:
-    return any(s in msg_l for s in (
-        "expected ':'",
-        "expected an indented block",
-        "unexpected indent",
-        "unindent does not match",
-        "indentation",
-        "invalid syntax",
-    ))
-
-
-def _looks_like_unclosed_string(msg_l: str) -> bool:
-    return any(s in msg_l for s in (
-        "unterminated string",
-        "eol while scanning string literal",
-        "unterminated triple-quoted string literal",
-    ))
-
-
-def _looks_like_unclosed_bracket_or_eof(msg_l: str) -> bool:
-    return any(s in msg_l for s in (
-        "unexpected eof while parsing",
-        "was never closed",
-        "closing parenthesis",
-        "closing bracket",
-        "closing brace",
-    ))
-
-
 def _find_nearest_header_above(lines: List[str], lineno: int, max_lookback: int = 60) -> Optional[int]:
     lineno = _clamp(lineno, 1, len(lines))
     lo = max(1, lineno - max_lookback)
@@ -290,6 +293,9 @@ def _find_nearest_header_above(lines: List[str], lineno: int, max_lookback: int 
 
 
 def _find_unclosed_construct_start(lines: List[str]) -> Optional[int]:
+    """
+    Tokenize-based inference of the most recent unmatched opening (, [, {.
+    """
     src = "".join(lines)
     try:
         toks = list(tokenize.generate_tokens(io.StringIO(src).readline))
@@ -357,26 +363,44 @@ def _generate_candidates(
     base_window: int,
     escalate_level: int,
 ) -> List[Tuple[int, int, str]]:
+    """
+    Candidate ordering tuned so UNCLOSED bucket tries tokenizer-start early.
+    """
     n = len(lines)
     lineno = _clamp(int(err.lineno or 1), 1, n)
     end_lineno = _clamp(int(err.end_lineno or lineno), lineno, n)
     msg_l = (err.msg or "").lower()
+    bucket = err.bucket
 
     cands: List[Tuple[int, int, str]] = []
+
+    # UNCLOSED: prioritize tokenizer inferred start line before tail chopping
+    if bucket == "UNCLOSED":
+        start_line = _find_unclosed_construct_start(lines)
+        if start_line is not None:
+            cands.append((start_line, start_line, "tokenizer inferred start line"))
+            cands.append((max(1, start_line - 1), min(n, start_line + 1), "tokenizer start neighborhood"))
+            if escalate_level >= 2:
+                cands.append((start_line, n, "tokenizer start to EOF"))
+
+    # Standard small targets
     cands.append((lineno, end_lineno, "reported span"))
     cands.append((lineno, lineno, "reported line only"))
 
+    # Dangling clause (except/else/elif/finally/case) early
     if 1 <= lineno <= n and _DANGLING_CLAUSE_RE.match(lines[lineno - 1]):
         cands.insert(0, (lineno, lineno, "dangling clause keyword line"))
         hdr = _find_nearest_header_above(lines, lineno)
         if hdr is not None:
             cands.insert(1, (hdr, hdr, "nearest header above (re-balance blocks)"))
 
+    # Backslash continuation
     if _prev_line_has_backslash_cont(lines, lineno):
         cands.insert(0, (max(1, lineno - 1), lineno, "backslash continuation (prev + current)"))
     if _line_has_backslash_cont(lines, lineno):
         cands.insert(0, (lineno, min(n, lineno + 1), "backslash continuation (current + next)"))
 
+    # Windows (larger windows appear at higher escalation)
     windows = [max(0, base_window), 1, 2, 4]
     if escalate_level >= 2:
         windows += [8]
@@ -387,83 +411,22 @@ def _generate_candidates(
         e = _clamp(end_lineno + w, s, n)
         cands.append((s, e, f"window w={w}"))
 
-    if _looks_like_block_problem(msg_l):
+    # Block-like errors: header deletion candidates
+    if any(s in msg_l for s in ["expected ':'", "expected an indented block", "unexpected indent", "unindent does not match", "indentation", "invalid syntax"]):
         hdr = _find_nearest_header_above(lines, lineno)
         if hdr is not None:
             cands.insert(0, (hdr, hdr, "nearest header above"))
             cands.insert(1, (max(1, hdr - 1), min(n, hdr + 1), "header neighborhood"))
 
-    if _looks_like_unclosed_string(msg_l) or _looks_like_unclosed_bracket_or_eof(msg_l):
-        start_line = _find_unclosed_construct_start(lines)
-        if start_line is not None:
-            cands.insert(0, (start_line, start_line, "tokenizer inferred start line"))
-            cands.insert(1, (max(1, start_line - 1), min(n, start_line + 1), "tokenizer start neighborhood"))
-            if escalate_level >= 2:
-                cands.append((start_line, n, "tokenizer start to EOF"))
-
+    # Statement chunk
     cs, ce = _find_statement_chunk(lines, lineno)
     cands.append((cs, ce, "statement chunk"))
+
+    # Tail chop (especially for truncated outputs)
     cands.append((lineno, n, "error line to EOF"))
 
+    # Very aggressive escalation
     if escalate_level >= 3:
         cands.append((1, lineno, "BOOM: start to error line"))
 
     return _dedupe_spans(cands)
-
-
-# --------------------------------------------------------------------
-# 2) Small integration snippet: where to call from your main loop
-# --------------------------------------------------------------------
-"""
-In your loop, you already create:
-  AFFECTED_FILE_PATH = LOG_BASE / file_hash
-  out_py = AFFECTED_FILE_PATH / f"syntax_repaired_{file_name[:-3]}.py"
-  out_pyc = AFFECTED_FILE_PATH / f"syntax_repaired_{file_name[:-3]}.pyc"
-  err_txt = AFFECTED_FILE_PATH / f"syntax_failed_repaired_{file_name[:-3]}_error.txt"
-
-Add this fallback exactly when max_retries is exhausted (or whenever you want):
-
-    if (max_retries < 0 or elapsed > MAX_EXAMPLE_RUNTIME_SEC) and (not is_compiled):
-        # Deletion-only fallback
-        fixed_code, del_log, last_res = delete_lines_until_compilable_with_oracle(
-            py_file_content=compilation_candidate,
-            compile_check=compile_new_pyc,
-            extract_line_number=extract_line_number,
-            get_error_word_message_from_content=get_error_word_message_from_content,
-            out_py_path=str(AFFECTED_FILE_PATH / f"syntax_repaired_{file_name[:-3]}.py"),
-            out_pyc_path=str(AFFECTED_FILE_PATH / f"syntax_repaired_{file_name[:-3]}.pyc"),
-            version=version,
-            base_window=1,
-            max_iters=5000,
-            max_deleted_ratio=0.95,
-            min_remaining_lines=1,
-            err_txt_path=str(AFFECTED_FILE_PATH / f"syntax_failed_repaired_{file_name[:-3]}_error.txt"),
-        )
-
-        # If it compiled, last_res["is_compiled"] is True and the .py/.pyc are already written.
-        if last_res.get("is_compiled"):
-            is_compiled = True
-            log_rec.update({
-                "compiled_success": True,
-                "path_out": str(AFFECTED_FILE_PATH / f"syntax_repaired_{file_name[:-3]}.py"),
-                "delete_only_fallback_used": True,
-                "delete_only_deletions": len(del_log),
-            })
-            # Optional: persist deletion log next to outputs
-            with open(str(AFFECTED_FILE_PATH / f"delete_only_log_{file_name[:-3]}.jsonl"), "w", encoding="utf-8") as f:
-                for rec in del_log:
-                    f.write(str(asdict(rec)) + "\\n")
-        else:
-            log_rec.update({
-                "delete_only_fallback_used": True,
-                "delete_only_deletions": len(del_log),
-                "delete_only_failed_error": last_res.get("error_description"),
-            })
-
-        _append_log(LOG_FILE, log_rec)
-        try:
-            os.unlink(copy_dir)
-        except FileNotFoundError:
-            pass
-        break
-"""

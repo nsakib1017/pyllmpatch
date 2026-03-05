@@ -12,7 +12,7 @@ import json
 import time     
 import uuid     
 from datetime import datetime, timezone  
-
+import shutil
 from typing import Tuple, Optional, Dict, Any  
 
 from utils.delete_only_compilation import delete_lines_until_compilable_with_oracle
@@ -358,20 +358,34 @@ if __name__ == "__main__":
         str(previuos_run_log_path) if previuos_run_log_path else "",
         only_previously_failed=False
     )
-    df_syntax_error_balanced = df_syntax_error_balanced.sample(frac=1, random_state=42).reset_index(drop=True)
+    df_syntax_error_balanced = df_syntax_error_balanced.sample(frac=1, random_state=42).reset_index(drop=True)  # shuffle
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     print("DataFrame shape:", df_syntax_error_balanced.shape)
 
-
+    # -----------------------------
+    # Mode toggles
+    # -----------------------------
     DELETE_ONLY_MODE = str(os.getenv("DELETE_ONLY_MODE", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
     ENABLE_DELETE_ONLY_FALLBACK = str(os.getenv("ENABLE_DELETE_ONLY_FALLBACK", "1")).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-    DELETE_ONLY_MAX_ITERS = int(os.getenv("DELETE_ONLY_MAX_ITERS", "5000"))
+    # -----------------------------
+    # Delete-only controls
+    # -----------------------------
+    DELETE_ONLY_INFINITE_ITERS = str(os.getenv("DELETE_ONLY_INFINITE_ITERS", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
+    DELETE_ONLY_MAX_ITERS = (10**9) if DELETE_ONLY_INFINITE_ITERS else int(os.getenv("DELETE_ONLY_MAX_ITERS", "5000"))
+
     DELETE_ONLY_BASE_WINDOW = int(os.getenv("DELETE_ONLY_BASE_WINDOW", "1"))
     DELETE_ONLY_MAX_DELETED_RATIO = float(os.getenv("DELETE_ONLY_MAX_DELETED_RATIO", "0.95"))
 
-    for outer_idx in range(0, 1):
+    if DELETE_ONLY_MODE:
+        print(f"{Colors.WARNING}DELETE_ONLY_MODE is enabled, LLMs will not be called{Colors.ENDC}")
+    else:
+        print(f"{Colors.WARNING}DELETE_ONLY_MODE is disabled, LLMs may be called{Colors.ENDC}")
 
+    if DELETE_ONLY_INFINITE_ITERS:
+        print(f"{Colors.WARNING}DELETE_ONLY_INFINITE_ITERS is enabled, delete-only may run for a very long time{Colors.ENDC}")
+
+    for outer_idx in range(0, 3):
         run_id = uuid.uuid4().hex
         batch_start_ts = _now_iso()
         LOG_BASE = Path(f"results/experiment_outputs/{ts}/{run_id}")
@@ -383,7 +397,6 @@ if __name__ == "__main__":
         count_idx = 0
 
         for idx, row in df_syntax_error_balanced.iterrows():
-
             is_compiled = False
             file_hash = norm_str(row.get("file_hash"))
             file_name = norm_str(row.get("file"))
@@ -401,6 +414,7 @@ if __name__ == "__main__":
 
             copy_dir = BASE_DIR_PYTHON_FILES / file_hash / f"copy_for_run_id_{run_id}_of_{file_name}"
             copy_file(path_to_err_file, copy_dir)
+
             whole_content = read_file(copy_dir)
             version = extract_bytecode_major_minor(whole_content)
             compilation_result = None
@@ -418,6 +432,11 @@ if __name__ == "__main__":
                 "path_in": str(path_to_err_file),
                 "bytecode_version": version,
                 "compile_error_description_before": error_message_processed,
+                "delete_only_mode": bool(DELETE_ONLY_MODE),
+                "delete_only_infinite_iters": bool(DELETE_ONLY_INFINITE_ITERS),
+                "delete_only_max_iters": int(DELETE_ONLY_MAX_ITERS),
+                "delete_only_base_window": int(DELETE_ONLY_BASE_WINDOW),
+                "delete_only_max_deleted_ratio": float(DELETE_ONLY_MAX_DELETED_RATIO),
             }
 
             t_begin = time.monotonic()
@@ -426,7 +445,6 @@ if __name__ == "__main__":
             previous_error = ""
 
             while not is_compiled:
-
                 AFFECTED_FILE_PATH = LOG_BASE / file_hash
                 if not AFFECTED_FILE_PATH.exists():
                     AFFECTED_FILE_PATH.mkdir(parents=True, exist_ok=True)
@@ -437,10 +455,10 @@ if __name__ == "__main__":
 
                 elapsed = time.monotonic() - t_begin
 
+                # ============================================================
                 # MODE A: DELETE-ONLY MODE (skip LLMs completely)
+                # ============================================================
                 if DELETE_ONLY_MODE:
-                    print(f"{Colors.WARNING}    -> DELETE_ONLY_MODE enabled. Skipping LLM repair. {Colors.ENDC}")
-
                     t0 = time.perf_counter()
 
                     compilation_candidate = read_file(copy_dir) or read_file(path_to_err_file) or ""
@@ -465,7 +483,6 @@ if __name__ == "__main__":
                     initial_error_description = last_res.get("error_description")
 
                     log_rec.update({
-                        "delete_only_mode": True,
                         "delete_only_fallback_used": False,
                         "delete_only_deletions": len(del_log),
                         "compiled_success": is_compiled,
@@ -478,6 +495,7 @@ if __name__ == "__main__":
                         "llm_latency_ms_total": 0,
                     })
 
+                    # Optional: write deletion log
                     try:
                         with open(str(AFFECTED_FILE_PATH / f"delete_only_log_{file_name[:-3]}.jsonl"), "w", encoding="utf-8") as f:
                             for rec in del_log:
@@ -503,9 +521,11 @@ if __name__ == "__main__":
                         except FileNotFoundError:
                             pass
 
-                    break
+                    break  # next file
 
+                # ============================================================
                 # MODE B: ORIGINAL (LLM repair) with optional delete-only fallback
+                # ============================================================
                 try:
                     final_code, llm_metrics, with_pin_point, start_ln, end_ln, base_indent = attempt_repair(
                         copy_dir=copy_dir,
@@ -523,7 +543,7 @@ if __name__ == "__main__":
                     break
 
                 t0 = time.perf_counter()
-                final_code = final_code.strip()
+                final_code = (final_code or "").strip()
 
                 if final_code:
                     if with_pin_point:
@@ -560,7 +580,6 @@ if __name__ == "__main__":
                 max_retries -= 1
 
                 log_rec.update({
-                    "delete_only_mode": False,
                     "fits_single_run": llm_metrics.get("fits_single_run"),
                     "avg_chunk_tokens": llm_metrics.get("avg_chunk_tokens"),
                     "max_chunk_tokens": llm_metrics.get("max_chunk_tokens"),
@@ -581,45 +600,67 @@ if __name__ == "__main__":
                         f.write(initial_error_description or "Unknown error")
                     error_word, error_message = get_error_word_message_from_content(err_txt_path)
 
+                # ============================================================
                 # Optional delete-only fallback when retries/time are exhausted
+                # Deletion runs on a NEW COPY created from the LAST LLM output
+                # ============================================================
                 if (max_retries < 0 or elapsed > MAX_EXAMPLE_RUNTIME_SEC):
                     print(f"{Colors.FAIL}    -> Max retries reached. Could not compile the file. {Colors.ENDC}")
 
                     if ENABLE_DELETE_ONLY_FALLBACK:
                         try:
+                            # Snapshot last LLM output that triggered the fallback
+                            llm_snapshot_path = AFFECTED_FILE_PATH / f"llm_last_output_{file_name[:-3]}.py"
+                            with open(str(llm_snapshot_path), "w", encoding="utf-8") as f:
+                                f.write(compilation_candidate or "")
+
+                            # Separate copy that delete-only reads as input
+                            delete_only_input_path = AFFECTED_FILE_PATH / f"delete_only_input_from_llm_{file_name[:-3]}.py"
+                            shutil.copyfile(str(llm_snapshot_path), str(delete_only_input_path))
+
+                            # Separate output paths so analysis can diff LLM vs delete-only output
+                            delete_only_out_py_path = str(AFFECTED_FILE_PATH / f"delete_only_repaired_from_llm_{file_name[:-3]}.py")
+                            delete_only_out_pyc_path = str(AFFECTED_FILE_PATH / f"delete_only_repaired_from_llm_{file_name[:-3]}.pyc")
+                            delete_only_err_txt_path = str(AFFECTED_FILE_PATH / f"delete_only_from_llm_{file_name[:-3]}_error.txt")
+
                             fixed_code, del_log, last_res = delete_lines_until_compilable_with_oracle(
-                                py_file_content=compilation_candidate,
+                                py_file_content=read_file(str(delete_only_input_path)) or "",
                                 compile_check=compile_new_pyc,
                                 extract_line_number=extract_line_number,
                                 get_error_word_message_from_content=get_error_word_message_from_content,
-                                out_py_path=out_py_path,
-                                out_pyc_path=out_pyc_path,
+                                out_py_path=delete_only_out_py_path,
+                                out_pyc_path=delete_only_out_pyc_path,
                                 version=version,
                                 base_window=DELETE_ONLY_BASE_WINDOW,
                                 max_iters=DELETE_ONLY_MAX_ITERS,
                                 max_deleted_ratio=DELETE_ONLY_MAX_DELETED_RATIO,
                                 min_remaining_lines=1,
-                                err_txt_path=err_txt_path,
+                                err_txt_path=delete_only_err_txt_path,
                             )
+
+                            log_rec.update({
+                                "delete_only_fallback_used": True,
+                                "delete_only_deletions": len(del_log),
+                                "llm_last_output_snapshot_path": str(llm_snapshot_path),
+                                "delete_only_input_path": str(delete_only_input_path),
+                                "delete_only_output_path": str(delete_only_out_py_path),
+                            })
 
                             if last_res.get("is_compiled"):
                                 is_compiled = True
                                 log_rec.update({
                                     "compiled_success": True,
-                                    "path_out": out_py_path,
-                                    "delete_only_fallback_used": True,
-                                    "delete_only_deletions": len(del_log),
+                                    "path_out": delete_only_out_py_path,
                                 })
+
                                 try:
-                                    with open(str(AFFECTED_FILE_PATH / f"delete_only_log_{file_name[:-3]}.jsonl"), "w", encoding="utf-8") as f:
+                                    with open(str(AFFECTED_FILE_PATH / f"delete_only_log_from_llm_{file_name[:-3]}.jsonl"), "w", encoding="utf-8") as f:
                                         for rec in del_log:
                                             f.write(str(asdict(rec)) + "\n")
                                 except Exception:
                                     pass
                             else:
                                 log_rec.update({
-                                    "delete_only_fallback_used": True,
-                                    "delete_only_deletions": len(del_log),
                                     "delete_only_failed_error": last_res.get("error_description"),
                                 })
 
