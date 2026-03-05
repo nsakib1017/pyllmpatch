@@ -14,22 +14,12 @@ from sentence_transformers import SentenceTransformer, util
 
 
 load_dotenv()
-# -------------------------
-# File utilities
-# -------------------------
 
 def read_text(path: Path) -> str:
-    # Read as UTF-8; replace undecodable bytes so the comparison can proceed
     return path.read_text(encoding="utf-8", errors="replace")
 
 
 def strip_comments_and_whitespace(text: str) -> str:
-    """
-    Text-only minifier:
-      1) For each line, drop everything from the first '#' to end-of-line.
-      2) Remove ALL whitespace (spaces, tabs, newlines, etc.).
-    NOTE: This treats '#' inside strings as comment starts too (by design).
-    """
     lines = []
     for line in text.splitlines():
         hash_idx = line.find('#')
@@ -42,12 +32,7 @@ def strip_comments_and_whitespace(text: str) -> str:
 
 
 
-# ------------------ Embedding long texts with chunking ------------------ #
 def chunk_by_tokens(text: str, tokenizer, max_tokens: int, stride: int) -> List[str]:
-    """
-    Split `text` into overlapping chunks by tokenizer tokens, then decode each
-    chunk back to text for SentenceTransformer.encode.
-    """
     # Tokenize once (no specials) then slice token ids.
     toks = tokenizer.encode(text, add_special_tokens=False)
     n = len(toks)
@@ -69,13 +54,8 @@ def chunk_by_tokens(text: str, tokenizer, max_tokens: int, stride: int) -> List[
 
 @torch.no_grad()
 def embed_long_text(model: SentenceTransformer, text: str, max_tokens: int = 384, stride: int = 64) -> torch.Tensor:
-    """
-    Embed long text by averaging L2-normalized embeddings over token-based chunks.
-    """
     tokenizer = model.tokenizer
     chunks = chunk_by_tokens(text, tokenizer, max_tokens=max_tokens, stride=stride)
-    # Encode chunks -> normalized embeddings (SentenceTransformer returns normalized if normalize_embeddings=True is set)
-    # We’ll explicitly normalize after.
     embs = model.encode(
         chunks,
         batch_size=8,
@@ -83,9 +63,9 @@ def embed_long_text(model: SentenceTransformer, text: str, max_tokens: int = 384
         show_progress_bar=False,
         normalize_embeddings=False,
     )
-    # L2-normalize each chunk vector
+
     embs = torch.nn.functional.normalize(embs, p=2, dim=1)
-    # Average then normalize again
+
     mean_emb = embs.mean(dim=0, keepdim=True)
     mean_emb = torch.nn.functional.normalize(mean_emb, p=2, dim=1)
     return mean_emb.squeeze(0)  # shape: (d,)
@@ -95,9 +75,6 @@ def embed_long_text(model: SentenceTransformer, text: str, max_tokens: int = 384
 def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     return torch.nn.functional.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
 
-# -------------------------
-# CSV helpers
-# -------------------------
 
 def read_csv_file(file_name: str) -> pd.DataFrame:
     if "__file__" in globals():
@@ -142,9 +119,6 @@ def save_csv_file(df: pd.DataFrame, file_name: Path):
     print(f"\n💾 Results saved to: {file_name.resolve()}")
 
 
-# -------------------------
-# Main
-# -------------------------
 
 if __name__ == "__main__":
     MAX_DIST = 5000
