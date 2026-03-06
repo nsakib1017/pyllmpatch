@@ -42,20 +42,17 @@ def delete_lines_until_compilable_with_oracle(
     max_deleted_ratio: float = 0.95,
     min_remaining_lines: int = 1,
     err_txt_path: Optional[str] = None,
+    debug_escalation: bool = False,
 ) -> Tuple[str, List[DeletionAttempt], Dict[str, Any]]:
     """
-    Deletion-only repair (line deletions only), driven by your compile oracle.
+    Deletion-only repair with more aggressive behavior for BLOCK errors
+    (IndentationError / missing ':' cascades) and an "indent region chop" candidate.
 
-    Improvements vs earlier version:
-      1) Escalation no longer depends only on exact (msg, lineno) repeats.
-         It also escalates when there's "no progress" even if messages change:
-           - lineno stays within a small band for many iterations
-           - error bucket stays mostly the same for many iterations
-      2) When the bucket suggests UNCLOSED constructs, tokenizer-based candidates
-         are prioritized automatically (by how candidates are ordered in generator).
-
-    Returns:
-      fixed_text, deletion_log, last_compile_result
+    Changes vs prior version:
+      - Faster escalation for bucket == BLOCK
+      - Larger windows earlier for BLOCK (adds 16 at lvl2, adds 32 at lvl3)
+      - Adds candidate: delete contiguous indented region starting at error line
+      - Keeps UNCLOSED tokenizer-first behavior
     """
     lines = _split_keepends(py_file_content)
     original_line_count = len(lines)
@@ -75,7 +72,6 @@ def delete_lines_until_compilable_with_oracle(
 
         if err_txt_path:
             try:
-                # write err txt so your existing parser can read it
                 with open(err_txt_path, "w", encoding="utf-8") as f:
                     f.write(err_desc or "Unknown error")
                 err_word, msg = get_error_word_message_from_content(err_txt_path)
@@ -88,7 +84,8 @@ def delete_lines_until_compilable_with_oracle(
             ln = extract_line_number(err_desc)
 
         if not isinstance(ln, int):
-            ln = None  
+            ln = None
+
         return err_word or "CompileError", (msg or err_desc or "").strip(), ln
 
     last_compile_res: Dict[str, Any] = {"is_compiled": False, "error_description": None}
@@ -117,27 +114,53 @@ def delete_lines_until_compilable_with_oracle(
         lineno = _clamp(lineno, 1, n)
         end_lineno = lineno
 
-        # -------------------------
-        # Escalation logic (updated)
-        # -------------------------
-        sig = (msg, lineno)
-        seen_counts[sig] = seen_counts.get(sig, 0) + 1
-        if seen_counts[sig] in (3, 6, 10):
-            escalate_level = min(3, escalate_level + 1)
-
         bucket = _bucketize(msg)
         recent_linenos.append(lineno)
         recent_buckets.append(bucket)
 
-        # Escalate on "no progress" even if msg changes
-        if len(recent_linenos) == recent_linenos.maxlen:
-            if max(recent_linenos) - min(recent_linenos) <= 3:
+        # -------------------------
+        # Escalation logic (more aggressive for BLOCK)
+        # -------------------------
+        sig = (msg, lineno)
+        seen_counts[sig] = seen_counts.get(sig, 0) + 1
+
+        # Exact-repeat thresholds
+        if bucket == "BLOCK":
+            # faster for indentation cascades
+            if seen_counts[sig] in (2, 4, 6):
+                escalate_level = min(3, escalate_level + 1)
+        else:
+            if seen_counts[sig] in (3, 6, 10):
                 escalate_level = min(3, escalate_level + 1)
 
+        # No-progress thresholds
+        if len(recent_linenos) == recent_linenos.maxlen:
+            span = max(recent_linenos) - min(recent_linenos)
+            if span <= 3:
+                # for BLOCK, escalate faster (jump directly)
+                if bucket == "BLOCK" and escalate_level < 2:
+                    escalate_level = 2
+                else:
+                    escalate_level = min(3, escalate_level + 1)
+
         if len(recent_buckets) == recent_buckets.maxlen:
-            # Mostly the same bucket (or toggling between two)
             if len(set(recent_buckets)) <= 2:
-                escalate_level = min(3, escalate_level + 1)
+                if bucket == "BLOCK" and escalate_level < 2:
+                    escalate_level = 2
+                else:
+                    escalate_level = min(3, escalate_level + 1)
+
+        if debug_escalation:
+            span_dbg = (
+                (max(recent_linenos) - min(recent_linenos))
+                if len(recent_linenos) == recent_linenos.maxlen
+                else None
+            )
+            uniq_b_dbg = len(set(recent_buckets)) if len(recent_buckets) == recent_buckets.maxlen else None
+            print(
+                f"[del-only] it={it} bucket={bucket} esc={escalate_level} "
+                f"sig_count={seen_counts[sig]} ln={lineno} span={span_dbg} uniq_b={uniq_b_dbg} msg={msg!r}"
+            )
 
         pseudo = _PseudoError(msg=msg, lineno=lineno, end_lineno=end_lineno, bucket=bucket)
 
@@ -174,16 +197,15 @@ def delete_lines_until_compilable_with_oracle(
                 chosen_applied = True
                 break
 
-            # Best-effort: prefer a move in extracted line number
+            # Prefer candidates that move the extracted line number
             trial_desc = (trial_res.get("error_description") or "").strip()
             tln = extract_line_number(trial_desc) if trial_desc else None
-            if isinstance(tln, int):
-                if (trial_desc, tln) != sig:
-                    chosen = (s, e, reason + " (changes error)")
-                    lines = trial_lines
-                    last_compile_res = trial_res
-                    chosen_applied = True
-                    break
+            if isinstance(tln, int) and (trial_desc, tln) != (msg, lineno):
+                chosen = (s, e, reason + " (changes error)")
+                lines = trial_lines
+                last_compile_res = trial_res
+                chosen_applied = True
+                break
 
         if not chosen_applied:
             if smallest is None:
@@ -213,10 +235,6 @@ def delete_lines_until_compilable_with_oracle(
     last_compile_res = compile_check(final_text, out_py_path, out_pyc_path, version)
     return final_text, attempts, last_compile_res
 
-
-# -------------------------------------------------------------------
-# Internals
-# -------------------------------------------------------------------
 
 class _PseudoError:
     def __init__(self, msg: str, lineno: int, end_lineno: int, bucket: str):
@@ -281,7 +299,7 @@ def _line_has_backslash_cont(lines: List[str], lineno: int) -> bool:
     return cur.rstrip().endswith("\\")
 
 
-def _find_nearest_header_above(lines: List[str], lineno: int, max_lookback: int = 60) -> Optional[int]:
+def _find_nearest_header_above(lines: List[str], lineno: int, max_lookback: int = 80) -> Optional[int]:
     lineno = _clamp(lineno, 1, len(lines))
     lo = max(1, lineno - max_lookback)
     for ln in range(lineno, lo - 1, -1):
@@ -293,9 +311,6 @@ def _find_nearest_header_above(lines: List[str], lineno: int, max_lookback: int 
 
 
 def _find_unclosed_construct_start(lines: List[str]) -> Optional[int]:
-    """
-    Tokenize-based inference of the most recent unmatched opening (, [, {.
-    """
     src = "".join(lines)
     try:
         toks = list(tokenize.generate_tokens(io.StringIO(src).readline))
@@ -346,6 +361,48 @@ def _find_statement_chunk(lines: List[str], lineno: int) -> Tuple[int, int]:
     return start, end
 
 
+def _indent_prefix_width(line: str) -> int:
+    # Count leading spaces/tabs; treats tab as 1 unit (fine for heuristic)
+    i = 0
+    for ch in line:
+        if ch == " " or ch == "\t":
+            i += 1
+        else:
+            break
+    return i
+
+
+def _find_indented_region(lines: List[str], lineno: int) -> Optional[Tuple[int, int]]:
+    """
+    For 'unexpected indent': delete a contiguous region starting at lineno where
+    indentation >= indentation at lineno and lines are not blank/comment-only.
+
+    Returns (start,end) 1-based inclusive, or None.
+    """
+    if lineno < 1 or lineno > len(lines):
+        return None
+
+    base_indent = _indent_prefix_width(lines[lineno - 1])
+    if base_indent == 0:
+        return None
+
+    start = lineno
+    end = lineno
+
+    for j in range(lineno + 1, len(lines) + 1):
+        s = lines[j - 1]
+        if _is_blank_or_comment(s):
+            end = j
+            continue
+        ind = _indent_prefix_width(s)
+        if ind >= base_indent:
+            end = j
+        else:
+            break
+
+    return (start, end) if end >= start else None
+
+
 def _dedupe_spans(cands: List[Tuple[int, int, str]]) -> List[Tuple[int, int, str]]:
     seen = set()
     out = []
@@ -363,9 +420,6 @@ def _generate_candidates(
     base_window: int,
     escalate_level: int,
 ) -> List[Tuple[int, int, str]]:
-    """
-    Candidate ordering tuned so UNCLOSED bucket tries tokenizer-start early.
-    """
     n = len(lines)
     lineno = _clamp(int(err.lineno or 1), 1, n)
     end_lineno = _clamp(int(err.end_lineno or lineno), lineno, n)
@@ -374,7 +428,7 @@ def _generate_candidates(
 
     cands: List[Tuple[int, int, str]] = []
 
-    # UNCLOSED: prioritize tokenizer inferred start line before tail chopping
+    # UNCLOSED: tokenizer-first
     if bucket == "UNCLOSED":
         start_line = _find_unclosed_construct_start(lines)
         if start_line is not None:
@@ -383,49 +437,63 @@ def _generate_candidates(
             if escalate_level >= 2:
                 cands.append((start_line, n, "tokenizer start to EOF"))
 
-    # Standard small targets
+    # BLOCK: try indented-region chop early for "unexpected indent"
+    if bucket == "BLOCK" and "unexpected indent" in msg_l:
+        region = _find_indented_region(lines, lineno)
+        if region is not None:
+            s, e = region
+            cands.append((s, e, "indent-region chop (unexpected indent)"))
+
+    # small targets
     cands.append((lineno, end_lineno, "reported span"))
     cands.append((lineno, lineno, "reported line only"))
 
-    # Dangling clause (except/else/elif/finally/case) early
+    # dangling clause
     if 1 <= lineno <= n and _DANGLING_CLAUSE_RE.match(lines[lineno - 1]):
         cands.insert(0, (lineno, lineno, "dangling clause keyword line"))
         hdr = _find_nearest_header_above(lines, lineno)
         if hdr is not None:
             cands.insert(1, (hdr, hdr, "nearest header above (re-balance blocks)"))
 
-    # Backslash continuation
+    # backslash continuation
     if _prev_line_has_backslash_cont(lines, lineno):
         cands.insert(0, (max(1, lineno - 1), lineno, "backslash continuation (prev + current)"))
     if _line_has_backslash_cont(lines, lineno):
         cands.insert(0, (lineno, min(n, lineno + 1), "backslash continuation (current + next)"))
 
-    # Windows (larger windows appear at higher escalation)
+    # windows: more aggressive for BLOCK
     windows = [max(0, base_window), 1, 2, 4]
-    if escalate_level >= 2:
-        windows += [8]
-    if escalate_level >= 3:
-        windows += [16]
+    if bucket == "BLOCK":
+        if escalate_level >= 2:
+            windows += [8, 16]
+        if escalate_level >= 3:
+            windows += [32]
+    else:
+        if escalate_level >= 2:
+            windows += [8]
+        if escalate_level >= 3:
+            windows += [16]
+
     for w in windows:
         s = _clamp(lineno - w, 1, n)
         e = _clamp(end_lineno + w, s, n)
         cands.append((s, e, f"window w={w}"))
 
-    # Block-like errors: header deletion candidates
+    # header deletion for block-ish messages
     if any(s in msg_l for s in ["expected ':'", "expected an indented block", "unexpected indent", "unindent does not match", "indentation", "invalid syntax"]):
         hdr = _find_nearest_header_above(lines, lineno)
         if hdr is not None:
             cands.insert(0, (hdr, hdr, "nearest header above"))
             cands.insert(1, (max(1, hdr - 1), min(n, hdr + 1), "header neighborhood"))
 
-    # Statement chunk
+    # statement chunk
     cs, ce = _find_statement_chunk(lines, lineno)
     cands.append((cs, ce, "statement chunk"))
 
-    # Tail chop (especially for truncated outputs)
+    # tail chop
     cands.append((lineno, n, "error line to EOF"))
 
-    # Very aggressive escalation
+    # aggressive
     if escalate_level >= 3:
         cands.append((1, lineno, "BOOM: start to error line"))
 
