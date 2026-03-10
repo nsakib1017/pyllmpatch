@@ -155,53 +155,53 @@ if __name__ == "__main__":
 
                 path1 = Path(f"{Path(path).parent}/{file_hash}/syntax_repaired_{file_name}")
                 path2 = Path(f"{os.getenv('BASE_DIR_PYTHON_FILES')}/{file_hash}/{file_name}")
-                path3 = Path(f"{os.getenv('BASE_DIR_PYTHON_FILES')}/{file_hash}/{raw_name}.py")
+                # path3 = Path(f"{os.getenv('BASE_DIR_PYTHON_FILES')}/{file_hash}/{raw_name}.py")
 
                 d32 = None
                 d31 = None
                 status = "OK"
 
-                missing = [str(p) for p in (path1, path2, path3) if not p.is_file()]
+                missing = [str(p) for p in (path1, path2) if not p.is_file()]
                 if missing:
                     status = "missing"
                 else:
                     try:
                         s1 = strip_comments_and_whitespace(read_text(path1))
                         s2 = strip_comments_and_whitespace(read_text(path2))
-                        s3 = strip_comments_and_whitespace(read_text(path3))
+                        # s3 = strip_comments_and_whitespace(read_text(path3))
 
-                        d32 = Levenshtein.distance(s3, s2, score_cutoff=MAX_DIST)
-                        d31 = Levenshtein.distance(s3, s1, score_cutoff=MAX_DIST)
+                        d21 = Levenshtein.distance(s2, s1, score_cutoff=MAX_DIST)
+                        # d31 = Levenshtein.distance(s3, s1, score_cutoff=MAX_DIST)
 
                         # Compute cosine similarities
                         e1 = embed_long_text(sentence_model, s1, max_tokens=512, stride=128)
                         e2 = embed_long_text(sentence_model, s2, max_tokens=512, stride=128)
-                        e3 = embed_long_text(sentence_model, s3, max_tokens=512, stride=128)
+                        # e3 = embed_long_text(sentence_model, s3, max_tokens=512, stride=128)
                         
-                        sim_31 = cosine_similarity(e3, e1)
-                        sim_32 = cosine_similarity(e3, e2)
+                        sim_21 = cosine_similarity(e2, e1)
+                        # sim_32 = cosine_similarity(e3, e2)
 
-                        dist_32 = 1.0 - sim_32
-                        dist_31 = 1.0 - sim_31
+                        dist_21 = 1.0 - sim_21
+                        # dist_31 = 1.0 - sim_31
                     except Exception:
                         status = "error"
 
                 results.append({
                     "file_hash": file_hash,
                     "decompiled_file_name": file_name,
-                    "raw_file_name": path3.name,
-                    "d_lookup_vs_decompiled": d32,
-                    "d_lookup_vs_repaired": d31,
-                    "d_lookup_vs_decompiled_cosine_similarity": sim_32,
-                    "d_lookup_vs_repaired_cosine_similarity": sim_31,
-                    "d_lookup_vs_decompiled_cosine_distance": dist_32,
-                    "d_lookup_vs_repaired_cosine_distance": dist_31,
+                    # "raw_file_name": path3.name,
+                    "d_repaired_vs_decompiled": d21,
+                    # "d_lookup_vs_repaired": d31,
+                    "d_repaired_vs_decompiled_cosine_similarity": sim_21,
+                    # "d_lookup_vs_repaired_cosine_similarity": sim_31,
+                    "d_repaired_vs_decompiled_cosine_distance": dist_21,
+                    # "d_lookup_vs_repaired_cosine_distance": dist_31,
                 })
 
             results_df = pd.DataFrame(results)
             out_path = Path(
                 f"{os.getenv('PROJECT_ROOT_DIR')}/dataset/"
-                f"decompiled_comparison_results_{model}_{config}.csv"
+                f"decompiled_comparison_results_wo_lookup_{model}_{config}.csv"
             )
             save_csv_file(results_df, out_path)
 

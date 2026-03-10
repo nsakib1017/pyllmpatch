@@ -18,6 +18,8 @@ scipy
 einops
 evaluate
 uv
+tree-sitter
+tree-sitter-python
 
 # Optional (recommended for local dev)
 openpyxl

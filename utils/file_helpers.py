@@ -550,4 +550,9 @@ LIST_OF_LOG_FILES = {
         "config_1":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20260125T155805Z/67ac1a2443ab4ac8bfe7bba365801501/run_log_67ac1a2443ab4ac8bfe7bba365801501_with_config_1.jsonl",
         "config_2":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20260125T155805Z/8cc795eb35404e8e8da0d6ec87eb7032/run_log_8cc795eb35404e8e8da0d6ec87eb7032_with_config_2.jsonl",
         },
+    "delete-everything": {
+        "config_0":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20260306T175101Z/27e9ae6ac6724779acd77324edda51df/run_log_27e9ae6ac6724779acd77324edda51df_with_config_0.jsonl",
+        "config_1":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20260306T175101Z/13d82a4a8a384595a80f7c64a10d6554/run_log_13d82a4a8a384595a80f7c64a10d6554_with_config_1.jsonl",
+        "config_2":f"{os.getenv('PROJECT_ROOT_DIR')}/results/experiment_outputs/20260306T175101Z/538f140b7e734a4d9970a0599fada635/run_log_538f140b7e734a4d9970a0599fada635_with_config_2.jsonl",
+        },
     }
