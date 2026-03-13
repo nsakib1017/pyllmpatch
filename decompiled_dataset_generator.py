@@ -3,6 +3,7 @@
 import os
 import csv
 import re
+import gc
 import subprocess
 from pathlib import Path
 
@@ -13,9 +14,13 @@ from utils.generate_bytecode import *
 load_dotenv()
 
 BASE_PYTHON_FILES = Path(os.getenv("BASE_DIR_PYTHON_FILES"))
-PYTHON_VERSIONS = {PythonVersion((3, x)) for x in range(10, 15)}
+PYTHON_VERSIONS = {PythonVersion((3, x)) for x in range(10, 15) if x != 12}
 HASH_FILES_CSV = Path(os.getenv("PROJECT_ROOT_DIR")) / "dataset" / os.getenv("BASE_DATASET_NAME")
 OUTPUT_CSV = Path(os.getenv("PROJECT_ROOT_DIR")) / "dataset" / "decompiled_syntax_errors_pylingual.csv"
+
+MAX_SOURCE_BYTES = 2 * 1024 * 1024
+MAX_DECOMPILED_BYTES = 5 * 1024 * 1024
+# PYLINGUAL_TIMEOUT_SECONDS = 120
 
 CSV_FIELDS = [
     "file_hash",
@@ -81,6 +86,7 @@ def run_pylingual(pyc_file: Path, out_dir: Path):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
+        # timeout=PYLINGUAL_TIMEOUT_SECONDS,
     )
 
 
@@ -152,11 +158,22 @@ def save_csv(rows, path: Path):
         writer.writerows(rows)
 
 
+def cleanup_file(path: Path):
+    try:
+        if path.exists() and path.is_file():
+            path.unlink()
+    except Exception:
+        pass
+
+
 def main():
     root = BASE_PYTHON_FILES
 
     print(f"Root directory: {root}")
     print(f"Reading CSV: {HASH_FILES_CSV}")
+    print(f"Max source bytes: {MAX_SOURCE_BYTES}")
+    print(f"Max decompiled bytes: {MAX_DECOMPILED_BYTES}")
+    # print(f"Pylingual timeout: {PYLINGUAL_TIMEOUT_SECONDS}s")
     print()
 
     versions_sorted = sorted(PYTHON_VERSIONS, key=lambda v: v.as_tuple())
@@ -179,6 +196,8 @@ def main():
                 break
 
             file_hash = item.get("file_hash", "<unknown>")
+            pyc_file = None
+            decompiled_file = None
 
             try:
                 csv_file_name = item["file"]
@@ -199,6 +218,13 @@ def main():
 
                 print(f"  -> source file: {source_py.name}")
 
+                source_size = source_py.stat().st_size
+                if source_size > MAX_SOURCE_BYTES:
+                    print(f"  -> skip (source too large: {source_size} bytes)")
+                    skipped += 1
+                    continue
+
+                print("  -> step: compile source")
                 pyc_file = hash_dir / "__pycache__" / f"{source_py.stem}.cpython-{version.major}{version.minor}.pyc"
                 pyc_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -212,7 +238,14 @@ def main():
 
                 decompiled_out_dir = hash_dir / f"decompiled_output_py{version.major}{version.minor}"
 
-                res = run_pylingual(pyc_file, decompiled_out_dir)
+                print("  -> step: run pylingual")
+                try:
+                    res = run_pylingual(pyc_file, decompiled_out_dir)
+                except subprocess.TimeoutExpired:
+                    print("  -> skip (pylingual timed out)")
+                    skipped += 1
+                    continue
+
                 if res.returncode != 0:
                     print(f"  -> skip (pylingual failed: exit code {res.returncode})")
                     skipped += 1
@@ -220,6 +253,7 @@ def main():
 
                 print(f"  -> pylingual finished, output dir: {decompiled_out_dir}")
 
+                print("  -> step: locate decompiled file")
                 decompiled_file = find_decompiled_file(decompiled_out_dir, pyc_file)
                 if decompiled_file is None:
                     print("  -> skip (decompiled file missing)")
@@ -228,6 +262,13 @@ def main():
 
                 print(f"  -> decompiled file: {decompiled_file.name}")
 
+                decompiled_size = decompiled_file.stat().st_size
+                if decompiled_size > MAX_DECOMPILED_BYTES:
+                    print(f"  -> skip (decompiled file too large: {decompiled_size} bytes)")
+                    skipped += 1
+                    continue
+
+                print("  -> step: compile decompiled file")
                 err = syntax_check(decompiled_file, file_hash, version)
                 if err:
                     rows.append(err)
@@ -244,8 +285,18 @@ def main():
                 print(f"  -> ERROR processing {file_hash}: {e}")
                 print()
 
+            finally:
+                if pyc_file is not None:
+                    cleanup_file(pyc_file)
+
+                if decompiled_file is not None:
+                    decompiled_pyc = decompiled_file.parent / "__pycache__" / f"{decompiled_file.stem}.cpython-{version.major}{version.minor}.pyc"
+                    cleanup_file(decompiled_pyc)
+
+                gc.collect()
+
         version_output_csv = OUTPUT_CSV.with_name(
-            f"{OUTPUT_CSV.stem}_{version.as_str()}{OUTPUT_CSV.suffix}"
+            f"{OUTPUT_CSV.stem}"
         )
 
         save_csv(rows, version_output_csv)
