@@ -13,7 +13,7 @@ from utils.generate_bytecode import *
 load_dotenv()
 
 BASE_PYTHON_FILES = Path(os.getenv("BASE_DIR_PYTHON_FILES"))
-PYTHON_VERSIONS = {PythonVersion((3, x)) for x in range(10, 11)}
+PYTHON_VERSIONS = {PythonVersion((3, x)) for x in range(10, 15)}
 HASH_FILES_CSV = Path(os.getenv("PROJECT_ROOT_DIR")) / "dataset" / os.getenv("BASE_DATASET_NAME")
 OUTPUT_CSV = Path(os.getenv("PROJECT_ROOT_DIR")) / "dataset" / "decompiled_syntax_errors_pylingual.csv"
 
@@ -71,7 +71,7 @@ def run_pylingual(pyc_file: Path, out_dir: Path):
 
     cmd = [
         "pylingual",
-        # "-q",
+        "-q",
         "-o", str(out_dir),
         str(pyc_file),
     ]
@@ -79,8 +79,8 @@ def run_pylingual(pyc_file: Path, out_dir: Path):
     return subprocess.run(
         cmd,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=False,
+        stderr=subprocess.DEVNULL,
+        check=False,
     )
 
 
@@ -122,7 +122,7 @@ def get_error_word_message_from_text(text):
     return error_word, message
 
 
-def syntax_check(file_path: Path, root: Path, version: PythonVersion):
+def syntax_check(file_path: Path, file_hash: str, version: PythonVersion):
     pyc_file = file_path.parent / "__pycache__" / f"{file_path.stem}.cpython-{version.major}{version.minor}.pyc"
     pyc_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -131,16 +131,11 @@ def syntax_check(file_path: Path, root: Path, version: PythonVersion):
         return None
 
     except CompileError as e:
-        try:
-            subdir = str(file_path.parent.relative_to(root))
-        except ValueError:
-            subdir = file_path.parent.name
-
         err_text = str(e).strip()
         error_word, message = get_error_word_message_from_text(err_text)
 
         return {
-            "file_hash": subdir,
+            "file_hash": file_hash,
             "file": file_path.name,
             "error_message": message if message else err_text,
             "error_description": err_text,
@@ -175,73 +170,79 @@ def main():
         processed = 0
         skipped = 0
         errors = 0
+        crashes = 0
 
         row_iter = iter_hash_rows(HASH_FILES_CSV)
 
         for idx, item in enumerate(row_iter, start=1):
-            if idx > 3:
+            if idx > 5:
                 break
 
-            file_hash = item["file_hash"]
-            csv_file_name = item["file"]
-
-            hash_dir = root / file_hash
-
-            print(f"[{version.as_str()}] {file_hash}")
-
-            if not hash_dir.exists():
-                print("  -> skip (directory missing)")
-                skipped += 1
-                continue
-
-            source_py = choose_source_py(hash_dir, csv_file_name)
-            if source_py is None:
-                print(f"  -> skip (source file not found for {csv_file_name})")
-                skipped += 1
-                continue
-
-            print(f"  -> source file: {source_py.name}")
-
-            pyc_file = hash_dir / "__pycache__" / f"{source_py.stem}.cpython-{version.major}{version.minor}.pyc"
-            pyc_file.parent.mkdir(parents=True, exist_ok=True)
+            file_hash = item.get("file_hash", "<unknown>")
 
             try:
-                compile_version(source_py, pyc_file, version)
-                print(f"  -> compiled source to {pyc_file.name}")
-            except CompileError as e:
-                print(f"  -> skip (source compile failed: {e})")
-                skipped += 1
-                continue
+                csv_file_name = item["file"]
+                hash_dir = root / file_hash
 
-            decompiled_out_dir = hash_dir / "decompiled_output"
+                print(f"[{version.as_str()}] {file_hash}")
 
-            res = run_pylingual(pyc_file, decompiled_out_dir)
-            if res.returncode != 0:
-                err_msg = (res.stderr or "").strip()
-                print(f"  -> skip (pylingual failed: {err_msg if err_msg else res.returncode})")
-                skipped += 1
-                continue
+                if not hash_dir.exists():
+                    print("  -> skip (directory missing)")
+                    skipped += 1
+                    continue
 
-            print(f"  -> pylingual finished, output dir: {decompiled_out_dir}")
+                source_py = choose_source_py(hash_dir, csv_file_name)
+                if source_py is None:
+                    print(f"  -> skip (source file not found for {csv_file_name})")
+                    skipped += 1
+                    continue
 
-            decompiled_file = find_decompiled_file(decompiled_out_dir, pyc_file)
-            if decompiled_file is None:
-                print("  -> skip (decompiled file missing)")
-                skipped += 1
-                continue
+                print(f"  -> source file: {source_py.name}")
 
-            print(f"  -> decompiled file: {decompiled_file.name}")
+                pyc_file = hash_dir / "__pycache__" / f"{source_py.stem}.cpython-{version.major}{version.minor}.pyc"
+                pyc_file.parent.mkdir(parents=True, exist_ok=True)
 
-            err = syntax_check(decompiled_file, root, version)
-            if err:
-                rows.append(err)
-                errors += 1
-                print("  -> syntax error detected")
-            else:
-                print("  -> syntax OK")
+                try:
+                    compile_version(source_py, pyc_file, version)
+                    print(f"  -> compiled source to {pyc_file.name}")
+                except CompileError as e:
+                    print(f"  -> skip (source compile failed: {e})")
+                    skipped += 1
+                    continue
 
-            processed += 1
-            print()
+                decompiled_out_dir = hash_dir / f"decompiled_output_py{version.major}{version.minor}"
+
+                res = run_pylingual(pyc_file, decompiled_out_dir)
+                if res.returncode != 0:
+                    print(f"  -> skip (pylingual failed: exit code {res.returncode})")
+                    skipped += 1
+                    continue
+
+                print(f"  -> pylingual finished, output dir: {decompiled_out_dir}")
+
+                decompiled_file = find_decompiled_file(decompiled_out_dir, pyc_file)
+                if decompiled_file is None:
+                    print("  -> skip (decompiled file missing)")
+                    skipped += 1
+                    continue
+
+                print(f"  -> decompiled file: {decompiled_file.name}")
+
+                err = syntax_check(decompiled_file, file_hash, version)
+                if err:
+                    rows.append(err)
+                    errors += 1
+                    print("  -> syntax error detected")
+                else:
+                    print("  -> syntax OK")
+
+                processed += 1
+                print()
+
+            except Exception as e:
+                crashes += 1
+                print(f"  -> ERROR processing {file_hash}: {e}")
+                print()
 
         version_output_csv = OUTPUT_CSV.with_name(
             f"{OUTPUT_CSV.stem}_{version.as_str()}{OUTPUT_CSV.suffix}"
@@ -254,6 +255,7 @@ def main():
         print(f"Processed: {processed}")
         print(f"Skipped: {skipped}")
         print(f"Syntax errors: {errors}")
+        print(f"Unexpected crashes: {crashes}")
         print(f"Saved: {version_output_csv}")
         print("-" * 70)
         print()
