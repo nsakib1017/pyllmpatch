@@ -80,7 +80,7 @@ def run_pylingual(pyc_file: Path, out_dir: Path):
         "-o", str(out_dir),
         str(pyc_file),
     ]
-
+    print (f"Running command: {' '.join(cmd)}")
     return subprocess.run(
         cmd,
         stdout=subprocess.DEVNULL,
