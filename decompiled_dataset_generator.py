@@ -14,7 +14,7 @@ from utils.generate_bytecode import *
 load_dotenv()
 
 BASE_PYTHON_FILES = Path(os.getenv("BASE_DIR_PYTHON_FILES"))
-PYTHON_VERSIONS = {PythonVersion((3, x)) for x in range(10, 15) if x != 12}
+PYTHON_VERSIONS = {PythonVersion((3, x)) for x in range(10, 15)}
 HASH_FILES_CSV = Path(os.getenv("PROJECT_ROOT_DIR")) / "dataset" / os.getenv("BASE_DATASET_NAME")
 OUTPUT_CSV = Path(os.getenv("PROJECT_ROOT_DIR")) / "dataset" / "decompiled_syntax_errors_pylingual.csv"
 
@@ -196,6 +196,7 @@ def main():
                 break
 
             file_hash = item.get("file_hash", "<unknown>")
+
             pyc_file = None
             decompiled_file = None
 
@@ -236,7 +237,7 @@ def main():
                     skipped += 1
                     continue
 
-                decompiled_out_dir = hash_dir / f"decompiled_output_py{version.major}{version.minor}"
+                decompiled_out_dir = hash_dir / f"decompiled_output"
 
                 print("  -> step: run pylingual")
                 try:
@@ -296,7 +297,7 @@ def main():
                 gc.collect()
 
         version_output_csv = OUTPUT_CSV.with_name(
-            f"{OUTPUT_CSV.stem}"
+            f"{OUTPUT_CSV.stem}_{version.as_str()}{OUTPUT_CSV.suffix}"
         )
 
         save_csv(rows, version_output_csv)
