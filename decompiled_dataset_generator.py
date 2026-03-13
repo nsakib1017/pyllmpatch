@@ -15,7 +15,7 @@ from utils.generate_bytecode import *
 load_dotenv()
 
 BASE_PYTHON_FILES = Path(os.getenv("BASE_DIR_PYTHON_FILES"))
-PYTHON_VERSIONS = {PythonVersion((3, x)) for x in range(10, 15)}
+PYTHON_VERSIONS = {PythonVersion((3, x)) for x in range(10, 15) if x!= 12}
 HASH_FILES_CSV = Path(os.getenv("PROJECT_ROOT_DIR")) / "dataset" / os.getenv("BASE_DATASET_NAME")
 OUTPUT_CSV = Path(os.getenv("PROJECT_ROOT_DIR")) / "dataset" / "decompiled_syntax_errors_pylingual.csv"
 
@@ -80,7 +80,7 @@ def run_pylingual(pyc_file: Path, out_dir: Path):
         "-o", str(out_dir),
         str(pyc_file),
     ]
-    print (f"Running command: {' '.join(cmd)}")
+    # print (f"       -> running command: {' '.join(cmd)}")
     return subprocess.run(
         cmd,
         stdout=subprocess.DEVNULL,
