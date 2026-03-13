@@ -10,7 +10,7 @@ import shutil
 
 from utils.version import PythonVersion
 
-UV_VERSIONS = {PythonVersion((3, x)) for x in range(8, 14)}
+UV_VERSIONS = {PythonVersion((3, x)) for x in range(8, 15)}
 
 
 class CompileError(Exception):

@@ -4,6 +4,7 @@ import os
 import csv
 import re
 import gc
+import time
 import subprocess
 from pathlib import Path
 
@@ -20,7 +21,6 @@ OUTPUT_CSV = Path(os.getenv("PROJECT_ROOT_DIR")) / "dataset" / "decompiled_synta
 
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_DECOMPILED_BYTES = 5 * 1024 * 1024
-# PYLINGUAL_TIMEOUT_SECONDS = 120
 
 CSV_FIELDS = [
     "file_hash",
@@ -86,18 +86,34 @@ def run_pylingual(pyc_file: Path, out_dir: Path):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
-        # timeout=PYLINGUAL_TIMEOUT_SECONDS,
     )
 
 
 def find_decompiled_file(out_dir: Path, pyc_file: Path):
-    decompiled_name = f"decompiled_{pyc_file.name.replace('.pyc', '.py')}"
-    candidate = out_dir / decompiled_name
+    expected_name = f"decompiled_{pyc_file.name.replace('.pyc', '.py')}"
+    expected_path = out_dir / expected_name
 
-    if candidate.exists():
-        return candidate
+    if expected_path.exists():
+        return expected_path
 
-    return None
+    candidates = list(out_dir.rglob("decompiled_*.py"))
+    if not candidates:
+        return None
+
+    pyc_stem = pyc_file.stem
+
+    exact_stem_matches = [p for p in candidates if p.stem == f"decompiled_{pyc_stem}"]
+    if exact_stem_matches:
+        exact_stem_matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return exact_stem_matches[0]
+
+    loose_matches = [p for p in candidates if pyc_stem in p.stem]
+    if loose_matches:
+        loose_matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return loose_matches[0]
+
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
 
 
 def get_error_word_message_from_text(text):
@@ -173,7 +189,6 @@ def main():
     print(f"Reading CSV: {HASH_FILES_CSV}")
     print(f"Max source bytes: {MAX_SOURCE_BYTES}")
     print(f"Max decompiled bytes: {MAX_DECOMPILED_BYTES}")
-    # print(f"Pylingual timeout: {PYLINGUAL_TIMEOUT_SECONDS}s")
     print()
 
     versions_sorted = sorted(PYTHON_VERSIONS, key=lambda v: v.as_tuple())
@@ -240,12 +255,7 @@ def main():
                 decompiled_out_dir = hash_dir / f"decompiled_output"
 
                 print("  -> step: run pylingual")
-                try:
-                    res = run_pylingual(pyc_file, decompiled_out_dir)
-                except subprocess.TimeoutExpired:
-                    print("  -> skip (pylingual timed out)")
-                    skipped += 1
-                    continue
+                res = run_pylingual(pyc_file, decompiled_out_dir)
 
                 if res.returncode != 0:
                     print(f"  -> skip (pylingual failed: exit code {res.returncode})")
@@ -255,9 +265,18 @@ def main():
                 print(f"  -> pylingual finished, output dir: {decompiled_out_dir}")
 
                 print("  -> step: locate decompiled file")
-                decompiled_file = find_decompiled_file(decompiled_out_dir, pyc_file)
+                decompiled_file = None
+                for attempt in range(3):
+                    decompiled_file = find_decompiled_file(decompiled_out_dir, pyc_file)
+                    if decompiled_file is not None:
+                        break
+                    time.sleep(0.5)
+
                 if decompiled_file is None:
-                    print("  -> skip (decompiled file missing)")
+                    existing = list(decompiled_out_dir.rglob("*")) if decompiled_out_dir.exists() else []
+                    print(f"  -> skip (decompiled file missing, found {len(existing)} item(s) in output dir)")
+                    for p in existing[:10]:
+                        print(f"     - {p}")
                     skipped += 1
                     continue
 
@@ -286,13 +305,13 @@ def main():
                 print(f"  -> ERROR processing {file_hash}: {e}")
                 print()
 
-            finally:
-                if pyc_file is not None:
-                    cleanup_file(pyc_file)
+            # finally:
+            #     if pyc_file is not None:
+            #         cleanup_file(pyc_file)
 
-                if decompiled_file is not None:
-                    decompiled_pyc = decompiled_file.parent / "__pycache__" / f"{decompiled_file.stem}.cpython-{version.major}{version.minor}.pyc"
-                    cleanup_file(decompiled_pyc)
+            #     if decompiled_file is not None:
+            #         decompiled_pyc = decompiled_file.parent / "__pycache__" / f"{decompiled_file.stem}.cpython-{version.major}{version.minor}.pyc"
+            #         cleanup_file(decompiled_pyc)
 
                 gc.collect()
 
