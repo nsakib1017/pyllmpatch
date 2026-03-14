@@ -15,7 +15,7 @@ from utils.generate_bytecode import *
 load_dotenv()
 
 BASE_PYTHON_FILES = Path(os.getenv("BASE_DIR_PYTHON_FILES"))
-PYTHON_VERSIONS = {PythonVersion((3, x)) for x in range(10, 15) if x!= 12}
+PYTHON_VERSIONS = {PythonVersion((3, x)) for x in range(11, 15)}
 HASH_FILES_CSV = Path(os.getenv("PROJECT_ROOT_DIR")) / "dataset" / os.getenv("BASE_DATASET_NAME")
 OUTPUT_CSV = Path(os.getenv("PROJECT_ROOT_DIR")) / "dataset" / "decompiled_syntax_errors_pylingual.csv"
 
@@ -207,8 +207,8 @@ def main():
         row_iter = iter_hash_rows(HASH_FILES_CSV)
 
         for idx, item in enumerate(row_iter, start=1):
-            if idx > 5:
-                break
+            # if idx > 10:
+            #     break
 
             file_hash = item.get("file_hash", "<unknown>")
 
@@ -305,13 +305,13 @@ def main():
                 print(f"  -> ERROR processing {file_hash}: {e}")
                 print()
 
-            # finally:
-            #     if pyc_file is not None:
-            #         cleanup_file(pyc_file)
+            finally:
+                if pyc_file is not None:
+                    cleanup_file(pyc_file)
 
-            #     if decompiled_file is not None:
-            #         decompiled_pyc = decompiled_file.parent / "__pycache__" / f"{decompiled_file.stem}.cpython-{version.major}{version.minor}.pyc"
-            #         cleanup_file(decompiled_pyc)
+                if decompiled_file is not None:
+                    decompiled_pyc = decompiled_file.parent / "__pycache__" / f"{decompiled_file.stem}.cpython-{version.major}{version.minor}.pyc"
+                    cleanup_file(decompiled_pyc)
 
                 gc.collect()
 
