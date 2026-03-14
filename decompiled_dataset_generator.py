@@ -15,12 +15,17 @@ from utils.generate_bytecode import *
 load_dotenv()
 
 BASE_PYTHON_FILES = Path(os.getenv("BASE_DIR_PYTHON_FILES"))
-PYTHON_VERSIONS = {PythonVersion((3, x)) for x in range(10, 15) if x!= 12}
+PYTHON_VERSIONS = {PythonVersion((3, x)) for x in range(8, 14)}
 HASH_FILES_CSV = Path(os.getenv("PROJECT_ROOT_DIR")) / "dataset" / os.getenv("BASE_DATASET_NAME")
-OUTPUT_CSV = Path(os.getenv("PROJECT_ROOT_DIR")) / "dataset" / "decompiled_syntax_errors_pylingual.csv"
+OUTPUT_CSV_BASE = Path(os.getenv("PROJECT_ROOT_DIR")) / "dataset" / "decompiled_syntax_errors.csv"
 
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_DECOMPILED_BYTES = 5 * 1024 * 1024
+
+DECOMPILERS = [
+    # "pylingual", 
+    "pycdc"
+]
 
 CSV_FIELDS = [
     "file_hash",
@@ -80,13 +85,42 @@ def run_pylingual(pyc_file: Path, out_dir: Path):
         "-o", str(out_dir),
         str(pyc_file),
     ]
-    # print (f"       -> running command: {' '.join(cmd)}")
-    return subprocess.run(
+
+    result = subprocess.run(
         cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
     )
+
+    expected_file = out_dir / f"decompiled_{pyc_file.name.replace('.pyc', '.py')}"
+    stderr_file = None
+    return result, expected_file, stderr_file
+
+
+def run_pycdc(pyc_file: Path, out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    output_file = out_dir / f"decompiled_{pyc_file.name.replace('.pyc', '.py')}"
+    error_file = out_dir / f"{pyc_file.stem}_pycdc.stderr.txt"
+
+    with output_file.open("w", encoding="utf-8") as out_f, error_file.open("w", encoding="utf-8") as err_f:
+        result = subprocess.run(
+            ["pycdc", str(pyc_file)],
+            stdout=out_f,
+            stderr=err_f,
+            check=False,
+        )
+
+    return result, output_file, error_file
+
+
+def run_decompiler(decompiler_name: str, pyc_file: Path, out_dir: Path):
+    if decompiler_name == "pylingual":
+        return run_pylingual(pyc_file, out_dir)
+    if decompiler_name == "pycdc":
+        return run_pycdc(pyc_file, out_dir)
+    raise ValueError(f"Unsupported decompiler: {decompiler_name}")
 
 
 def find_decompiled_file(out_dir: Path, pyc_file: Path):
@@ -182,6 +216,12 @@ def cleanup_file(path: Path):
         pass
 
 
+def build_output_csv_path(base_path: Path, decompiler_name: str, version: PythonVersion) -> Path:
+    return base_path.with_name(
+        f"{base_path.stem}_{decompiler_name}_{version.as_str()}{base_path.suffix}"
+    )
+
+
 def main():
     root = BASE_PYTHON_FILES
 
@@ -189,147 +229,153 @@ def main():
     print(f"Reading CSV: {HASH_FILES_CSV}")
     print(f"Max source bytes: {MAX_SOURCE_BYTES}")
     print(f"Max decompiled bytes: {MAX_DECOMPILED_BYTES}")
+    print(f"Decompilers: {DECOMPILERS}")
     print()
 
     versions_sorted = sorted(PYTHON_VERSIONS, key=lambda v: v.as_tuple())
 
-    for version in versions_sorted:
-        print("=" * 70)
-        print(f"Starting Python {version.as_str()}")
-        print("=" * 70)
+    for decompiler_name in DECOMPILERS:
+        print("#" * 70)
+        print(f"Starting decompiler: {decompiler_name}")
+        print("#" * 70)
+        print()
 
-        rows = []
-        processed = 0
-        skipped = 0
-        errors = 0
-        crashes = 0
+        for version in versions_sorted:
+            print("=" * 70)
+            print(f"Starting Python {version.as_str()} with {decompiler_name}")
+            print("=" * 70)
 
-        row_iter = iter_hash_rows(HASH_FILES_CSV)
+            rows = []
+            processed = 0
+            skipped = 0
+            errors = 0
+            crashes = 0
 
-        for idx, item in enumerate(row_iter, start=1):
-            if idx > 5:
-                break
+            row_iter = iter_hash_rows(HASH_FILES_CSV)
 
-            file_hash = item.get("file_hash", "<unknown>")
+            for idx, item in enumerate(row_iter, start=1):
+                # if idx > 5:
+                #     break
 
-            pyc_file = None
-            decompiled_file = None
+                file_hash = item.get("file_hash", "<unknown>")
 
-            try:
-                csv_file_name = item["file"]
-                hash_dir = root / file_hash
-
-                print(f"[{version.as_str()}] {file_hash}")
-
-                if not hash_dir.exists():
-                    print("  -> skip (directory missing)")
-                    skipped += 1
-                    continue
-
-                source_py = choose_source_py(hash_dir, csv_file_name)
-                if source_py is None:
-                    print(f"  -> skip (source file not found for {csv_file_name})")
-                    skipped += 1
-                    continue
-
-                print(f"  -> source file: {source_py.name}")
-
-                source_size = source_py.stat().st_size
-                if source_size > MAX_SOURCE_BYTES:
-                    print(f"  -> skip (source too large: {source_size} bytes)")
-                    skipped += 1
-                    continue
-
-                print("  -> step: compile source")
-                pyc_file = hash_dir / "__pycache__" / f"{source_py.stem}.cpython-{version.major}{version.minor}.pyc"
-                pyc_file.parent.mkdir(parents=True, exist_ok=True)
+                pyc_file = None
+                decompiled_file = None
 
                 try:
-                    compile_version(source_py, pyc_file, version)
-                    print(f"  -> compiled source to {pyc_file.name}")
-                except CompileError as e:
-                    print(f"  -> skip (source compile failed: {e})")
-                    skipped += 1
-                    continue
+                    csv_file_name = item["file"]
+                    hash_dir = root / file_hash
 
-                decompiled_out_dir = hash_dir / f"decompiled_output"
+                    print(f"[{decompiler_name} | {version.as_str()}] {file_hash}")
 
-                print("  -> step: run pylingual")
-                res = run_pylingual(pyc_file, decompiled_out_dir)
+                    if not hash_dir.exists():
+                        print("  -> skip (directory missing)")
+                        skipped += 1
+                        continue
 
-                if res.returncode != 0:
-                    print(f"  -> skip (pylingual failed: exit code {res.returncode})")
-                    skipped += 1
-                    continue
+                    source_py = choose_source_py(hash_dir, csv_file_name)
+                    if source_py is None:
+                        print(f"  -> skip (source file not found for {csv_file_name})")
+                        skipped += 1
+                        continue
 
-                print(f"  -> pylingual finished, output dir: {decompiled_out_dir}")
+                    print(f"  -> source file: {source_py.name}")
 
-                print("  -> step: locate decompiled file")
-                decompiled_file = None
-                for attempt in range(3):
-                    decompiled_file = find_decompiled_file(decompiled_out_dir, pyc_file)
-                    if decompiled_file is not None:
-                        break
-                    time.sleep(0.5)
+                    source_size = source_py.stat().st_size
+                    if source_size > MAX_SOURCE_BYTES:
+                        print(f"  -> skip (source too large: {source_size} bytes)")
+                        skipped += 1
+                        continue
 
-                if decompiled_file is None:
-                    existing = list(decompiled_out_dir.rglob("*")) if decompiled_out_dir.exists() else []
-                    print(f"  -> skip (decompiled file missing, found {len(existing)} item(s) in output dir)")
-                    for p in existing[:10]:
-                        print(f"     - {p}")
-                    skipped += 1
-                    continue
+                    print("  -> step: compile source")
+                    pyc_file = hash_dir / "__pycache__" / f"{source_py.stem}.cpython-{version.major}{version.minor}.pyc"
+                    pyc_file.parent.mkdir(parents=True, exist_ok=True)
 
-                print(f"  -> decompiled file: {decompiled_file.name}")
+                    try:
+                        compile_version(source_py, pyc_file, version)
+                        print(f"  -> compiled source to {pyc_file.name}")
+                    except CompileError as e:
+                        print(f"  -> skip (source compile failed: {e})")
+                        skipped += 1
+                        continue
 
-                decompiled_size = decompiled_file.stat().st_size
-                if decompiled_size > MAX_DECOMPILED_BYTES:
-                    print(f"  -> skip (decompiled file too large: {decompiled_size} bytes)")
-                    skipped += 1
-                    continue
+                    decompiled_out_dir = hash_dir / f"decompiled_output_{decompiler_name}"
 
-                print("  -> step: compile decompiled file")
-                err = syntax_check(decompiled_file, file_hash, version)
-                if err:
-                    rows.append(err)
-                    errors += 1
-                    print("  -> syntax error detected")
-                else:
-                    print("  -> syntax OK")
+                    print(f"  -> step: run {decompiler_name}")
+                    res, expected_decompiled_file, stderr_file = run_decompiler(
+                        decompiler_name, pyc_file, decompiled_out_dir
+                    )
 
-                processed += 1
-                print()
+                    if res.returncode != 0:
+                        print(f"  -> skip ({decompiler_name} failed: exit code {res.returncode})")
+                        if stderr_file is not None and stderr_file.exists():
+                            print(f"  -> stderr saved to: {stderr_file}")
+                        skipped += 1
+                        continue
 
-            except Exception as e:
-                crashes += 1
-                print(f"  -> ERROR processing {file_hash}: {e}")
-                print()
+                    print(f"  -> {decompiler_name} finished, output dir: {decompiled_out_dir}")
 
-            # finally:
-            #     if pyc_file is not None:
-            #         cleanup_file(pyc_file)
+                    print("  -> step: locate decompiled file")
+                    decompiled_file = None
+                    for attempt in range(3):
+                        if expected_decompiled_file is not None and expected_decompiled_file.exists():
+                            decompiled_file = expected_decompiled_file
+                            break
 
-            #     if decompiled_file is not None:
-            #         decompiled_pyc = decompiled_file.parent / "__pycache__" / f"{decompiled_file.stem}.cpython-{version.major}{version.minor}.pyc"
-            #         cleanup_file(decompiled_pyc)
+                        decompiled_file = find_decompiled_file(decompiled_out_dir, pyc_file)
+                        if decompiled_file is not None:
+                            break
+
+                        time.sleep(0.5)
+
+                    if decompiled_file is None:
+                        existing = list(decompiled_out_dir.rglob("*")) if decompiled_out_dir.exists() else []
+                        print(f"  -> skip (decompiled file missing, found {len(existing)} item(s) in output dir)")
+                        for p in existing[:10]:
+                            print(f"     - {p}")
+                        skipped += 1
+                        continue
+
+                    print(f"  -> decompiled file: {decompiled_file.name}")
+
+                    decompiled_size = decompiled_file.stat().st_size
+                    if decompiled_size > MAX_DECOMPILED_BYTES:
+                        print(f"  -> skip (decompiled file too large: {decompiled_size} bytes)")
+                        skipped += 1
+                        continue
+
+                    print("  -> step: compile decompiled file")
+                    err = syntax_check(decompiled_file, file_hash, version)
+                    if err:
+                        rows.append(err)
+                        errors += 1
+                        print("  -> syntax error detected")
+                    else:
+                        print("  -> syntax OK")
+
+                    processed += 1
+                    print()
+
+                except Exception as e:
+                    crashes += 1
+                    print(f"  -> ERROR processing {file_hash}: {e}")
+                    print()
 
                 gc.collect()
 
-        version_output_csv = OUTPUT_CSV.with_name(
-            f"{OUTPUT_CSV.stem}_{version.as_str()}{OUTPUT_CSV.suffix}"
-        )
+            version_output_csv = build_output_csv_path(OUTPUT_CSV_BASE, decompiler_name, version)
+            save_csv(rows, version_output_csv)
 
-        save_csv(rows, version_output_csv)
-
-        print("-" * 70)
-        print(f"Version {version.as_str()} finished")
-        print(f"Processed: {processed}")
-        print(f"Skipped: {skipped}")
-        print(f"Syntax errors: {errors}")
-        print(f"Unexpected crashes: {crashes}")
-        print(f"Saved: {version_output_csv}")
-        print("-" * 70)
-        print()
+            print("-" * 70)
+            print(f"Decompiler: {decompiler_name}")
+            print(f"Version {version.as_str()} finished")
+            print(f"Processed: {processed}")
+            print(f"Skipped: {skipped}")
+            print(f"Syntax errors: {errors}")
+            print(f"Unexpected crashes: {crashes}")
+            print(f"Saved: {version_output_csv}")
+            print("-" * 70)
+            print()
 
 
 if __name__ == "__main__":
