@@ -15,15 +15,14 @@ from utils.generate_bytecode import *
 load_dotenv()
 
 BASE_PYTHON_FILES = Path(os.getenv("BASE_DIR_PYTHON_FILES"))
-PYTHON_VERSIONS = {PythonVersion((3, x)) for x in range(8, 14)}
-HASH_FILES_CSV = Path(os.getenv("PROJECT_ROOT_DIR")) / "dataset" / os.getenv("BASE_DATASET_NAME")
-OUTPUT_CSV_BASE = Path(os.getenv("PROJECT_ROOT_DIR")) / "dataset" / "decompiled_syntax_errors.csv"
+PYTHON_VERSIONS = {PythonVersion((3, x)) for x in range(10, 14)}
+OUTPUT_CSV_BASE = Path(os.getenv("PROJECT_ROOT_DIR")) / "dataset" / "pycdc" / "pypi_decompiled_syntax_errors.csv"
 
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_DECOMPILED_BYTES = 5 * 1024 * 1024
 
 DECOMPILERS = [
-    # "pylingual", 
+    # "pylingual",
     "pycdc"
 ]
 
@@ -36,44 +35,35 @@ CSV_FIELDS = [
 ]
 
 
-def get_source_name_from_decompiled_name(decompiled_name: str) -> str:
-    name = decompiled_name
+def choose_source_py(hash_dir: Path):
+    candidates = [
+        p for p in hash_dir.iterdir()
+        if p.is_file()
+        and p.suffix == ".py"
+        and not p.name.startswith("decompiled")
+    ]
 
-    if name.startswith("decompiled_"):
-        name = name[len("decompiled_"):]
+    if not candidates:
+        return None
 
-    name = re.sub(r"\.cpython-\d+\.py$", ".py", name)
+    if len(candidates) == 1:
+        return candidates[0]
 
-    return name
-
-
-def iter_hash_rows(csv_path: Path):
-    with csv_path.open(newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-
-        required = {"file_hash", "file"}
-        if not required.issubset(reader.fieldnames or []):
-            raise ValueError("CSV must contain 'file_hash' and 'file' columns")
-
-        for row in reader:
-            file_hash = row["file_hash"].strip()
-            file_name = row["file"].strip()
-
-            if file_hash and file_name:
-                yield {
-                    "file_hash": file_hash,
-                    "file": file_name,
-                }
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
 
 
-def choose_source_py(hash_dir: Path, decompiled_file_name_from_csv: str):
-    source_name = get_source_name_from_decompiled_name(decompiled_file_name_from_csv)
-    source_path = hash_dir / source_name
-
-    if source_path.is_file():
-        return source_path
-
-    return None
+def iter_hash_dirs(root: Path):
+    """
+    Iterate over hash directories directly from the filesystem.
+    Each subdirectory name is treated as the file hash.
+    """
+    for p in root.iterdir():
+        if p.is_dir():
+            yield {
+                "file_hash": p.name,
+                "hash_dir": p,
+            }
 
 
 def run_pylingual(pyc_file: Path, out_dir: Path):
@@ -178,7 +168,7 @@ def get_error_word_message_from_text(text):
     return error_word, message
 
 
-def syntax_check(file_path: Path, file_hash: str, version: PythonVersion):
+def syntax_check(file_path: Path, file_hash: str, source_file_name: str, version: PythonVersion):
     pyc_file = file_path.parent / "__pycache__" / f"{file_path.stem}.cpython-{version.major}{version.minor}.pyc"
     pyc_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -192,7 +182,7 @@ def syntax_check(file_path: Path, file_hash: str, version: PythonVersion):
 
         return {
             "file_hash": file_hash,
-            "file": file_path.name,
+            "file": source_file_name,
             "error_message": message if message else err_text,
             "error_description": err_text,
             "error": error_word if error_word else err_text,
@@ -226,7 +216,7 @@ def main():
     root = BASE_PYTHON_FILES
 
     print(f"Root directory: {root}")
-    print(f"Reading CSV: {HASH_FILES_CSV}")
+    print("Reading hash directories from filesystem")
     print(f"Max source bytes: {MAX_SOURCE_BYTES}")
     print(f"Max decompiled bytes: {MAX_DECOMPILED_BYTES}")
     print(f"Decompilers: {DECOMPILERS}")
@@ -251,7 +241,7 @@ def main():
             errors = 0
             crashes = 0
 
-            row_iter = iter_hash_rows(HASH_FILES_CSV)
+            row_iter = iter_hash_dirs(root)
 
             for idx, item in enumerate(row_iter, start=1):
                 # if idx > 5:
@@ -263,8 +253,7 @@ def main():
                 decompiled_file = None
 
                 try:
-                    csv_file_name = item["file"]
-                    hash_dir = root / file_hash
+                    hash_dir = item["hash_dir"]
 
                     print(f"[{decompiler_name} | {version.as_str()}] {file_hash}")
 
@@ -273,9 +262,9 @@ def main():
                         skipped += 1
                         continue
 
-                    source_py = choose_source_py(hash_dir, csv_file_name)
+                    source_py = choose_source_py(hash_dir)
                     if source_py is None:
-                        print(f"  -> skip (source file not found for {csv_file_name})")
+                        print("  -> skip (source file not found)")
                         skipped += 1
                         continue
 
@@ -345,7 +334,7 @@ def main():
                         continue
 
                     print("  -> step: compile decompiled file")
-                    err = syntax_check(decompiled_file, file_hash, version)
+                    err = syntax_check(decompiled_file, file_hash, source_py.name, version)
                     if err:
                         rows.append(err)
                         errors += 1
