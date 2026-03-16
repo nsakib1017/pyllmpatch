@@ -26,7 +26,7 @@ def load_model_once(
         max_seq_length=max_tokens + 8192,
         dtype=None,
         load_in_4bit=True,
-        device_map={"": "cuda:0"},
+        device_map=device_map,
     )
 
     # model.eval()
