@@ -632,6 +632,7 @@ if __name__ == "__main__":
                     print(f"{Colors.FAIL}    -> Max retries reached. Could not compile the file. {Colors.ENDC}")
 
                     if ENABLE_DELETE_ONLY_FALLBACK:
+                        print(f"{Colors.WARNING}    -> Engaging delete-only fallback for the last llm output...")
                         try:
                             # Snapshot last LLM output that triggered the fallback
                             llm_snapshot_path = AFFECTED_FILE_PATH / f"llm_last_output_{file_name[:-3]}.py"
