@@ -202,6 +202,7 @@ def process_file_in_single_run(content: str, model: dict, error: str, affected_f
 def process_file_for_syntax_error_patching(initial_content: str, error_description, affected_file_path: Path, log_rec={}, llm=OPEN_LLM_MODELS[1], outer_idx=0) -> Optional[Tuple[str, Dict[str, Any]]]:
     log_rec.update({"provider": llm["provider"], "model_name": llm["name"]})
     if initial_content is not None and not count_tokens_safe(initial_content,  llm["provider"], llm["name"]) > llm['token_for_completion'] - 5000:
+    # if initial_content is not None:
             final_code, metrics = process_file_in_single_run(initial_content, llm, error_description, affected_file_path, outer_idx)
             return final_code, metrics
         # else:
