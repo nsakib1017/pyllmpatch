@@ -442,7 +442,7 @@ if __name__ == "__main__":
             copy_file(path_to_err_file, copy_dir)
 
             whole_content = read_file(copy_dir)
-            version = extract_bytecode_major_minor(whole_content)
+            version = bytecode_version
             compilation_result = None
 
             max_retries = int(os.getenv("NO_OF_MAX_RETRIES")) if os.getenv("NO_OF_MAX_RETRIES") else 0
@@ -481,9 +481,6 @@ if __name__ == "__main__":
 
                 elapsed = time.monotonic() - t_begin
 
-                # ============================================================
-                # MODE A: DELETE-ONLY MODE (skip LLMs completely)
-                # ============================================================
                 if DELETE_ONLY_MODE:
                     try:
                         t0 = time.perf_counter()
@@ -563,8 +560,8 @@ if __name__ == "__main__":
                         llm=OPEN_LLM_MODELS[int(os.getenv("LOCAL_LLM_IDX"))] if os.getenv("LOCAL_LLM_IDX") and int(os.getenv("LOCAL_LLM_IDX")) < len(OPEN_LLM_MODELS) else OPEN_LLM_MODELS[0],
                         log_rec=log_rec,
                         strategy_state={"syntax_context": {"failures": 0}, "whole_file": {"failures": 0}},
-                        # try_whole_file=True if ((total_attempts_completed > (int(max_retries / 2) - 1))) and (outer_idx == 2) else False,
-                        try_whole_file=True,
+                        try_whole_file=True if ((total_attempts_completed > (int(max_retries / 2) - 1))) and (outer_idx == 2) else False,
+                        # try_whole_file=True,
                         outer_idx=outer_idx,
                         affected_file_path=AFFECTED_FILE_PATH
                     )
