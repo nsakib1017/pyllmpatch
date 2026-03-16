@@ -199,26 +199,50 @@ def process_file_in_single_run(content: str, model: dict, error: str, affected_f
 #     return final_content, metrics, corrected_chunks
 
 
-def process_file_for_syntax_error_patching(initial_content: str, error_description, affected_file_path: Path, log_rec={}, llm=OPEN_LLM_MODELS[1], outer_idx=0) -> Optional[Tuple[str, Dict[str, Any]]]:
+def process_file_for_syntax_error_patching(
+    initial_content: str,
+    error_description,
+    affected_file_path: Path,
+    log_rec={},
+    llm=OPEN_LLM_MODELS[1],
+    outer_idx=0
+) -> Optional[Tuple[str, Dict[str, Any]]]:
     log_rec.update({"provider": llm["provider"], "model_name": llm["name"]})
-    if initial_content is not None and not count_tokens_safe(initial_content,  llm["provider"], llm["name"]) > llm['token_for_completion'] - 5000:
-    # if initial_content is not None:
-            final_code, metrics = process_file_in_single_run(initial_content, llm, error_description, affected_file_path, outer_idx)
-            return final_code, metrics
-        # else:
-        #     # chunks = chunk_top_level_objects_lenient_merged(
-        #     #     initial_content,
-        #     #     max_tokens_per_chunk=llm['token_for_completion'] - 5000,
-        #     #     headroom_tokens=1000,
-        #     #     extra_merge_passes=1
-        #     # )
-        #     # for chunk in chunks:
-        #     #     if count_tokens_safe(chunk,  llm["provider"], llm["name"]) > llm['token_for_completion'] - 5000:
-        #     #         return None
-        #     # final_code, metrics, corrected_chunks = process_and_merge_chunks(chunks, llm, error_description, retry_attempt, previuos_response, previous_error)
-        #     return None  
-    else:
+
+    if initial_content is None:
+        log_rec.update({
+            "skipped_due_to_missing_content": True,
+            "skipped_due_to_token_limit": False,
+            "input_token_count": None,
+            "token_limit_for_completion": llm["token_for_completion"],
+        })
         return None
+
+    input_token_count = count_tokens_safe(initial_content, llm["provider"], llm["name"])
+    token_threshold = llm["token_for_completion"] - 5000
+
+    if input_token_count > token_threshold:
+        log_rec.update({
+            "skipped_due_to_token_limit": True,
+            "skipped_due_to_missing_content": False,
+            "input_token_count": input_token_count,
+            "token_limit_for_completion": llm["token_for_completion"],
+            "token_threshold_used": token_threshold,
+        })
+        return None
+
+    log_rec.update({
+        "skipped_due_to_token_limit": False,
+        "skipped_due_to_missing_content": False,
+        "input_token_count": input_token_count,
+        "token_limit_for_completion": llm["token_for_completion"],
+        "token_threshold_used": token_threshold,
+    })
+
+    final_code, metrics = process_file_in_single_run(
+        initial_content, llm, error_description, affected_file_path, outer_idx
+    )
+    return final_code, metrics
 
 def extract_bytecode_major_minor(src: str) -> Optional[str]:
     m = re.search(r"Bytecode version:\s*(\d+)\.(\d+)", src)
@@ -337,8 +361,11 @@ def attempt_repair(
             )
 
         if processed is None:
-            # print("here 1")
             state["failures"] += 1
+            log_rec.update({
+                "repair_attempt_skipped": True,
+                "repair_skip_strategy": strategy,
+            })
             continue
 
         # success
@@ -553,7 +580,7 @@ if __name__ == "__main__":
                         break
 
                 try:
-                    final_code, llm_metrics, with_pin_point, start_ln, end_ln, base_indent = attempt_repair(
+                    repair_result = attempt_repair(
                         copy_dir=copy_dir,
                         error_description=initial_error_description,
                         log_base=LOG_BASE,
@@ -562,12 +589,32 @@ if __name__ == "__main__":
                         log_rec=log_rec,
                         strategy_state={"syntax_context": {"failures": 0}, "whole_file": {"failures": 0}},
                         try_whole_file=True if ((total_attempts_completed > (int(max_retries / 2) - 1))) and (outer_idx == 2) else False,
-                        # try_whole_file=True,
                         outer_idx=outer_idx,
                         affected_file_path=AFFECTED_FILE_PATH
                     )
+
+                    if repair_result is None:
+                        log_rec.update({
+                            "compiled_success": False,
+                            "total_attempts_completed": total_attempts_completed,
+                            "repair_not_attempted_or_failed_precheck": True,
+                        })
+                        _append_log(LOG_FILE, log_rec)
+                        try:
+                            os.unlink(copy_dir)
+                        except FileNotFoundError:
+                            pass
+                        break
+
+                    final_code, llm_metrics, with_pin_point, start_ln, end_ln, base_indent = repair_result
+
                 except Exception as e:
                     print(f"Error during repair attempt: {e}")
+                    log_rec.update({
+                        "compiled_success": False,
+                        "repair_exception": str(e),
+                    })
+                    _append_log(LOG_FILE, log_rec)
                     break
 
                 t0 = time.perf_counter()
