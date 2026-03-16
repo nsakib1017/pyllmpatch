@@ -553,8 +553,8 @@ if __name__ == "__main__":
                     finally:
                         break
 
-                # try:
-                final_code, llm_metrics, with_pin_point, start_ln, end_ln, base_indent = attempt_repair(
+                try:
+                    final_code, llm_metrics, with_pin_point, start_ln, end_ln, base_indent = attempt_repair(
                         copy_dir=copy_dir,
                         error_description=initial_error_description,
                         log_base=LOG_BASE,
@@ -567,9 +567,9 @@ if __name__ == "__main__":
                         outer_idx=outer_idx,
                         affected_file_path=AFFECTED_FILE_PATH
                     )
-                # except Exception as e:
-                #     print(f"Error during repair attempt: {e}")
-                #     break
+                except Exception as e:
+                    print(f"Error during repair attempt: {e}")
+                    break
 
                 t0 = time.perf_counter()
                 final_code = (final_code or "").strip()
