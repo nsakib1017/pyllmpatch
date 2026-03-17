@@ -33,22 +33,23 @@ load_dotenv()
 RepairResult = Tuple[str, Dict[str, Any], bool, Optional[int], Optional[int], Optional[int]]
 
 
+PROJECT_ROOT_DIR = Path(str(os.getenv("PROJECT_ROOT_DIR")))
+ROOT_FOR_FILES = Path(str(os.getenv("ROOT_FOR_FILES")))
+BASE_DIR_PYTHON_FILES_PYLINGUAL = ROOT_FOR_FILES / str(os.getenv("BASE_DIR_PYTHON_FILES_PYLINGUAL"))
+BASE_DIR_PYTHON_FILES_PYPI = ROOT_FOR_FILES / str(os.getenv("BASE_DIR_PYTHON_FILES_PYPI"))
+BASE_DATASET_NAME = str(os.getenv("BASE_DATASET_NAME"))
+BASE_DATASET_PATH = PROJECT_ROOT_DIR / "dataset" / BASE_DATASET_NAME
 
-BASE_DIR_PYTHON_FILES = Path(str(os.getenv("BASE_DIR_PYTHON_FILES")))
 MAX_EXAMPLE_RUNTIME_SEC = int(float(os.getenv("MAX_EXAMPLE_RUNTIME_MIN")) * 60 * 60)
 def prepare_snippets_for_repair(
     previous_run_log_path: str = "",
     only_previously_failed: bool = False,
 ):
     if not previous_run_log_path:
-        return read_csv_file(
-            f"{os.getenv('PROJECT_ROOT_DIR')}/dataset/{os.getenv('BASE_DATASET_NAME')}"
-        )
+        return read_csv_file(f"{BASE_DATASET_PATH}")
 
     df_previous_log = pd.read_json(previous_run_log_path, lines=True)
-    df_balanced = read_csv_file(
-        f"{os.getenv('PROJECT_ROOT_DIR')}/dataset/{os.getenv('BASE_DATASET_NAME')}"
-    )
+    df_balanced = read_csv_file(f"{BASE_DATASET_PATH}")
 
     # Normalize types and remove NaNs/dupes just in case
     df_previous_log["file_hash"] = df_previous_log["file_hash"].astype(str)
@@ -198,25 +199,50 @@ def process_file_in_single_run(content: str, model: dict, error: str, affected_f
 #     return final_content, metrics, corrected_chunks
 
 
-def process_file_for_syntax_error_patching(initial_content: str, error_description, affected_file_path: Path, log_rec={}, llm=OPEN_LLM_MODELS[1], outer_idx=0) -> Optional[Tuple[str, Dict[str, Any]]]:
+def process_file_for_syntax_error_patching(
+    initial_content: str,
+    error_description,
+    affected_file_path: Path,
+    log_rec={},
+    llm=OPEN_LLM_MODELS[1],
+    outer_idx=0
+) -> Optional[Tuple[str, Dict[str, Any]]]:
     log_rec.update({"provider": llm["provider"], "model_name": llm["name"]})
-    if initial_content is not None and not count_tokens_safe(initial_content,  llm["provider"], llm["name"]) > llm['token_for_completion'] - 5000:
-            final_code, metrics = process_file_in_single_run(initial_content, llm, error_description, affected_file_path, outer_idx)
-            return final_code, metrics
-        # else:
-        #     # chunks = chunk_top_level_objects_lenient_merged(
-        #     #     initial_content,
-        #     #     max_tokens_per_chunk=llm['token_for_completion'] - 5000,
-        #     #     headroom_tokens=1000,
-        #     #     extra_merge_passes=1
-        #     # )
-        #     # for chunk in chunks:
-        #     #     if count_tokens_safe(chunk,  llm["provider"], llm["name"]) > llm['token_for_completion'] - 5000:
-        #     #         return None
-        #     # final_code, metrics, corrected_chunks = process_and_merge_chunks(chunks, llm, error_description, retry_attempt, previuos_response, previous_error)
-        #     return None  
-    else:
+
+    if initial_content is None:
+        log_rec.update({
+            "skipped_due_to_missing_content": True,
+            "skipped_due_to_token_limit": False,
+            "input_token_count": None,
+            "token_limit_for_completion": llm["token_for_completion"],
+        })
         return None
+
+    input_token_count = count_tokens_safe(initial_content, llm["provider"], llm["name"])
+    token_threshold = llm["token_for_completion"] - 5000
+
+    if input_token_count > token_threshold:
+        log_rec.update({
+            "skipped_due_to_token_limit": True,
+            "skipped_due_to_missing_content": False,
+            "input_token_count": input_token_count,
+            "token_limit_for_completion": llm["token_for_completion"],
+            "token_threshold_used": token_threshold,
+        })
+        return None
+
+    log_rec.update({
+        "skipped_due_to_token_limit": False,
+        "skipped_due_to_missing_content": False,
+        "input_token_count": input_token_count,
+        "token_limit_for_completion": llm["token_for_completion"],
+        "token_threshold_used": token_threshold,
+    })
+
+    final_code, metrics = process_file_in_single_run(
+        initial_content, llm, error_description, affected_file_path, outer_idx
+    )
+    return final_code, metrics
 
 def extract_bytecode_major_minor(src: str) -> Optional[str]:
     m = re.search(r"Bytecode version:\s*(\d+)\.(\d+)", src)
@@ -277,9 +303,11 @@ def attempt_repair(
     llm,
     log_rec: Dict[str, Any],
     strategy_state: Dict[str, Dict[str, Any]],
-    try_whole_file: bool = False,
+    try_whole_file: bool = True,
     outer_idx: int = 0,
+    affected_file_path: Path
 ) -> Optional[RepairResult]:
+    # print("here")
     strategies = ["syntax_context"]
     if try_whole_file:
         strategies.append("whole_file")
@@ -296,6 +324,7 @@ def attempt_repair(
         base_indent = None
 
         if not try_whole_file:
+            # print("here 2")
             error_line = extract_line_number(error_description)
             syntax_context = fetch_syntax_context(copy_dir, error_line, outer_idx)
 
@@ -313,18 +342,19 @@ def attempt_repair(
             processed = process_file_for_syntax_error_patching(
                 initial_content,
                 error_description,
-                log_base / file_hash,
+                affected_file_path,
                 log_rec=log_rec,
                 llm=llm,
                 outer_idx=outer_idx,
             )
 
         elif try_whole_file:
+            # print("here")
             initial_content = read_file(copy_dir)
             processed = process_file_for_syntax_error_patching(
                 initial_content,
                 error_description,
-                log_base / file_hash,
+                affected_file_path,
                 log_rec=log_rec,
                 llm=llm,
                 outer_idx=outer_idx,
@@ -332,6 +362,10 @@ def attempt_repair(
 
         if processed is None:
             state["failures"] += 1
+            log_rec.update({
+                "repair_attempt_skipped": True,
+                "repair_skip_strategy": strategy,
+            })
             continue
 
         # success
@@ -350,7 +384,19 @@ def attempt_repair(
 
     return None
 
-
+def get_file_path_base_dir(decompiler_name: str, dataset_name: str, file_hash: str) -> Path:
+    if "pylingual" in decompiler_name.lower():
+        if "pylingual" in dataset_name.lower():
+            return BASE_DIR_PYTHON_FILES_PYLINGUAL / file_hash / "decompiler_output"
+        if "pypi" in dataset_name.lower():
+             return BASE_DIR_PYTHON_FILES_PYPI / file_hash / "decompiled_output"
+    elif "pycdc" in decompiler_name.lower():
+        if "pylingual" in dataset_name.lower():
+            return BASE_DIR_PYTHON_FILES_PYLINGUAL / file_hash / "pycdc_decompilation_output"
+        if "pypi" in dataset_name.lower():
+             return BASE_DIR_PYTHON_FILES_PYPI / file_hash / "decompiled_output_pycdc"
+    else:
+        return None
 
 if __name__ == "__main__":
     previuos_run_log_path = Path(str(os.getenv("PREVIOUS_RUN_LOG_PATH"))) if os.getenv("PREVIOUS_RUN_LOG_PATH") else None
@@ -362,15 +408,11 @@ if __name__ == "__main__":
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     print("DataFrame shape:", df_syntax_error_balanced.shape)
 
-    # -----------------------------
-    # Mode toggles
-    # -----------------------------
+
     DELETE_ONLY_MODE = str(os.getenv("DELETE_ONLY_MODE", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
     ENABLE_DELETE_ONLY_FALLBACK = str(os.getenv("ENABLE_DELETE_ONLY_FALLBACK", "1")).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-    # -----------------------------
-    # Delete-only controls
-    # -----------------------------
+
     DELETE_ONLY_INFINITE_ITERS = str(os.getenv("DELETE_ONLY_INFINITE_ITERS", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
     DELETE_ONLY_MAX_ITERS = (10**9) if DELETE_ONLY_INFINITE_ITERS else int(os.getenv("DELETE_ONLY_MAX_ITERS", "5000"))
 
@@ -385,7 +427,7 @@ if __name__ == "__main__":
     if DELETE_ONLY_INFINITE_ITERS:
         print(f"{Colors.WARNING}DELETE_ONLY_INFINITE_ITERS is enabled, delete-only may run for a very long time{Colors.ENDC}")
 
-    for outer_idx in range(0, 3):
+    for outer_idx in range(0, 1):
         run_id = uuid.uuid4().hex
         batch_start_ts = _now_iso()
         LOG_BASE = Path(f"results/experiment_outputs/{ts}/{run_id}")
@@ -400,7 +442,13 @@ if __name__ == "__main__":
             is_compiled = False
             file_hash = norm_str(row.get("file_hash"))
             file_name = norm_str(row.get("file"))
-            file_dir = BASE_DIR_PYTHON_FILES / file_hash / file_name
+            file_dir = Path(row.get("file_path"))
+            decompiler_name = row.get("decompiler")
+            dataset_name = row.get("dataset")
+            bytecode_version = str(row.get("bytecode_version"))
+            if not file_dir.exists() or not decompiler_name or not dataset_name or not file_hash or not file_name or not bytecode_version:
+                continue
+            # BASE_DIR_PYTHON_FILES / file_hash / file_name
 
             header = f"\n# --- Processing Content from file (with config {outer_idx}): {str(file_dir)} ({count_idx+1}/{len(df_syntax_error_balanced)}) --- #\n"
             footer = f"\n# --- End of Processing Content from file (with config {outer_idx}): {str(file_dir)} ({count_idx+1}/{len(df_syntax_error_balanced)}) --- #\n"
@@ -412,11 +460,15 @@ if __name__ == "__main__":
             error_message_processed = row.get("error_msg_clean")
             error_word = row.get("syntactic_error_word")
 
-            copy_dir = BASE_DIR_PYTHON_FILES / file_hash / f"copy_for_run_id_{run_id}_of_{file_name}"
+            file_path_base_dir = get_file_path_base_dir(decompiler_name, dataset_name, file_hash)
+            if file_path_base_dir is None:
+                continue
+
+            copy_dir = file_path_base_dir / f"copy_for_run_id_{run_id}_of_{file_name}"
             copy_file(path_to_err_file, copy_dir)
 
             whole_content = read_file(copy_dir)
-            version = extract_bytecode_major_minor(whole_content)
+            version = bytecode_version
             compilation_result = None
 
             max_retries = int(os.getenv("NO_OF_MAX_RETRIES")) if os.getenv("NO_OF_MAX_RETRIES") else 0
@@ -431,7 +483,8 @@ if __name__ == "__main__":
                 "retries_allowed": max_retries,
                 "path_in": str(path_to_err_file),
                 "bytecode_version": version,
-                "compile_error_description_before": error_message_processed,
+                "compile_error_word_before": row.get("error"),
+                "compile_error_message_before": row.get("error_message"),
                 "delete_only_mode": bool(DELETE_ONLY_MODE),
                 "delete_only_infinite_iters": bool(DELETE_ONLY_INFINITE_ITERS),
                 "delete_only_max_iters": int(DELETE_ONLY_MAX_ITERS),
@@ -443,91 +496,90 @@ if __name__ == "__main__":
             retry_attempt = False
             previuos_response = None
             previous_error = ""
+            
+            AFFECTED_FILE_PATH = LOG_BASE / decompiler_name / dataset_name / bytecode_version / file_hash
+            if not AFFECTED_FILE_PATH.exists():
+                AFFECTED_FILE_PATH.mkdir(parents=True, exist_ok=True)
 
             while not is_compiled:
-                AFFECTED_FILE_PATH = LOG_BASE / file_hash
-                if not AFFECTED_FILE_PATH.exists():
-                    AFFECTED_FILE_PATH.mkdir(parents=True, exist_ok=True)
-
                 out_py_path = str(AFFECTED_FILE_PATH / f"syntax_repaired_{file_name[:-3]}.py")
                 out_pyc_path = str(AFFECTED_FILE_PATH / f"syntax_repaired_{file_name[:-3]}.pyc")
                 err_txt_path = str(AFFECTED_FILE_PATH / f"syntax_failed_repaired_{file_name[:-3]}_error.txt")
 
                 elapsed = time.monotonic() - t_begin
 
-                # ============================================================
-                # MODE A: DELETE-ONLY MODE (skip LLMs completely)
-                # ============================================================
                 if DELETE_ONLY_MODE:
-                    t0 = time.perf_counter()
-
-                    compilation_candidate = read_file(copy_dir) or read_file(path_to_err_file) or ""
-
-                    fixed_code, del_log, last_res = delete_lines_until_compilable_with_oracle(
-                        py_file_content=compilation_candidate,
-                        compile_check=compile_new_pyc,
-                        extract_line_number=extract_line_number,
-                        get_error_word_message_from_content=get_error_word_message_from_content,
-                        out_py_path=out_py_path,
-                        out_pyc_path=out_pyc_path,
-                        version=version,
-                        base_window=DELETE_ONLY_BASE_WINDOW,
-                        max_iters=DELETE_ONLY_MAX_ITERS,
-                        max_deleted_ratio=DELETE_ONLY_MAX_DELETED_RATIO,
-                        min_remaining_lines=1,
-                        err_txt_path=err_txt_path,
-                    )
-
-                    compile_ms = int((time.perf_counter() - t0) * 1000)
-                    is_compiled = bool(last_res.get("is_compiled", False))
-                    initial_error_description = last_res.get("error_description")
-
-                    log_rec.update({
-                        "delete_only_fallback_used": False,
-                        "delete_only_deletions": len(del_log),
-                        "compiled_success": is_compiled,
-                        "total_attempts_completed": 1,
-                        "compile_latency_ms": compile_ms,
-                        "fits_single_run": None,
-                        "avg_chunk_tokens": None,
-                        "max_chunk_tokens": None,
-                        "llm_calls": 0,
-                        "llm_latency_ms_total": 0,
-                    })
-
-                    # Optional: write deletion log
                     try:
-                        with open(str(AFFECTED_FILE_PATH / f"delete_only_log_{file_name[:-3]}.jsonl"), "w", encoding="utf-8") as f:
-                            for rec in del_log:
-                                f.write(str(asdict(rec)) + "\n")
-                    except Exception:
+                        t0 = time.perf_counter()
+
+                        compilation_candidate = read_file(copy_dir) or read_file(path_to_err_file) or ""
+
+                        fixed_code, del_log, last_res = delete_lines_until_compilable_with_oracle(
+                            py_file_content=compilation_candidate,
+                            compile_check=compile_new_pyc,
+                            extract_line_number=extract_line_number,
+                            get_error_word_message_from_content=get_error_word_message_from_content,
+                            out_py_path=out_py_path,
+                            out_pyc_path=out_pyc_path,
+                            version=version,
+                            base_window=DELETE_ONLY_BASE_WINDOW,
+                            max_iters=DELETE_ONLY_MAX_ITERS,
+                            max_deleted_ratio=DELETE_ONLY_MAX_DELETED_RATIO,
+                            min_remaining_lines=1,
+                            err_txt_path=err_txt_path,
+                        )
+
+                        compile_ms = int((time.perf_counter() - t0) * 1000)
+                        is_compiled = bool(last_res.get("is_compiled", False))
+                        initial_error_description = last_res.get("error_description")
+
+                        log_rec.update({
+                            "delete_only_fallback_used": False,
+                            "delete_only_deletions": len(del_log),
+                            "compiled_success": is_compiled,
+                            "total_attempts_completed": 1,
+                            "compile_latency_ms": compile_ms,
+                            "fits_single_run": None,
+                            "avg_chunk_tokens": None,
+                            "max_chunk_tokens": None,
+                            "llm_calls": 0,
+                            "llm_latency_ms_total": 0,
+                        })
+
+                        # Optional: write deletion log
+                        try:
+                            with open(str(AFFECTED_FILE_PATH / f"delete_only_log_{file_name[:-3]}.jsonl"), "w", encoding="utf-8") as f:
+                                for rec in del_log:
+                                    f.write(str(asdict(rec)) + "\n")
+                        except Exception:
+                            pass
+
+                        if is_compiled:
+                            log_rec.update({"path_out": out_py_path})
+                            _append_log(LOG_FILE, log_rec)
+                            try:
+                                os.unlink(copy_dir)
+                            except FileNotFoundError:
+                                pass
+                        else:
+                            with open(err_txt_path, "w", encoding="utf-8") as f:
+                                f.write(initial_error_description or "Unknown error")
+                            error_word, error_message = get_error_word_message_from_content(err_txt_path)
+                            failure_cleanup(AFFECTED_FILE_PATH, compilation_candidate, file_name[:-3], error_word, error_message)
+                            _append_log(LOG_FILE, log_rec)
+                            try:
+                                os.unlink(copy_dir)
+                            except FileNotFoundError:
+                                pass
+
+                        break  # next file
+                    except Exception as e:
                         pass
+                    finally:
+                        break
 
-                    if is_compiled:
-                        log_rec.update({"path_out": out_py_path})
-                        _append_log(LOG_FILE, log_rec)
-                        try:
-                            os.unlink(copy_dir)
-                        except FileNotFoundError:
-                            pass
-                    else:
-                        with open(err_txt_path, "w", encoding="utf-8") as f:
-                            f.write(initial_error_description or "Unknown error")
-                        error_word, error_message = get_error_word_message_from_content(err_txt_path)
-                        failure_cleanup(AFFECTED_FILE_PATH, compilation_candidate, file_name[:-3], error_word, error_message)
-                        _append_log(LOG_FILE, log_rec)
-                        try:
-                            os.unlink(copy_dir)
-                        except FileNotFoundError:
-                            pass
-
-                    break  # next file
-
-                # ============================================================
-                # MODE B: ORIGINAL (LLM repair) with optional delete-only fallback
-                # ============================================================
                 try:
-                    final_code, llm_metrics, with_pin_point, start_ln, end_ln, base_indent = attempt_repair(
+                    repair_result = attempt_repair(
                         copy_dir=copy_dir,
                         error_description=initial_error_description,
                         log_base=LOG_BASE,
@@ -535,11 +587,34 @@ if __name__ == "__main__":
                         llm=OPEN_LLM_MODELS[int(os.getenv("LOCAL_LLM_IDX"))] if os.getenv("LOCAL_LLM_IDX") and int(os.getenv("LOCAL_LLM_IDX")) < len(OPEN_LLM_MODELS) else OPEN_LLM_MODELS[0],
                         log_rec=log_rec,
                         strategy_state={"syntax_context": {"failures": 0}, "whole_file": {"failures": 0}},
-                        try_whole_file=True if ((total_attempts_completed > (int(max_retries / 2) - 1))) and (outer_idx == 2) else False,
+                        # try_whole_file=True if ((total_attempts_completed > (int(max_retries / 2) - 1))) and (outer_idx == 2) else False,
+                        try_whole_file=False,
                         outer_idx=outer_idx,
+                        affected_file_path=AFFECTED_FILE_PATH
                     )
+
+                    if repair_result is None:
+                        log_rec.update({
+                            "compiled_success": False,
+                            "total_attempts_completed": total_attempts_completed,
+                            "repair_not_attempted_or_failed_precheck": True,
+                        })
+                        _append_log(LOG_FILE, log_rec)
+                        try:
+                            os.unlink(copy_dir)
+                        except FileNotFoundError:
+                            pass
+                        break
+
+                    final_code, llm_metrics, with_pin_point, start_ln, end_ln, base_indent = repair_result
+
                 except Exception as e:
                     print(f"Error during repair attempt: {e}")
+                    log_rec.update({
+                        "compiled_success": False,
+                        "repair_exception": str(e),
+                    })
+                    _append_log(LOG_FILE, log_rec)
                     break
 
                 t0 = time.perf_counter()
@@ -600,14 +675,11 @@ if __name__ == "__main__":
                         f.write(initial_error_description or "Unknown error")
                     error_word, error_message = get_error_word_message_from_content(err_txt_path)
 
-                # ============================================================
-                # Optional delete-only fallback when retries/time are exhausted
-                # Deletion runs on a NEW COPY created from the LAST LLM output
-                # ============================================================
                 if (max_retries < 0 or elapsed > MAX_EXAMPLE_RUNTIME_SEC):
                     print(f"{Colors.FAIL}    -> Max retries reached. Could not compile the file. {Colors.ENDC}")
 
                     if ENABLE_DELETE_ONLY_FALLBACK:
+                        print(f"{Colors.WARNING}    -> Engaging delete-only fallback for the last llm output...")
                         try:
                             # Snapshot last LLM output that triggered the fallback
                             llm_snapshot_path = AFFECTED_FILE_PATH / f"llm_last_output_{file_name[:-3]}.py"

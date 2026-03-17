@@ -75,7 +75,7 @@ def read_csv_file(file_name: str) -> pd.DataFrame:
     csv_path = script_dir / file_name
     print(csv_path)
     print(f"Trying to read: {csv_path.resolve()}")
-    df = pd.read_csv(csv_path)
+    df = pd.read_csv(csv_path, dtype={"bytecode_version": str})
     return df
 
 
