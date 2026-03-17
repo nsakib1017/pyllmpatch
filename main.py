@@ -25,7 +25,7 @@ from utils.generate_bytecode import *
 from model.inference import *
 from utils.indentation_fixer import *
 from dataclasses import asdict
-
+import traceback
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -437,324 +437,359 @@ if __name__ == "__main__":
 
         LOG_FILE = LOG_BASE / f"run_log_{run_id}_with_config_{outer_idx}.jsonl"
         count_idx = 0
-
         for idx, row in df_syntax_error_balanced.iterrows():
+            copy_dir = None
+            AFFECTED_FILE_PATH = None
+            log_rec = None
+
             is_compiled = False
             file_hash = norm_str(row.get("file_hash"))
             file_name = norm_str(row.get("file"))
-            file_dir = Path(row.get("file_path"))
+            file_dir = Path(row.get("file_path")) if row.get("file_path") else None
             decompiler_name = row.get("decompiler")
             dataset_name = row.get("dataset")
-            bytecode_version = str(row.get("bytecode_version"))
-            if not file_dir.exists() or not decompiler_name or not dataset_name or not file_hash or not file_name or not bytecode_version:
-                continue
-            # BASE_DIR_PYTHON_FILES / file_hash / file_name
+            bytecode_version = str(row.get("bytecode_version")) if row.get("bytecode_version") is not None else ""
 
             header = f"\n# --- Processing Content from file (with config {outer_idx}): {str(file_dir)} ({count_idx+1}/{len(df_syntax_error_balanced)}) --- #\n"
             footer = f"\n# --- End of Processing Content from file (with config {outer_idx}): {str(file_dir)} ({count_idx+1}/{len(df_syntax_error_balanced)}) --- #\n"
 
             print(header)
-            path_to_err_file = str(file_dir)
 
-            initial_error_description = row.get("error_description")
-            error_message_processed = row.get("error_msg_clean")
-            error_word = row.get("syntactic_error_word")
+            try:
+                if not file_dir or not file_dir.exists() or not decompiler_name or not dataset_name or not file_hash or not file_name or not bytecode_version:
+                    continue
 
-            file_path_base_dir = get_file_path_base_dir(decompiler_name, dataset_name, file_hash)
-            if file_path_base_dir is None:
-                continue
+                path_to_err_file = str(file_dir)
 
-            copy_dir = file_path_base_dir / f"copy_for_run_id_{run_id}_of_{file_name}"
-            copy_file(path_to_err_file, copy_dir)
+                initial_error_description = row.get("error_description")
+                error_message_processed = row.get("error_msg_clean")
+                error_word = row.get("syntactic_error_word")
 
-            whole_content = read_file(copy_dir)
-            version = bytecode_version
-            compilation_result = None
+                file_path_base_dir = get_file_path_base_dir(decompiler_name, dataset_name, file_hash)
+                if file_path_base_dir is None:
+                    continue
 
-            max_retries = int(os.getenv("NO_OF_MAX_RETRIES")) if os.getenv("NO_OF_MAX_RETRIES") else 0
-            total_attempts_completed = 0
-            error_list = []
+                copy_dir = file_path_base_dir / f"copy_for_run_id_{run_id}_of_{file_name}"
+                copy_file(path_to_err_file, copy_dir)
 
-            log_rec = {
-                "run_id": run_id,
-                "timestamp": _now_iso(),
-                "file_hash": file_hash,
-                "total_attempts_allowed": max_retries + 1,
-                "retries_allowed": max_retries,
-                "path_in": str(path_to_err_file),
-                "bytecode_version": version,
-                "compile_error_word_before": row.get("error"),
-                "compile_error_message_before": row.get("error_message"),
-                "delete_only_mode": bool(DELETE_ONLY_MODE),
-                "delete_only_infinite_iters": bool(DELETE_ONLY_INFINITE_ITERS),
-                "delete_only_max_iters": int(DELETE_ONLY_MAX_ITERS),
-                "delete_only_base_window": int(DELETE_ONLY_BASE_WINDOW),
-                "delete_only_max_deleted_ratio": float(DELETE_ONLY_MAX_DELETED_RATIO),
-            }
+                whole_content = read_file(copy_dir)
+                version = bytecode_version
+                compilation_result = None
 
-            t_begin = time.monotonic()
-            retry_attempt = False
-            previuos_response = None
-            previous_error = ""
-            
-            AFFECTED_FILE_PATH = LOG_BASE / decompiler_name / dataset_name / bytecode_version / file_hash
-            if not AFFECTED_FILE_PATH.exists():
-                AFFECTED_FILE_PATH.mkdir(parents=True, exist_ok=True)
+                max_retries = int(os.getenv("NO_OF_MAX_RETRIES")) if os.getenv("NO_OF_MAX_RETRIES") else 0
+                total_attempts_completed = 0
+                error_list = []
 
-            while not is_compiled:
-                out_py_path = str(AFFECTED_FILE_PATH / f"syntax_repaired_{file_name[:-3]}.py")
-                out_pyc_path = str(AFFECTED_FILE_PATH / f"syntax_repaired_{file_name[:-3]}.pyc")
-                err_txt_path = str(AFFECTED_FILE_PATH / f"syntax_failed_repaired_{file_name[:-3]}_error.txt")
+                log_rec = {
+                    "run_id": run_id,
+                    "timestamp": _now_iso(),
+                    "file_hash": file_hash,
+                    "file_name": file_name,
+                    "row_index": int(idx),
+                    "total_attempts_allowed": max_retries + 1,
+                    "retries_allowed": max_retries,
+                    "path_in": str(path_to_err_file),
+                    "bytecode_version": version,
+                    "decompiler": decompiler_name,
+                    "dataset": dataset_name,
+                    "compile_error_word_before": row.get("error"),
+                    "compile_error_message_before": row.get("error_message"),
+                    "delete_only_mode": bool(DELETE_ONLY_MODE),
+                    "delete_only_infinite_iters": bool(DELETE_ONLY_INFINITE_ITERS),
+                    "delete_only_max_iters": int(DELETE_ONLY_MAX_ITERS),
+                    "delete_only_base_window": int(DELETE_ONLY_BASE_WINDOW),
+                    "delete_only_max_deleted_ratio": float(DELETE_ONLY_MAX_DELETED_RATIO),
+                }
 
-                elapsed = time.monotonic() - t_begin
+                t_begin = time.monotonic()
+                retry_attempt = False
+                previuos_response = None
+                previous_error = ""
 
-                if DELETE_ONLY_MODE:
-                    try:
-                        t0 = time.perf_counter()
+                AFFECTED_FILE_PATH = LOG_BASE / decompiler_name / dataset_name / bytecode_version / file_hash
+                if not AFFECTED_FILE_PATH.exists():
+                    AFFECTED_FILE_PATH.mkdir(parents=True, exist_ok=True)
 
-                        compilation_candidate = read_file(copy_dir) or read_file(path_to_err_file) or ""
+                while not is_compiled:
+                    out_py_path = str(AFFECTED_FILE_PATH / f"syntax_repaired_{file_name[:-3]}.py")
+                    out_pyc_path = str(AFFECTED_FILE_PATH / f"syntax_repaired_{file_name[:-3]}.pyc")
+                    err_txt_path = str(AFFECTED_FILE_PATH / f"syntax_failed_repaired_{file_name[:-3]}_error.txt")
 
-                        fixed_code, del_log, last_res = delete_lines_until_compilable_with_oracle(
-                            py_file_content=compilation_candidate,
-                            compile_check=compile_new_pyc,
-                            extract_line_number=extract_line_number,
-                            get_error_word_message_from_content=get_error_word_message_from_content,
-                            out_py_path=out_py_path,
-                            out_pyc_path=out_pyc_path,
-                            version=version,
-                            base_window=DELETE_ONLY_BASE_WINDOW,
-                            max_iters=DELETE_ONLY_MAX_ITERS,
-                            max_deleted_ratio=DELETE_ONLY_MAX_DELETED_RATIO,
-                            min_remaining_lines=1,
-                            err_txt_path=err_txt_path,
-                        )
+                    elapsed = time.monotonic() - t_begin
 
-                        compile_ms = int((time.perf_counter() - t0) * 1000)
-                        is_compiled = bool(last_res.get("is_compiled", False))
-                        initial_error_description = last_res.get("error_description")
-
-                        log_rec.update({
-                            "delete_only_fallback_used": False,
-                            "delete_only_deletions": len(del_log),
-                            "compiled_success": is_compiled,
-                            "total_attempts_completed": 1,
-                            "compile_latency_ms": compile_ms,
-                            "fits_single_run": None,
-                            "avg_chunk_tokens": None,
-                            "max_chunk_tokens": None,
-                            "llm_calls": 0,
-                            "llm_latency_ms_total": 0,
-                        })
-
-                        # Optional: write deletion log
+                    if DELETE_ONLY_MODE:
                         try:
-                            with open(str(AFFECTED_FILE_PATH / f"delete_only_log_{file_name[:-3]}.jsonl"), "w", encoding="utf-8") as f:
-                                for rec in del_log:
-                                    f.write(str(asdict(rec)) + "\n")
-                        except Exception:
-                            pass
+                            t0 = time.perf_counter()
 
-                        if is_compiled:
-                            log_rec.update({"path_out": out_py_path})
-                            _append_log(LOG_FILE, log_rec)
-                            try:
-                                os.unlink(copy_dir)
-                            except FileNotFoundError:
-                                pass
-                        else:
-                            with open(err_txt_path, "w", encoding="utf-8") as f:
-                                f.write(initial_error_description or "Unknown error")
-                            error_word, error_message = get_error_word_message_from_content(err_txt_path)
-                            failure_cleanup(AFFECTED_FILE_PATH, compilation_candidate, file_name[:-3], error_word, error_message)
-                            _append_log(LOG_FILE, log_rec)
-                            try:
-                                os.unlink(copy_dir)
-                            except FileNotFoundError:
-                                pass
-
-                        break  # next file
-                    except Exception as e:
-                        pass
-                    finally:
-                        break
-
-                try:
-                    repair_result = attempt_repair(
-                        copy_dir=copy_dir,
-                        error_description=initial_error_description,
-                        log_base=LOG_BASE,
-                        file_hash=file_hash,
-                        llm=OPEN_LLM_MODELS[int(os.getenv("LOCAL_LLM_IDX"))] if os.getenv("LOCAL_LLM_IDX") and int(os.getenv("LOCAL_LLM_IDX")) < len(OPEN_LLM_MODELS) else OPEN_LLM_MODELS[0],
-                        log_rec=log_rec,
-                        strategy_state={"syntax_context": {"failures": 0}, "whole_file": {"failures": 0}},
-                        # try_whole_file=True if ((total_attempts_completed > (int(max_retries / 2) - 1))) and (outer_idx == 2) else False,
-                        try_whole_file=False,
-                        outer_idx=outer_idx,
-                        affected_file_path=AFFECTED_FILE_PATH
-                    )
-
-                    if repair_result is None:
-                        log_rec.update({
-                            "compiled_success": False,
-                            "total_attempts_completed": total_attempts_completed,
-                            "repair_not_attempted_or_failed_precheck": True,
-                        })
-                        _append_log(LOG_FILE, log_rec)
-                        try:
-                            os.unlink(copy_dir)
-                        except FileNotFoundError:
-                            pass
-                        break
-
-                    final_code, llm_metrics, with_pin_point, start_ln, end_ln, base_indent = repair_result
-
-                except Exception as e:
-                    print(f"Error during repair attempt: {e}")
-                    log_rec.update({
-                        "compiled_success": False,
-                        "repair_exception": str(e),
-                    })
-                    _append_log(LOG_FILE, log_rec)
-                    break
-
-                t0 = time.perf_counter()
-                final_code = (final_code or "").strip()
-                
-                try:
-                    if final_code:
-                        if with_pin_point:
-                            final_code = align_indentation(final_code, base_indent)
-                            reattach_block(copy_dir, start_ln, end_ln, final_code)
-                        else:
-                            create_file_from_response(copy_dir, final_code)
-                        compilation_candidate = read_file(copy_dir)
-                    else:
-                        copied_content = read_file(copy_dir)
-                        if copied_content:
-                            compilation_candidate = copied_content
-                        else:
-                            compilation_candidate = read_file(path_to_err_file)
-
-
-                    compilation_result = compile_new_pyc(
-                        compilation_candidate,
-                        out_py_path,
-                        out_pyc_path,
-                        version
-                    )
-                    compile_ms = int((time.perf_counter() - t0) * 1000)
-                    is_compiled = compilation_result["is_compiled"]
-                    initial_error_description = compilation_result["error_description"]
-                    if not is_compiled:
-                        print(f"{Colors.WARNING}    -> Re-compilation failed for file. Retrying ({total_attempts_completed+1}/{int(os.getenv('NO_OF_MAX_RETRIES'))+1}).... {Colors.ENDC}")
-
-                    total_attempts_completed += 1
-                    max_retries -= 1
-
-                    log_rec.update({
-                        "fits_single_run": llm_metrics.get("fits_single_run"),
-                        "avg_chunk_tokens": llm_metrics.get("avg_chunk_tokens"),
-                        "max_chunk_tokens": llm_metrics.get("max_chunk_tokens"),
-                        "llm_calls": llm_metrics.get("llm_calls"),
-                        "llm_latency_ms_total": llm_metrics.get("llm_latency_ms_total"),
-                        "compiled_success": bool(is_compiled),
-                        "total_attempts_completed": total_attempts_completed,
-                        "compile_latency_ms": compile_ms,
-                    })
-
-                    if is_compiled:
-                        log_rec.update({"path_out": out_py_path})
-                        os.unlink(copy_dir)
-                        _append_log(LOG_FILE, log_rec)
-
-                    elif not is_compiled:
-                        with open(err_txt_path, "w", encoding="utf-8") as f:
-                            f.write(initial_error_description or "Unknown error")
-                        error_word, error_message = get_error_word_message_from_content(err_txt_path)
-                except Exception:
-                    compile_ms = int((time.perf_counter() - t0) * 1000)
-                    is_compiled = False
-                    print(f"{Colors.WARNING}    -> Re-compilation failed for file. Retrying ({total_attempts_completed+1}/{int(os.getenv('NO_OF_MAX_RETRIES'))+1}).... {Colors.ENDC}")
-
-                if (max_retries < 0 or elapsed > MAX_EXAMPLE_RUNTIME_SEC):
-                    print(f"{Colors.FAIL}    -> Max retries reached. Could not compile the file. {Colors.ENDC}")
-
-                    if ENABLE_DELETE_ONLY_FALLBACK:
-                        print(f"{Colors.WARNING}    -> Engaging delete-only fallback for the last llm output...")
-                        try:
-                            # Snapshot last LLM output that triggered the fallback
-                            llm_snapshot_path = AFFECTED_FILE_PATH / f"llm_last_output_{file_name[:-3]}.py"
-                            with open(str(llm_snapshot_path), "w", encoding="utf-8") as f:
-                                f.write(compilation_candidate or "")
-
-                            # Separate copy that delete-only reads as input
-                            delete_only_input_path = AFFECTED_FILE_PATH / f"delete_only_input_from_llm_{file_name[:-3]}.py"
-                            shutil.copyfile(str(llm_snapshot_path), str(delete_only_input_path))
-
-                            # Separate output paths so analysis can diff LLM vs delete-only output
-                            delete_only_out_py_path = str(AFFECTED_FILE_PATH / f"delete_only_repaired_from_llm_{file_name[:-3]}.py")
-                            delete_only_out_pyc_path = str(AFFECTED_FILE_PATH / f"delete_only_repaired_from_llm_{file_name[:-3]}.pyc")
-                            delete_only_err_txt_path = str(AFFECTED_FILE_PATH / f"delete_only_from_llm_{file_name[:-3]}_error.txt")
+                            compilation_candidate = read_file(copy_dir) or read_file(path_to_err_file) or ""
 
                             fixed_code, del_log, last_res = delete_lines_until_compilable_with_oracle(
-                                py_file_content=read_file(str(delete_only_input_path)) or "",
+                                py_file_content=compilation_candidate,
                                 compile_check=compile_new_pyc,
                                 extract_line_number=extract_line_number,
                                 get_error_word_message_from_content=get_error_word_message_from_content,
-                                out_py_path=delete_only_out_py_path,
-                                out_pyc_path=delete_only_out_pyc_path,
+                                out_py_path=out_py_path,
+                                out_pyc_path=out_pyc_path,
                                 version=version,
                                 base_window=DELETE_ONLY_BASE_WINDOW,
                                 max_iters=DELETE_ONLY_MAX_ITERS,
                                 max_deleted_ratio=DELETE_ONLY_MAX_DELETED_RATIO,
                                 min_remaining_lines=1,
-                                err_txt_path=delete_only_err_txt_path,
+                                err_txt_path=err_txt_path,
                             )
 
+                            compile_ms = int((time.perf_counter() - t0) * 1000)
+                            is_compiled = bool(last_res.get("is_compiled", False))
+                            initial_error_description = last_res.get("error_description")
+
                             log_rec.update({
-                                "delete_only_fallback_used": True,
+                                "delete_only_fallback_used": False,
                                 "delete_only_deletions": len(del_log),
-                                "llm_last_output_snapshot_path": str(llm_snapshot_path),
-                                "delete_only_input_path": str(delete_only_input_path),
-                                "delete_only_output_path": str(delete_only_out_py_path),
+                                "compiled_success": is_compiled,
+                                "total_attempts_completed": 1,
+                                "compile_latency_ms": compile_ms,
+                                "fits_single_run": None,
+                                "avg_chunk_tokens": None,
+                                "max_chunk_tokens": None,
+                                "llm_calls": 0,
+                                "llm_latency_ms_total": 0,
                             })
 
-                            if last_res.get("is_compiled"):
-                                is_compiled = True
-                                log_rec.update({
-                                    "compiled_success": True,
-                                    "path_out": delete_only_out_py_path,
-                                })
+                            try:
+                                with open(str(AFFECTED_FILE_PATH / f"delete_only_log_{file_name[:-3]}.jsonl"), "w", encoding="utf-8") as f:
+                                    for rec in del_log:
+                                        f.write(str(asdict(rec)) + "\n")
+                            except Exception:
+                                pass
 
-                                try:
-                                    with open(str(AFFECTED_FILE_PATH / f"delete_only_log_from_llm_{file_name[:-3]}.jsonl"), "w", encoding="utf-8") as f:
-                                        for rec in del_log:
-                                            f.write(str(asdict(rec)) + "\n")
-                                except Exception:
-                                    pass
+                            if is_compiled:
+                                log_rec.update({"path_out": out_py_path})
+                                _append_log(LOG_FILE, log_rec)
                             else:
-                                log_rec.update({
-                                    "delete_only_failed_error": last_res.get("error_description"),
-                                })
+                                with open(err_txt_path, "w", encoding="utf-8") as f:
+                                    f.write(initial_error_description or "Unknown error")
+                                error_word, error_message = get_error_word_message_from_content(err_txt_path)
+                                failure_cleanup(AFFECTED_FILE_PATH, compilation_candidate, file_name[:-3], error_word, error_message)
+                                _append_log(LOG_FILE, log_rec)
 
-                        except Exception as e:
-                            log_rec.update({
-                                "delete_only_fallback_used": True,
-                                "delete_only_fallback_exception": str(e),
-                            })
-                    else:
-                        log_rec.update({"delete_only_fallback_used": False})
+                            break
+                        except Exception:
+                            raise
 
                     try:
-                        failure_cleanup(AFFECTED_FILE_PATH, compilation_candidate, file_name[:-3], error_word, error_message)
-                        if elapsed > MAX_EXAMPLE_RUNTIME_SEC:
-                            log_rec.update({"compiled_success": None})
+                        repair_result = attempt_repair(
+                            copy_dir=copy_dir,
+                            error_description=initial_error_description,
+                            log_base=LOG_BASE,
+                            file_hash=file_hash,
+                            llm=OPEN_LLM_MODELS[int(os.getenv("LOCAL_LLM_IDX"))] if os.getenv("LOCAL_LLM_IDX") and int(os.getenv("LOCAL_LLM_IDX")) < len(OPEN_LLM_MODELS) else OPEN_LLM_MODELS[0],
+                            log_rec=log_rec,
+                            strategy_state={"syntax_context": {"failures": 0}, "whole_file": {"failures": 0}},
+                            try_whole_file=False,
+                            outer_idx=outer_idx,
+                            affected_file_path=AFFECTED_FILE_PATH
+                        )
+
+                        if repair_result is None:
+                            log_rec.update({
+                                "compiled_success": False,
+                                "total_attempts_completed": total_attempts_completed,
+                                "repair_not_attempted_or_failed_precheck": True,
+                            })
+                            _append_log(LOG_FILE, log_rec)
+                            break
+
+                        final_code, llm_metrics, with_pin_point, start_ln, end_ln, base_indent = repair_result
+
+                    except Exception as e:
+                        print(f"Error during repair attempt: {e}")
+                        log_rec.update({
+                            "compiled_success": False,
+                            "repair_exception": str(e),
+                        })
                         _append_log(LOG_FILE, log_rec)
+                        break
+
+                    t0 = time.perf_counter()
+                    final_code = (final_code or "").strip()
+
+                    try:
+                        if final_code:
+                            if with_pin_point:
+                                final_code = align_indentation(final_code, base_indent)
+                                reattach_block(copy_dir, start_ln, end_ln, final_code)
+                            else:
+                                create_file_from_response(copy_dir, final_code)
+                            compilation_candidate = read_file(copy_dir)
+                        else:
+                            copied_content = read_file(copy_dir)
+                            if copied_content:
+                                compilation_candidate = copied_content
+                            else:
+                                compilation_candidate = read_file(path_to_err_file)
+
+                        compilation_result = compile_new_pyc(
+                            compilation_candidate,
+                            out_py_path,
+                            out_pyc_path,
+                            version
+                        )
+                        compile_ms = int((time.perf_counter() - t0) * 1000)
+                        is_compiled = compilation_result["is_compiled"]
+                        initial_error_description = compilation_result["error_description"]
+
+                        if not is_compiled:
+                            print(f"{Colors.WARNING}    -> Re-compilation failed for file. Retrying ({total_attempts_completed+1}/{int(os.getenv('NO_OF_MAX_RETRIES'))+1}).... {Colors.ENDC}")
+
+                        total_attempts_completed += 1
+                        max_retries -= 1
+
+                        log_rec.update({
+                            "fits_single_run": llm_metrics.get("fits_single_run"),
+                            "avg_chunk_tokens": llm_metrics.get("avg_chunk_tokens"),
+                            "max_chunk_tokens": llm_metrics.get("max_chunk_tokens"),
+                            "llm_calls": llm_metrics.get("llm_calls"),
+                            "llm_latency_ms_total": llm_metrics.get("llm_latency_ms_total"),
+                            "compiled_success": bool(is_compiled),
+                            "total_attempts_completed": total_attempts_completed,
+                            "compile_latency_ms": compile_ms,
+                        })
+
+                        if is_compiled:
+                            log_rec.update({"path_out": out_py_path})
+                            _append_log(LOG_FILE, log_rec)
+
+                        else:
+                            with open(err_txt_path, "w", encoding="utf-8") as f:
+                                f.write(initial_error_description or "Unknown error")
+                            error_word, error_message = get_error_word_message_from_content(err_txt_path)
+
+                    except Exception:
+                        compile_ms = int((time.perf_counter() - t0) * 1000)
+                        is_compiled = False
+                        print(f"{Colors.WARNING}    -> Re-compilation failed for file. Retrying ({total_attempts_completed+1}/{int(os.getenv('NO_OF_MAX_RETRIES'))+1}).... {Colors.ENDC}")
+
+                    if (max_retries < 0 or elapsed > MAX_EXAMPLE_RUNTIME_SEC):
+                        print(f"{Colors.FAIL}    -> Max retries reached. Could not compile the file. {Colors.ENDC}")
+
+                        if ENABLE_DELETE_ONLY_FALLBACK:
+                            print(f"{Colors.WARNING}    -> Engaging delete-only fallback for the last llm output...")
+                            try:
+                                llm_snapshot_path = AFFECTED_FILE_PATH / f"llm_last_output_{file_name[:-3]}.py"
+                                with open(str(llm_snapshot_path), "w", encoding="utf-8") as f:
+                                    f.write(compilation_candidate or "")
+
+                                delete_only_input_path = AFFECTED_FILE_PATH / f"delete_only_input_from_llm_{file_name[:-3]}.py"
+                                shutil.copyfile(str(llm_snapshot_path), str(delete_only_input_path))
+
+                                delete_only_out_py_path = str(AFFECTED_FILE_PATH / f"delete_only_repaired_from_llm_{file_name[:-3]}.py")
+                                delete_only_out_pyc_path = str(AFFECTED_FILE_PATH / f"delete_only_repaired_from_llm_{file_name[:-3]}.pyc")
+                                delete_only_err_txt_path = str(AFFECTED_FILE_PATH / f"delete_only_from_llm_{file_name[:-3]}_error.txt")
+
+                                fixed_code, del_log, last_res = delete_lines_until_compilable_with_oracle(
+                                    py_file_content=read_file(str(delete_only_input_path)) or "",
+                                    compile_check=compile_new_pyc,
+                                    extract_line_number=extract_line_number,
+                                    get_error_word_message_from_content=get_error_word_message_from_content,
+                                    out_py_path=delete_only_out_py_path,
+                                    out_pyc_path=delete_only_out_pyc_path,
+                                    version=version,
+                                    base_window=DELETE_ONLY_BASE_WINDOW,
+                                    max_iters=DELETE_ONLY_MAX_ITERS,
+                                    max_deleted_ratio=DELETE_ONLY_MAX_DELETED_RATIO,
+                                    min_remaining_lines=1,
+                                    err_txt_path=delete_only_err_txt_path,
+                                )
+
+                                log_rec.update({
+                                    "delete_only_fallback_used": True,
+                                    "delete_only_deletions": len(del_log),
+                                    "llm_last_output_snapshot_path": str(llm_snapshot_path),
+                                    "delete_only_input_path": str(delete_only_input_path),
+                                    "delete_only_output_path": str(delete_only_out_py_path),
+                                })
+
+                                if last_res.get("is_compiled"):
+                                    is_compiled = True
+                                    log_rec.update({
+                                        "compiled_success": True,
+                                        "path_out": delete_only_out_py_path,
+                                    })
+
+                                    try:
+                                        with open(str(AFFECTED_FILE_PATH / f"delete_only_log_from_llm_{file_name[:-3]}.jsonl"), "w", encoding="utf-8") as f:
+                                            for rec in del_log:
+                                                f.write(str(asdict(rec)) + "\n")
+                                    except Exception:
+                                        pass
+                                else:
+                                    log_rec.update({
+                                        "delete_only_failed_error": last_res.get("error_description"),
+                                    })
+
+                            except Exception as e:
+                                log_rec.update({
+                                    "delete_only_fallback_used": True,
+                                    "delete_only_fallback_exception": str(e),
+                                })
+                        else:
+                            log_rec.update({"delete_only_fallback_used": False})
+
+                        try:
+                            failure_cleanup(AFFECTED_FILE_PATH, compilation_candidate, file_name[:-3], error_word, error_message)
+                            if elapsed > MAX_EXAMPLE_RUNTIME_SEC:
+                                log_rec.update({"compiled_success": None})
+                            _append_log(LOG_FILE, log_rec)
+                        finally:
+                            break
+
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                exc_tb = traceback.format_exc()
+                print(f"{Colors.FAIL}Unexpected exception for sample {file_hash or '<unknown>'}: {e}{Colors.ENDC}")
+
+                crash_log = {
+                    "run_id": run_id,
+                    "timestamp": _now_iso(),
+                    "row_index": int(idx),
+                    "file_hash": file_hash,
+                    "file_name": file_name,
+                    "path_in": str(file_dir) if file_dir else None,
+                    "bytecode_version": bytecode_version,
+                    "decompiler": decompiler_name,
+                    "dataset": dataset_name,
+                    "compiled_success": False,
+                    "unexpected_exception": str(e),
+                    "unexpected_exception_traceback": exc_tb,
+                }
+
+                if isinstance(log_rec, dict):
+                    crash_log.update(log_rec)
+                    crash_log["compiled_success"] = False
+                    crash_log["unexpected_exception"] = str(e)
+                    crash_log["unexpected_exception_traceback"] = exc_tb
+
+                try:
+                    _append_log(LOG_FILE, crash_log)
+                except Exception:
+                    pass
+
+                try:
+                    if AFFECTED_FILE_PATH is not None:
+                        with open(AFFECTED_FILE_PATH / f"unexpected_exception_{file_name or 'unknown'}.txt", "w", encoding="utf-8") as f:
+                            f.write(exc_tb)
+                except Exception:
+                    pass
+
+            finally:
+                if copy_dir is not None:
+                    try:
                         os.unlink(copy_dir)
                     except FileNotFoundError:
                         pass
-                    finally:
-                        break
+                    except Exception:
+                        pass
 
-            count_idx += 1
-            print(footer)
+                count_idx += 1
+                print(footer)
