@@ -411,6 +411,8 @@ if __name__ == "__main__":
 
     DELETE_ONLY_MODE = str(os.getenv("DELETE_ONLY_MODE", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
     ENABLE_DELETE_ONLY_FALLBACK = str(os.getenv("ENABLE_DELETE_ONLY_FALLBACK", "1")).strip().lower() in {"1", "true", "yes", "y", "on"}
+    CONFIG_IDX_START = int(os.getenv("CONFIG_IDX_START", 0))
+    CONFIG_IDX_RANGE = int(os.getenv("CONFIG_IDX_RANGE", 1))
 
 
     DELETE_ONLY_INFINITE_ITERS = str(os.getenv("DELETE_ONLY_INFINITE_ITERS", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -428,14 +430,14 @@ if __name__ == "__main__":
     if DELETE_ONLY_INFINITE_ITERS:
         print(f"{Colors.WARNING}DELETE_ONLY_INFINITE_ITERS is enabled, delete-only may run for a very long time{Colors.ENDC}")
 
-    for outer_idx in range(0, 1):
+    for outer_idx in range(CONFIG_IDX_START, CONFIG_IDX_RANGE):
         run_id = uuid.uuid4().hex
         batch_start_ts = _now_iso()
         LOG_BASE = Path(f"results/experiment_outputs/{ts}/{run_id}")
 
         if not LOG_BASE.exists():
             LOG_BASE.mkdir(parents=True, exist_ok=True)
-        LOG_FILE = LOG_BASE / f"run_log_{run_id}_with_config_{outer_idx}_{BASE_DATASET_PATH.name.split(".")[0]}.jsonl"
+        LOG_FILE = LOG_BASE / f"run_log_{run_id}_with_config_{outer_idx}_{BASE_DATASET_PATH.name.split('.')[0]}.jsonl"
         count_idx = 0
         for idx, row in df_syntax_error_balanced.iterrows():
             copy_dir = None
@@ -699,7 +701,7 @@ if __name__ == "__main__":
                         print(f"{Colors.FAIL}    -> Max retries reached. Could not compile the file. {Colors.ENDC}")
 
                         if ENABLE_DELETE_ONLY_FALLBACK:
-                            print(f"{Colors.WARNING}    -> Engaging delete-only fallback for the last llm output...")
+                            print(f"{Colors.WARNING}    -> Engaging delete-only fallback for the last llm output...  {Colors.ENDC}")
                             try:
                                 llm_snapshot_path = AFFECTED_FILE_PATH / f"llm_last_output_{file_name[:-3]}.py"
                                 with open(str(llm_snapshot_path), "w", encoding="utf-8") as f:
