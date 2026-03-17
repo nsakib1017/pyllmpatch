@@ -446,7 +446,6 @@ if __name__ == "__main__":
             decompiler_name = row.get("decompiler")
             dataset_name = row.get("dataset")
             bytecode_version = str(row.get("bytecode_version"))
-
             if not file_dir.exists() or not decompiler_name or not dataset_name or not file_hash or not file_name or not bytecode_version:
                 continue
             # BASE_DIR_PYTHON_FILES / file_hash / file_name
