@@ -435,8 +435,7 @@ if __name__ == "__main__":
 
         if not LOG_BASE.exists():
             LOG_BASE.mkdir(parents=True, exist_ok=True)
-
-        LOG_FILE = LOG_BASE / f"run_log_{run_id}_with_config_{outer_idx}.jsonl"
+        LOG_FILE = LOG_BASE / f"run_log_{run_id}_with_config_{outer_idx}_{BASE_DATASET_PATH.name.split(".")[0]}.jsonl"
         count_idx = 0
         for idx, row in df_syntax_error_balanced.iterrows():
             copy_dir = None
@@ -613,7 +612,6 @@ if __name__ == "__main__":
                             log_rec=log_rec,
                             strategy_state={"syntax_context": {"failures": 0}, "whole_file": {"failures": 0}},
                             try_whole_file=True if ((total_attempts_completed > (int(max_retries / 2) - 1))) and (outer_idx == 2) else False,
-                            # try_whole_file=True,
                             outer_idx=outer_idx,
                             affected_file_path=AFFECTED_FILE_PATH
                         )
