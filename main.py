@@ -619,22 +619,23 @@ if __name__ == "__main__":
 
                 t0 = time.perf_counter()
                 final_code = (final_code or "").strip()
-
-                if final_code:
-                    if with_pin_point:
-                        final_code = align_indentation(final_code, base_indent)
-                        reattach_block(copy_dir, start_ln, end_ln, final_code)
-                    else:
-                        create_file_from_response(copy_dir, final_code)
-                    compilation_candidate = read_file(copy_dir)
-                else:
-                    copied_content = read_file(copy_dir)
-                    if copied_content:
-                        compilation_candidate = copied_content
-                    else:
-                        compilation_candidate = read_file(path_to_err_file)
-
+                
                 try:
+                    if final_code:
+                        if with_pin_point:
+                            final_code = align_indentation(final_code, base_indent)
+                            reattach_block(copy_dir, start_ln, end_ln, final_code)
+                        else:
+                            create_file_from_response(copy_dir, final_code)
+                        compilation_candidate = read_file(copy_dir)
+                    else:
+                        copied_content = read_file(copy_dir)
+                        if copied_content:
+                            compilation_candidate = copied_content
+                        else:
+                            compilation_candidate = read_file(path_to_err_file)
+
+
                     compilation_result = compile_new_pyc(
                         compilation_candidate,
                         out_py_path,
@@ -646,34 +647,34 @@ if __name__ == "__main__":
                     initial_error_description = compilation_result["error_description"]
                     if not is_compiled:
                         print(f"{Colors.WARNING}    -> Re-compilation failed for file. Retrying ({total_attempts_completed+1}/{int(os.getenv('NO_OF_MAX_RETRIES'))+1}).... {Colors.ENDC}")
+
+                    total_attempts_completed += 1
+                    max_retries -= 1
+
+                    log_rec.update({
+                        "fits_single_run": llm_metrics.get("fits_single_run"),
+                        "avg_chunk_tokens": llm_metrics.get("avg_chunk_tokens"),
+                        "max_chunk_tokens": llm_metrics.get("max_chunk_tokens"),
+                        "llm_calls": llm_metrics.get("llm_calls"),
+                        "llm_latency_ms_total": llm_metrics.get("llm_latency_ms_total"),
+                        "compiled_success": bool(is_compiled),
+                        "total_attempts_completed": total_attempts_completed,
+                        "compile_latency_ms": compile_ms,
+                    })
+
+                    if is_compiled:
+                        log_rec.update({"path_out": out_py_path})
+                        os.unlink(copy_dir)
+                        _append_log(LOG_FILE, log_rec)
+
+                    elif not is_compiled:
+                        with open(err_txt_path, "w", encoding="utf-8") as f:
+                            f.write(initial_error_description or "Unknown error")
+                        error_word, error_message = get_error_word_message_from_content(err_txt_path)
                 except Exception:
                     compile_ms = int((time.perf_counter() - t0) * 1000)
                     is_compiled = False
                     print(f"{Colors.WARNING}    -> Re-compilation failed for file. Retrying ({total_attempts_completed+1}/{int(os.getenv('NO_OF_MAX_RETRIES'))+1}).... {Colors.ENDC}")
-
-                total_attempts_completed += 1
-                max_retries -= 1
-
-                log_rec.update({
-                    "fits_single_run": llm_metrics.get("fits_single_run"),
-                    "avg_chunk_tokens": llm_metrics.get("avg_chunk_tokens"),
-                    "max_chunk_tokens": llm_metrics.get("max_chunk_tokens"),
-                    "llm_calls": llm_metrics.get("llm_calls"),
-                    "llm_latency_ms_total": llm_metrics.get("llm_latency_ms_total"),
-                    "compiled_success": bool(is_compiled),
-                    "total_attempts_completed": total_attempts_completed,
-                    "compile_latency_ms": compile_ms,
-                })
-
-                if is_compiled:
-                    log_rec.update({"path_out": out_py_path})
-                    os.unlink(copy_dir)
-                    _append_log(LOG_FILE, log_rec)
-
-                elif not is_compiled:
-                    with open(err_txt_path, "w", encoding="utf-8") as f:
-                        f.write(initial_error_description or "Unknown error")
-                    error_word, error_message = get_error_word_message_from_content(err_txt_path)
 
                 if (max_retries < 0 or elapsed > MAX_EXAMPLE_RUNTIME_SEC):
                     print(f"{Colors.FAIL}    -> Max retries reached. Could not compile the file. {Colors.ENDC}")
