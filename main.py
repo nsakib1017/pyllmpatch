@@ -418,6 +418,7 @@ if __name__ == "__main__":
 
     DELETE_ONLY_BASE_WINDOW = int(os.getenv("DELETE_ONLY_BASE_WINDOW", "1"))
     DELETE_ONLY_MAX_DELETED_RATIO = float(os.getenv("DELETE_ONLY_MAX_DELETED_RATIO", "0.95"))
+    MAX_WHOLE_FILE_BYTES = int(os.getenv("MAX_WHOLE_FILE_BYTES", str(1 * 1024 * 1024)))
 
     if DELETE_ONLY_MODE:
         print(f"{Colors.WARNING}DELETE_ONLY_MODE is enabled, LLMs will not be called{Colors.ENDC}")
@@ -459,6 +460,31 @@ if __name__ == "__main__":
                 if not file_dir or not file_dir.exists() or not decompiler_name or not dataset_name or not file_hash or not file_name or not bytecode_version:
                     continue
 
+                try:
+                    input_file_size_bytes = file_dir.stat().st_size
+                except Exception:
+                    input_file_size_bytes = None
+
+                if input_file_size_bytes is not None and input_file_size_bytes > MAX_WHOLE_FILE_BYTES:
+                    skip_log = {
+                        "run_id": run_id,
+                        "timestamp": _now_iso(),
+                        "row_index": int(idx),
+                        "file_hash": file_hash,
+                        "file_name": file_name,
+                        "path_in": str(file_dir),
+                        "bytecode_version": bytecode_version,
+                        "decompiler": decompiler_name,
+                        "dataset": dataset_name,
+                        "compiled_success": False,
+                        "skipped_due_to_file_size_guard": True,
+                        "input_file_size_bytes": int(input_file_size_bytes),
+                        "max_whole_file_bytes": int(MAX_WHOLE_FILE_BYTES),
+                    }
+                    _append_log(LOG_FILE, skip_log)
+                    print(f"{Colors.WARNING}Skipping oversized file: {file_dir} ({input_file_size_bytes} bytes > {MAX_WHOLE_FILE_BYTES}){Colors.ENDC}")
+                    continue
+
                 path_to_err_file = str(file_dir)
 
                 initial_error_description = row.get("error_description")
@@ -472,7 +498,6 @@ if __name__ == "__main__":
                 copy_dir = file_path_base_dir / f"copy_for_run_id_{run_id}_of_{file_name}"
                 copy_file(path_to_err_file, copy_dir)
 
-                whole_content = read_file(copy_dir)
                 version = bytecode_version
                 compilation_result = None
 
@@ -492,6 +517,8 @@ if __name__ == "__main__":
                     "bytecode_version": version,
                     "decompiler": decompiler_name,
                     "dataset": dataset_name,
+                    "input_file_size_bytes": int(input_file_size_bytes) if input_file_size_bytes is not None else None,
+                    "max_whole_file_bytes": int(MAX_WHOLE_FILE_BYTES),
                     "compile_error_word_before": row.get("error"),
                     "compile_error_message_before": row.get("error_message"),
                     "delete_only_mode": bool(DELETE_ONLY_MODE),
