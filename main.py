@@ -612,7 +612,8 @@ if __name__ == "__main__":
                             llm=OPEN_LLM_MODELS[int(os.getenv("LOCAL_LLM_IDX"))] if os.getenv("LOCAL_LLM_IDX") and int(os.getenv("LOCAL_LLM_IDX")) < len(OPEN_LLM_MODELS) else OPEN_LLM_MODELS[0],
                             log_rec=log_rec,
                             strategy_state={"syntax_context": {"failures": 0}, "whole_file": {"failures": 0}},
-                            try_whole_file=False,
+                            # try_whole_file=True if ((total_attempts_completed > (int(max_retries / 2) - 1))) and (outer_idx == 2) else False,
+                            try_whole_file=True,
                             outer_idx=outer_idx,
                             affected_file_path=AFFECTED_FILE_PATH
                         )
