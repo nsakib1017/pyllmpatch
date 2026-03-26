@@ -146,6 +146,14 @@ def get_previous_attempt_result(previuos_response: str, previous_error) -> str:
 
 
 def get_user_prompt(code_snippet: str, error_message: str, retry_attempt=False, previuos_response="", previous_error="") -> str:
+
+
+    retry_text = (
+        get_previous_attempt_result(previuos_response, previous_error)
+        if retry_attempt and previuos_response and previous_error
+        else ""
+    )
+    
     return (
         "Analyze the initial code Snippet below for possible Python syntax errors.\n"
         "It is highly important that you find and fix every syntax error present in the snippet. \n"
@@ -164,7 +172,7 @@ def get_user_prompt(code_snippet: str, error_message: str, retry_attempt=False, 
         "Return only the complete, corrected code snippet (no explanations, no markdown, no extra text).\n"
         "The error message from the initial compilation effort is provided for your reference.\n\n"
 
-        + (get_previous_attempt_result(previuos_response, previous_error) if retry_attempt else "") +  
+        + f"{retry_text}" +  
         
         "Find and fix all syntax errors you can identify in the initial snippet, make the absolutely necessary modifications to ensure the code is syntactically correct and compilable.\n"
         "You will use the original code snippet provided as reference to keep the error free lines unchanged, so that the line differences are as minimal as possible.\n"

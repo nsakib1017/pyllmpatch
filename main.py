@@ -411,6 +411,7 @@ if __name__ == "__main__":
 
     DELETE_ONLY_MODE = str(os.getenv("DELETE_ONLY_MODE", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
     ENABLE_DELETE_ONLY_FALLBACK = str(os.getenv("ENABLE_DELETE_ONLY_FALLBACK", "1")).strip().lower() in {"1", "true", "yes", "y", "on"}
+    USE_LOCAL_LLM = str(os.getenv("USE_LOCAL_LLM", "True")).strip().lower() in {"1", "true", "yes", "y", "on"}
     CONFIG_IDX_START = int(os.getenv("CONFIG_IDX_START", 0))
     CONFIG_IDX_RANGE = int(os.getenv("CONFIG_IDX_RANGE", 1))
 
@@ -605,15 +606,32 @@ if __name__ == "__main__":
                             raise
 
                     try:
+                        half_retries = max_retries // 2
+                        is_late_retry = total_attempts_completed >= half_retries
+                        is_final_outer = outer_idx == 2
+                        use_whole_file_for_remote = not USE_LOCAL_LLM
+                        try_whole_file = (is_late_retry and is_final_outer) or use_whole_file_for_remote
+                        
+                        llm_map = OPEN_LLM_MODELS if USE_LOCAL_LLM else LLM_MODELS
+                        idx_str = os.getenv("LOCAL_LLM_IDX")
+                        try:
+                            idx = int(idx_str) if idx_str is not None else 0
+                        except ValueError:
+                            idx = 0
+                        if not (0 <= idx < len(llm_map)):
+                            idx = 0
+                        selected_llm = llm_map[idx]
+
+
                         repair_result = attempt_repair(
                             copy_dir=copy_dir,
                             error_description=initial_error_description,
                             log_base=LOG_BASE,
                             file_hash=file_hash,
-                            llm=OPEN_LLM_MODELS[int(os.getenv("LOCAL_LLM_IDX"))] if os.getenv("LOCAL_LLM_IDX") and int(os.getenv("LOCAL_LLM_IDX")) < len(OPEN_LLM_MODELS) else OPEN_LLM_MODELS[0],
+                            llm=selected_llm,
                             log_rec=log_rec,
                             strategy_state={"syntax_context": {"failures": 0}, "whole_file": {"failures": 0}},
-                            try_whole_file=True if ((total_attempts_completed > (int(max_retries / 2) - 1))) and (outer_idx == 2) else False,
+                            try_whole_file=try_whole_file,
                             outer_idx=outer_idx,
                             affected_file_path=AFFECTED_FILE_PATH
                         )
