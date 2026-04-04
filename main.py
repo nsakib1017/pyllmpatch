@@ -386,12 +386,12 @@ def attempt_repair(
 
 def get_file_path_base_dir(decompiler_name: str, dataset_name: str, file_hash: str) -> Path:
     if "pylingual" in decompiler_name.lower():
-        if "pylingual" in dataset_name.lower():
+        if "pylingual" or "malware" in dataset_name.lower():
             return BASE_DIR_PYTHON_FILES_PYLINGUAL / file_hash / "decompiler_output"
         if "pypi" in dataset_name.lower():
              return BASE_DIR_PYTHON_FILES_PYPI / file_hash / "decompiled_output"
     elif "pycdc" in decompiler_name.lower():
-        if "pylingual" in dataset_name.lower():
+        if "pylingual" or "malware" in dataset_name.lower():
             return BASE_DIR_PYTHON_FILES_PYLINGUAL / file_hash / "pycdc_decompilation_output"
         if "pypi" in dataset_name.lower():
              return BASE_DIR_PYTHON_FILES_PYPI / file_hash / "decompiled_output_pycdc"
