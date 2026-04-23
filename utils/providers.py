@@ -30,12 +30,48 @@ LLM_MODELS = [
 ]
 
 OPEN_LLM_MODELS =  [
-    {'provider': 'Alibaba', 'name': 'qwen2.5-coder-7b', 'token_for_completion': 16384, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/merged_model_qwen2.5_coder_7b_instruct"},
-    {'provider': 'Alibaba', 'name': 'qwen2.5-coder-32b', 'token_for_completion': 32768, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/merged_model_qwen2.5_coder_32b_instruct_15_epochs"},
-    {'provider': 'IBM', 'name': 'granite-4.0-1b', 'token_for_completion': 16384, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth/granite-4.0-1b/run_1769129689/checkpoint-700"},
-    {'provider': 'MistralAI', 'name': 'mistral-7b-instruct', 'token_for_completion': 8192, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/unsloth/mistral-7b-instruct-v0.3/run_1769076402"},
-    {'provider': 'DeepSeek', 'name': 'DeepSeek-R1-0528-Qwen3-8B', 'token_for_completion': 32768, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth/DeepSeek-R1-0528-Qwen3-8B/run_1769125567/checkpoint-300"},
-    {'provider': 'Microsoft', 'name': 'phi-4', 'token_for_completion': 16384, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth/Phi-4-unsloth-bnb-4bit/run_1769294194/checkpoint-300"},
+    {
+        'provider': 'Alibaba',
+        'name': 'qwen2.5-coder-7b',
+        'token_for_completion': 16384,
+        'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/merged_model_qwen2.5_coder_7b_instruct",
+        'tokenizer_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/tokenizer_snapshots/qwen2.5-coder-7b",
+    },
+    {
+        'provider': 'Alibaba',
+        'name': 'qwen2.5-coder-32b',
+        'token_for_completion': 32768,
+        'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/merged_model_qwen2.5_coder_32b_instruct_15_epochs",
+        'tokenizer_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/tokenizer_snapshots/qwen2.5-coder-32b",
+    },
+    {
+        'provider': 'IBM',
+        'name': 'granite-4.0-1b',
+        'token_for_completion': 16384,
+        'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/unsloth/granite-4.0-1b/run_1769129689",
+        'tokenizer_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/tokenizer_snapshots/granite-4.0-1b",
+    },
+    {
+        'provider': 'MistralAI',
+        'name': 'mistral-7b-instruct',
+        'token_for_completion': 8192,
+        'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/unsloth/mistral-7b-instruct-v0.3/run_1769076402",
+        'tokenizer_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/tokenizer_snapshots/mistral-7b-instruct",
+    },
+    {
+        'provider': 'DeepSeek',
+        'name': 'DeepSeek-R1-0528-Qwen3-8B',
+        'token_for_completion': 32768,
+        'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth/unsloth/DeepSeek-R1-0528-Qwen3-8B/run_1769125567/checkpoint-300",
+        'tokenizer_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/tokenizer_snapshots/deepseek-r1-0528-qwen3-8b",
+    },
+    {
+        'provider': 'Microsoft',
+        'name': 'phi-4',
+        'token_for_completion': 16384,
+        'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth/unsloth/phi-4-reasoning/run_1769142686/checkpoint-900",
+        'tokenizer_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/tokenizer_snapshots/phi-4",
+    },
     # {'provider': 'OpenAI', 'name': 'gpt-oss-20b', 'token_for_completion': 32768, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth/gpt-oss-20b/run_1769125385/checkpoint-800"},
     # {'provider': 'Meta', 'name': 'codellama-34b', 'token_for_completion': 16384, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth/codellama-34b-bnb-4bit/run_1769663638/checkpoint-200"},
     # {'provider': 'Google', 'name': 'gemma-3-12b-it-unsloth-bnb-4bit', 'token_for_completion': 32768, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth/gemma-3-12b-it-unsloth-bnb-4bit/run_1769095208/checkpoint-200"}

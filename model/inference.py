@@ -14,9 +14,10 @@ CHAT_TEMPLATE = """{% for message in messages %}
 {% endif %}"""
 
 
-def call_llm_with_message(*, messages, model_path, max_tokens) -> str:
+def call_llm_with_message(*, messages, model_path, max_tokens, tokenizer_path=None) -> str:
     model, tokenizer = load_model_once(
         model_path=model_path,
+        tokenizer_path=tokenizer_path,
         max_tokens=max_tokens,
     )
 

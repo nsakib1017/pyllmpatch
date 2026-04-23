@@ -9,6 +9,7 @@ results/*
 finetuning/finetuned_models/
 finetuning/unsloth_compiled_cache/
 finetuning/merged_models/
+finetuning/tokenizer_snapshots/
 unsloth_compiled_cache
 pylingual
 .codex

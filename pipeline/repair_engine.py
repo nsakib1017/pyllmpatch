@@ -23,7 +23,15 @@ from utils.token_helpers import (
 RepairResult = Tuple[str, Dict[str, Any], bool, Optional[int], Optional[int], Optional[str]]
 
 
-def make_call_to_local_llm(content: str, error: str, current_explanation: str, affected_file_path: Path, model_path: str, max_tokens: int):
+def make_call_to_local_llm(
+    content: str,
+    error: str,
+    current_explanation: str,
+    affected_file_path: Path,
+    model_path: str,
+    max_tokens: int,
+    tokenizer_path: Optional[str] = None,
+):
     from model.inference import call_llm_with_message
 
     messages = build_chat_messages(
@@ -41,10 +49,21 @@ def make_call_to_local_llm(content: str, error: str, current_explanation: str, a
     with open(str(out_path), "w", encoding="utf-8") as f:
         json.dump(messages, f, ensure_ascii=False, indent=2, default=str)
 
-    return call_llm_with_message(messages=messages, model_path=model_path, max_tokens=max_tokens)
+    return call_llm_with_message(
+        messages=messages,
+        model_path=model_path,
+        max_tokens=max_tokens,
+        tokenizer_path=tokenizer_path,
+    )
 
 
-def explain_current_code_syntax_error(content: str, error: str, model_path: str, max_tokens: int) -> str:
+def explain_current_code_syntax_error(
+    content: str,
+    error: str,
+    model_path: str,
+    max_tokens: int,
+    tokenizer_path: Optional[str] = None,
+) -> str:
     from model.inference import call_llm_with_message
 
     messages = build_chat_messages(
@@ -53,7 +72,12 @@ def explain_current_code_syntax_error(content: str, error: str, model_path: str,
         system_prompt=SYSTEM_PROMPT_FOR_ROOT_CAUSE_ANALYSIS,
         user_prompt_template=USER_PROMPT_TEMPLATE_ROOT_CAUSE,
     )
-    return call_llm_with_message(messages=messages, model_path=model_path, max_tokens=max_tokens)
+    return call_llm_with_message(
+        messages=messages,
+        model_path=model_path,
+        max_tokens=max_tokens,
+        tokenizer_path=tokenizer_path,
+    )
 
 
 def make_call_to_api_llm(content: str, model: dict, error: str):
@@ -69,9 +93,27 @@ def process_file_in_single_run(content: str, model: dict, error: str, affected_f
     print(f"{Colors.OKGREEN}    -> Content fits in a single run for {model_name}. Processing...{Colors.ENDC}")
     t0 = time.perf_counter()
 
-    current_explanation = explain_current_code_syntax_error(content, error, model["model_path"], model["token_for_completion"]) if outer_idx != 0 else ""
+    current_explanation = (
+        explain_current_code_syntax_error(
+            content,
+            error,
+            model["model_path"],
+            model["token_for_completion"],
+            model.get("tokenizer_path"),
+        )
+        if outer_idx != 0
+        else ""
+    )
     if model["name"] in {m["name"] for m in OPEN_LLM_MODELS}:
-        llm_raw = make_call_to_local_llm(content, error, current_explanation, affected_file_path, model["model_path"], model["token_for_completion"])
+        llm_raw = make_call_to_local_llm(
+            content,
+            error,
+            current_explanation,
+            affected_file_path,
+            model["model_path"],
+            model["token_for_completion"],
+            model.get("tokenizer_path"),
+        )
     else:
         llm_raw = make_call_to_api_llm(content, model, error)
 
