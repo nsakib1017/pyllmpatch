@@ -1,13 +1,8 @@
-# Read dataset_summary.csv into a pandas DataFrame
 import shutil
 import pandas as pd
 from pathlib import Path
-import matplotlib.pyplot as plt
-import seaborn as sns
 import os
 import re
-import sys
-# import difflib
 from typing import List, Tuple, Optional, Any
 from dotenv import load_dotenv
 
@@ -19,12 +14,9 @@ DEF_CLASS_PREFIXES = ("def ", "class ", "async def ")
 
 def highest_indented_file(
     directory: Path | str,
-    pattern: str = "indented_*"  # change to "indented_*.py" to require .py
+    pattern: str = "indented_*"
 ) -> Optional[Tuple[Path, int]]:
-    """
-    Return (path, idx) for the highest-numbered file named like 'indented_{idx}[.ext]'
-    in the given directory. Returns None if none found.
-    """
+    """Return the highest-numbered `indented_*` file in a directory."""
     directory = Path(directory)
     best: Optional[Tuple[Path, int]] = None
 
@@ -48,10 +40,8 @@ def norm_str(x: str | None) -> str | None:
 def read_file(file_path: Path) -> Optional[str]:
     if file_path:
         try:
-            # Open the file, read its content, and print it
             with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-                return content
+                return f.read()
         except FileNotFoundError:
             print(f"Error: File not found at the specified path: {file_path}")
             return None
@@ -109,11 +99,7 @@ def get_error_word_message_from_content(filepath):
 
 
 def strip_code_fences(payload: Any) -> str:
-    """
-    Strips the code fences (```python, ~~~, etc.) from a string,
-    and handles different formats like None, dict, list, bytes, etc.
-    """
-    # ---- 1) Normalize to text ------------------------------------------------
+    """Strip markdown code fences from common LLM response shapes."""
     def _normalize(x: Any) -> str:
         if x is None:
             return ""
@@ -122,7 +108,6 @@ def strip_code_fences(payload: Any) -> str:
         if isinstance(x, str):
             return x
         if isinstance(x, dict):
-            # Common LLM shapes
             val = x.get("content") or x.get("text") or ""
             if isinstance(val, bytes):
                 return val.decode("utf-8", errors="ignore")
@@ -142,27 +127,21 @@ def strip_code_fences(payload: Any) -> str:
 
     text = _normalize(payload)
 
-    # ---- 2) Strip fences (regex patterns) ----------------------------------
     fence = r"(?:```|~~~)"
-    lang_until_eol = r"[^\r\n]*"  # Match language until end of line
-    # Refined regex that also ensures line breaks are handled
+    lang_until_eol = r"[^\r\n]*"
     paired_re = re.compile(
         rf"(?P<f>{fence})[ \t]*{lang_until_eol}[ \t]*(?:\r?\n)?"
         rf"(?P<body>.*?)"
         rf"(?:\r?\n)?(?P=f)[ \t]*", re.DOTALL
     )
-
-    # This should strip the code block properly
     text = paired_re.sub(lambda m: m.group("body"), text)
 
-    # ---- 3) Remove leading fence at the start of the string -----------------
     leading_open_re = re.compile(
         rf"^\ufeff?(?:{fence})[ \t]*{lang_until_eol}[ \t]*(?:\r?\n)?",
         re.DOTALL,
     )
     text = leading_open_re.sub("", text, count=1)
 
-    # ---- 4) Remove trailing fence at the end of the string -----------------
     trailing_close_re = re.compile(
         rf"(?:\r?\n)?(?:{fence})[ \t]*\Z",
         re.DOTALL,
@@ -197,10 +176,7 @@ def strip_base_indent(lines: list[str], base_indent: str) -> list[str]:
 
 
 def compute_base_indent(lines: List[str]) -> str:
-    """
-    Compute the minimum indentation of non-empty lines.
-    This is the indentation that must be preserved when reattaching.
-    """
+    """Return the minimum indentation of non-empty lines."""
     indents = [
         leading_spaces(l)
         for l in lines
@@ -213,9 +189,7 @@ def compute_base_indent(lines: List[str]) -> str:
 
 
 def build_triple_quote_mask(lines):
-    """
-    Returns a list[bool] where True means the line is inside a triple-quoted string.
-    """
+    """Return a mask showing whether each line is inside a triple-quoted string."""
     in_triple = False
     triple_char = None
     mask = [False] * len(lines)
@@ -223,7 +197,6 @@ def build_triple_quote_mask(lines):
     for i, line in enumerate(lines):
         stripped = line.strip()
 
-        # Count occurrences to handle """ text """ on one line
         for quote in ('"""', "'''"):
             count = stripped.count(quote)
             if count % 2 == 1:
@@ -244,12 +217,7 @@ def fetch_based_on_lines(
     error_line: int,
     fallback_upward_lines: int = 100,
 ) -> Optional[Tuple[str, int, int, str]]:
-    """
-    Fetch syntax context with indentation normalization.
-
-    Returns:
-        (normalized_context_text, start_line, end_line, base_indent)
-    """
+    """Return a syntax context window around an error line."""
 
     content = read_file(file_path)
     if content is None:
@@ -263,9 +231,6 @@ def fetch_based_on_lines(
 
     error_indent = leading_spaces(lines[idx])
 
-    # -------------------------
-    # 1️⃣ Enclosing function/class
-    # -------------------------
     start_idx = None
     block_indent = None
 
@@ -305,9 +270,6 @@ def fetch_based_on_lines(
             base_indent,                
         )
 
-    # -------------------------
-    # 2️⃣ Root-level block
-    # -------------------------
     start_idx = idx
     for i in range(idx, -1, -1):
         if lines[i].strip() and leading_spaces(lines[i]) == 0:
@@ -329,7 +291,7 @@ def fetch_based_on_lines(
     normalized_lines = strip_base_indent(block_lines, base_indent)
 
     return (
-        "\n".join(normalized_lines),      # 👈 normalized
+        "\n".join(normalized_lines),
         expanded_start + 1,
         end_idx + 1,
         base_indent,
@@ -371,9 +333,6 @@ def fetch_based_on_blocks(
 
     error_indent = leading_spaces(lines[idx])
 
-    # ----------------------------------------------
-    # Case 1: Error inside an indented region
-    # ----------------------------------------------
     if error_indent > 0:
         start_idx = 0
         for i in range(idx, -1, -1):
@@ -398,9 +357,6 @@ def fetch_based_on_blocks(
             base_indent,
         )
 
-    # ----------------------------------------------
-    # Case 2: Global-scope error
-    # ----------------------------------------------
     start_idx = 0
     for i in range(idx - 1, -1, -1):
         if is_top_level_anchor(lines[i], i):
@@ -448,9 +404,7 @@ def normalize_lines(text: str) -> List[str]:
 
 
 def apply_base_indent(lines: List[str], base_indent: str) -> List[str]:
-    """
-    Apply base indentation to all non-empty lines.
-    """
+    """Apply a shared indentation prefix to non-empty lines."""
     return [
         (base_indent + l if l.strip() else l)
         for l in lines
@@ -461,15 +415,10 @@ def align_indentation(
     patched_block: str,
     base_indent: str,
 ) -> str:
-    """
-    Align indentation of patched_block to match original_block.
-    """
+    """Align a patched block to the original base indentation."""
 
     patched_lines = normalize_lines(patched_block)
-
-    # Reapply original indentation
     aligned = apply_base_indent(patched_lines, base_indent)
-
     return "\n".join(aligned)
 
 
@@ -481,10 +430,7 @@ def reattach_block(
     new_block: str,
     backup: bool = False,
 ) -> None:
-    """
-    Replace lines [start_line, end_line] with new_block.
-    Creates a backup if requested.
-    """
+    """Replace a line range in a file with a new block."""
 
     content = file_path.read_text(encoding="utf-8")
     lines = content.splitlines()

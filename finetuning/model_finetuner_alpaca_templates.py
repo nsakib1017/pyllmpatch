@@ -6,10 +6,8 @@ from pprint import pprint
 
 import torch
 import pandas as pd
-import numpy as np
 
 from dotenv import load_dotenv
-from tqdm import tqdm
 from datasets import Dataset
 from sklearn.model_selection import train_test_split
 
@@ -18,10 +16,6 @@ from unsloth import FastLanguageModel, is_bfloat16_supported
 from trl import SFTTrainer
 from transformers import TrainingArguments
 from functools import partial
-
-# ===============================
-# Environment & Globals
-# ===============================
 
 def setup_environment():
     load_dotenv()
@@ -70,10 +64,6 @@ alpaca_prompt = """Below is an instruction that describes a task, paired with an
 ### Response:
 {}"""
 
-# ===============================
-# Model Setup
-# ===============================
-
 def load_model_and_tokenizer():
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=MODEL_NAME,
@@ -105,11 +95,6 @@ def load_model_and_tokenizer():
     print("Model device:", model.device)
     return model, tokenizer
 
-
-# ===============================
-# Dataset Utilities
-# ===============================
-
 def read_csv_file(file_name: str) -> pd.DataFrame:
     csv_path = Path.cwd() / file_name
     print("Loading dataset:", csv_path)
@@ -129,14 +114,12 @@ def formatting_prompts_func(
     error_col: str = "syntactic_error_description",
     eos_token: str = "",
 ) -> dict:
-    # Get the required columns from the batch
     samples = []
     for i in range(len(batch['syntactic_error_description'])):
         user_prompt = user_prompt_template.format(
             error_message=batch[error_col][i],
             code_snippet=batch["old_code_full"][i].strip("\n"),
         )
-        # Format the messages using alpaca_prompt format
         messages = alpaca_prompt.format(
             system_prompt.strip(),
             user_prompt,
@@ -146,12 +129,6 @@ def formatting_prompts_func(
 
     return {"text": samples}
 
-
-
-# ===============================
-# Training
-# ===============================
-
 def create_trainer(
     model,
     tokenizer,
@@ -159,17 +136,12 @@ def create_trainer(
     val_dataset,
     output_dir,
 ):
-    
-
-    # format_fn = partial(formatting_func, tokenizer=tokenizer)
-    
     return SFTTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        # formatting_func=formatting_prompts_func,
-        dataset_text_field = "text",
+        dataset_text_field="text",
         max_seq_length=MAX_SEQ_LENGTH,
         dataset_num_proc=2,
         packing=False,
@@ -201,11 +173,6 @@ def create_trainer(
         ),
     )
 
-
-# ===============================
-# Main
-# ===============================
-
 def main():
     setup_environment()
     model, tokenizer = load_model_and_tokenizer()
@@ -220,23 +187,29 @@ def main():
         shuffle=True,
     )
 
-    # train_samples = dataframe_to_chat_samples(
-    #     train_df,
-    #     system_prompt=SYSTEM_PROMPT,
-    #     user_prompt_template=USER_PROMPT_TEMPLATE,
-    # )
-
-    # val_samples = dataframe_to_chat_samples(
-    #     val_df,
-    #     system_prompt=SYSTEM_PROMPT,
-    #     user_prompt_template=USER_PROMPT_TEMPLATE,
-    # )
-
     train_dataset = Dataset.from_pandas(train_df)
     val_dataset = Dataset.from_pandas(val_df)
 
-    train_dataset=train_dataset.map(partial(formatting_prompts_func, system_prompt=SYSTEM_PROMPT, user_prompt_template=USER_PROMPT_TEMPLATE, eos_token=tokenizer.eos_token), batched=True, remove_columns=train_dataset.column_names, )
-    val_dataset=val_dataset.map(partial(formatting_prompts_func, system_prompt=SYSTEM_PROMPT, user_prompt_template=USER_PROMPT_TEMPLATE, eos_token=tokenizer.eos_token), batched=True, remove_columns=val_dataset.column_names, )
+    train_dataset = train_dataset.map(
+        partial(
+            formatting_prompts_func,
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt_template=USER_PROMPT_TEMPLATE,
+            eos_token=tokenizer.eos_token,
+        ),
+        batched=True,
+        remove_columns=train_dataset.column_names,
+    )
+    val_dataset = val_dataset.map(
+        partial(
+            formatting_prompts_func,
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt_template=USER_PROMPT_TEMPLATE,
+            eos_token=tokenizer.eos_token,
+        ),
+        batched=True,
+        remove_columns=val_dataset.column_names,
+    )
 
     print("Sample formatted training data:", train_dataset[0])
 

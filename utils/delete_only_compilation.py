@@ -44,16 +44,7 @@ def delete_lines_until_compilable_with_oracle(
     err_txt_path: Optional[str] = None,
     debug_escalation: bool = False,
 ) -> Tuple[str, List[DeletionAttempt], Dict[str, Any]]:
-    """
-    Deletion-only repair with more aggressive behavior for BLOCK errors
-    (IndentationError / missing ':' cascades) and an "indent region chop" candidate.
-
-    Changes vs prior version:
-      - Faster escalation for bucket == BLOCK
-      - Larger windows earlier for BLOCK (adds 16 at lvl2, adds 32 at lvl3)
-      - Adds candidate: delete contiguous indented region starting at error line
-      - Keeps UNCLOSED tokenizer-first behavior
-    """
+    """Try to reach a compilable file by deleting increasingly broad line spans."""
     lines = _split_keepends(py_file_content)
     original_line_count = len(lines)
     attempts: List[DeletionAttempt] = []
@@ -118,26 +109,19 @@ def delete_lines_until_compilable_with_oracle(
         recent_linenos.append(lineno)
         recent_buckets.append(bucket)
 
-        # -------------------------
-        # Escalation logic (more aggressive for BLOCK)
-        # -------------------------
         sig = (msg, lineno)
         seen_counts[sig] = seen_counts.get(sig, 0) + 1
 
-        # Exact-repeat thresholds
         if bucket == "BLOCK":
-            # faster for indentation cascades
             if seen_counts[sig] in (2, 4, 6):
                 escalate_level = min(3, escalate_level + 1)
         else:
             if seen_counts[sig] in (3, 6, 10):
                 escalate_level = min(3, escalate_level + 1)
 
-        # No-progress thresholds
         if len(recent_linenos) == recent_linenos.maxlen:
             span = max(recent_linenos) - min(recent_linenos)
             if span <= 3:
-                # for BLOCK, escalate faster (jump directly)
                 if bucket == "BLOCK" and escalate_level < 2:
                     escalate_level = 2
                 else:
@@ -197,7 +181,6 @@ def delete_lines_until_compilable_with_oracle(
                 chosen_applied = True
                 break
 
-            # Prefer candidates that move the extracted line number
             trial_desc = (trial_res.get("error_description") or "").strip()
             tln = extract_line_number(trial_desc) if trial_desc else None
             if isinstance(tln, int) and (trial_desc, tln) != (msg, lineno):
@@ -362,7 +345,6 @@ def _find_statement_chunk(lines: List[str], lineno: int) -> Tuple[int, int]:
 
 
 def _indent_prefix_width(line: str) -> int:
-    # Count leading spaces/tabs; treats tab as 1 unit (fine for heuristic)
     i = 0
     for ch in line:
         if ch == " " or ch == "\t":
@@ -373,12 +355,7 @@ def _indent_prefix_width(line: str) -> int:
 
 
 def _find_indented_region(lines: List[str], lineno: int) -> Optional[Tuple[int, int]]:
-    """
-    For 'unexpected indent': delete a contiguous region starting at lineno where
-    indentation >= indentation at lineno and lines are not blank/comment-only.
-
-    Returns (start,end) 1-based inclusive, or None.
-    """
+    """Return a contiguous indented region rooted at `lineno`."""
     if lineno < 1 or lineno > len(lines):
         return None
 
@@ -428,7 +405,6 @@ def _generate_candidates(
 
     cands: List[Tuple[int, int, str]] = []
 
-    # UNCLOSED: tokenizer-first
     if bucket == "UNCLOSED":
         start_line = _find_unclosed_construct_start(lines)
         if start_line is not None:
@@ -437,31 +413,26 @@ def _generate_candidates(
             if escalate_level >= 2:
                 cands.append((start_line, n, "tokenizer start to EOF"))
 
-    # BLOCK: try indented-region chop early for "unexpected indent"
     if bucket == "BLOCK" and "unexpected indent" in msg_l:
         region = _find_indented_region(lines, lineno)
         if region is not None:
             s, e = region
             cands.append((s, e, "indent-region chop (unexpected indent)"))
 
-    # small targets
     cands.append((lineno, end_lineno, "reported span"))
     cands.append((lineno, lineno, "reported line only"))
 
-    # dangling clause
     if 1 <= lineno <= n and _DANGLING_CLAUSE_RE.match(lines[lineno - 1]):
         cands.insert(0, (lineno, lineno, "dangling clause keyword line"))
         hdr = _find_nearest_header_above(lines, lineno)
         if hdr is not None:
             cands.insert(1, (hdr, hdr, "nearest header above (re-balance blocks)"))
 
-    # backslash continuation
     if _prev_line_has_backslash_cont(lines, lineno):
         cands.insert(0, (max(1, lineno - 1), lineno, "backslash continuation (prev + current)"))
     if _line_has_backslash_cont(lines, lineno):
         cands.insert(0, (lineno, min(n, lineno + 1), "backslash continuation (current + next)"))
 
-    # windows: more aggressive for BLOCK
     windows = [max(0, base_window), 1, 2, 4]
     if bucket == "BLOCK":
         if escalate_level >= 2:
@@ -479,21 +450,17 @@ def _generate_candidates(
         e = _clamp(end_lineno + w, s, n)
         cands.append((s, e, f"window w={w}"))
 
-    # header deletion for block-ish messages
     if any(s in msg_l for s in ["expected ':'", "expected an indented block", "unexpected indent", "unindent does not match", "indentation", "invalid syntax"]):
         hdr = _find_nearest_header_above(lines, lineno)
         if hdr is not None:
             cands.insert(0, (hdr, hdr, "nearest header above"))
             cands.insert(1, (max(1, hdr - 1), min(n, hdr + 1), "header neighborhood"))
 
-    # statement chunk
     cs, ce = _find_statement_chunk(lines, lineno)
     cands.append((cs, ce, "statement chunk"))
 
-    # tail chop
     cands.append((lineno, n, "error line to EOF"))
 
-    # aggressive
     if escalate_level >= 3:
         cands.append((1, lineno, "BOOM: start to error line"))
 

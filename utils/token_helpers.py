@@ -179,11 +179,8 @@ def get_user_prompt(code_snippet: str, error_message: str, retry_attempt=False, 
         "Your final output must be compilable, free from all sorts of syntax errors and must be as close to the original snippet as possible (i.e., without unnecessary deletions, additions or modifications of error free lines) and with only the necessary changes made to fix the syntax errors.\n"        
 
     )
-
-
-# --- ANSI Color Codes for Terminal Output ---
 class Colors:
-    """Class to hold ANSI color codes for styling terminal output."""
+    """ANSI color codes used by the CLI."""
     HEADER = '\033[95m'
     OKBLUE = '\033[94m'
     OKCYAN = '\033[96m'
@@ -212,14 +209,8 @@ def count_tokens(text: str, encoding_name: str = "cl100k_base", model_name = "ge
         return response.total_tokens
     else:
         try:
-            # Get the encoding for the specified model
             encoding = tiktoken.get_encoding(encoding_name)
-            # Encode the text and count the number of tokens
-            num_tokens = len(encoding.encode(text))
-            return num_tokens
-        except Exception as e:
-            # print(f"{Colors.WARNING}    -> Correct encoding not found for model {model_name} with encoding {encoding_name}. Trying default encoding.")
+            return len(encoding.encode(text))
+        except Exception:
             encoding = tiktoken.get_encoding("cl100k_base")
-            # Encode the text and count the number of tokens
-            num_tokens = len(encoding.encode(text))
-            return num_tokens
+            return len(encoding.encode(text))

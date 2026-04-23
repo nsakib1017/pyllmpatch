@@ -6,10 +6,8 @@ from pprint import pprint
 
 import torch
 import pandas as pd
-import numpy as np
 
 from dotenv import load_dotenv
-from tqdm import tqdm
 from datasets import Dataset
 from sklearn.model_selection import train_test_split
 
@@ -19,16 +17,13 @@ from trl import SFTTrainer
 from transformers import TrainingArguments, EarlyStoppingCallback
 from functools import partial
 from unsloth.chat_templates import get_chat_template
-# ===============================
-# Environment & Globals
-# ===============================
+
 
 def setup_environment():
     load_dotenv()
     print("CUDA available:", torch.cuda.is_available())
 
 
-#unsloth/phi-4-reasoning
 MODEL_NAME = "unsloth/codellama-34b-bnb-4bit"
 MAX_SEQ_LENGTH = 16384
 LOAD_IN_4BIT = True
@@ -78,11 +73,6 @@ USER_PROMPT_TEMPLATE = (
     "If the code contains no syntax errors or the errors cannot be fixed, return the code unchanged."
 )
 
-
-# ===============================
-# Model Setup
-# ===============================
-
 def load_model_and_tokenizer():
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=MODEL_NAME,
@@ -91,9 +81,8 @@ def load_model_and_tokenizer():
         load_in_4bit=LOAD_IN_4BIT,
         device_map={"": "cuda:0"},
     )
-    # model.to("cuda")
 
-    tokenizer = get_chat_template(tokenizer,chat_template = "phi-4",)
+    tokenizer = get_chat_template(tokenizer, chat_template="phi-4")
 
 
     model = FastLanguageModel.get_peft_model(
@@ -117,11 +106,6 @@ def load_model_and_tokenizer():
 
     print("Model device:", model.device)
     return model, tokenizer
-
-
-# ===============================
-# Dataset Utilities
-# ===============================
 
 def read_csv_file(file_name: str) -> pd.DataFrame:
     csv_path = Path.cwd() / file_name
@@ -198,11 +182,6 @@ def formatting_func(example, tokenizer):
 
     return texts
 
-
-# ===============================
-# Training
-# ===============================
-
 def create_trainer(
     model,
     tokenizer,
@@ -210,10 +189,8 @@ def create_trainer(
     val_dataset,
     output_dir,
 ):
-    
-
     format_fn = partial(formatting_func, tokenizer=tokenizer)
-    
+
     return SFTTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -252,16 +229,9 @@ def create_trainer(
         ),
     )
 
-
-# ===============================
-# Main
-# ===============================
-
 def main():
     setup_environment()
     model, tokenizer = load_model_and_tokenizer()
-
-    # tokenizer = get_chat_template(tokenizer, chat_template = "gemma-3",)
 
     df = read_csv_file(f"{os.getenv('PROJECT_ROOT_DIR')}/dataset/{os.getenv('DATASET_PATH_FOR_FINETUNING_NAME')}")
     df = clean_dataset(df)

@@ -1,18 +1,17 @@
 import re
 
+
 def detect_context_indent(code: str) -> str:
+    """Return the minimum leading indentation shared by all non-empty lines."""
     indents = []
     for line in code.splitlines():
         if line.strip():
-            indent = re.match(r"\s*", line).group(0)
-            indents.append(indent)
-    if not indents:
-        return ""
-    # Minimum indentation (context level)
-    return min(indents, key=len)
+            indents.append(re.match(r"\s*", line).group(0))
+    return min(indents, key=len) if indents else ""
 
 
 def normalize_indentation(code: str, context_indent: str) -> str:
+    """Strip a shared indentation prefix from each line when present."""
     if not context_indent:
         return code
     return "\n".join(
@@ -22,6 +21,7 @@ def normalize_indentation(code: str, context_indent: str) -> str:
 
 
 def reapply_context_indent(code: str, context_indent: str) -> str:
+    """Reapply a shared indentation prefix to each non-empty line."""
     if not context_indent:
         return code
     return "\n".join(
@@ -30,39 +30,6 @@ def reapply_context_indent(code: str, context_indent: str) -> str:
     )
 
 
-def detect_context_indent(code: str) -> str:
-    """
-    Return the minimum leading indentation shared by all non-empty lines.
-    """
-    indents = []
-    for line in code.splitlines():
-        if line.strip():
-            indents.append(re.match(r"\s*", line).group(0))
-    if not indents:
-        return ""
-    return min(indents, key=len)
-
-
-def apply_context_indent(
-    original_snippet: str,
-    fixed_snippet: str,
-) -> str:
-    """
-    Reattach indentation context from original_snippet
-    to fixed_snippet.
-    """
-
-    context_indent = detect_context_indent(original_snippet)
-
-    if not context_indent:
-        # No contextual indentation → return fixed as-is
-        return fixed_snippet
-
-    fixed_lines = fixed_snippet.splitlines()
-
-    reindented_lines = [
-        context_indent + line if line.strip() else line
-        for line in fixed_lines
-    ]
-
-    return "\n".join(reindented_lines)
+def apply_context_indent(original_snippet: str, fixed_snippet: str) -> str:
+    """Reattach indentation context from the original snippet to the fixed snippet."""
+    return reapply_context_indent(fixed_snippet, detect_context_indent(original_snippet))
