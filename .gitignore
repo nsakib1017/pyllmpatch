@@ -11,3 +11,5 @@ finetuning/unsloth_compiled_cache/
 finetuning/merged_models/
 unsloth_compiled_cache
 pylingual
+.codex
+test
