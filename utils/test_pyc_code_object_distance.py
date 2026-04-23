@@ -5,8 +5,7 @@ import csv
 import sys
 from pathlib import Path
 
-import xdis.opcodes
-from xdis.load import load_module
+import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PYLINGUAL_ROOT = REPO_ROOT / "pylingual"
@@ -14,15 +13,38 @@ PYLINGUAL_ROOT = REPO_ROOT / "pylingual"
 if str(PYLINGUAL_ROOT) not in sys.path:
     sys.path.insert(0, str(PYLINGUAL_ROOT))
 
-from pylingual.editable_bytecode import EditableBytecode, Inst
-from pylingual.editable_bytecode.bytecode_patches import fix_indirect_jump, fix_unreachable, remove_extended_arg, remove_nop, replace_firstlno
-from pylingual.equivalence_check import is_control_flow_equivalent, matching_iter
-from pylingual.editable_bytecode.control_flow_graph import bytecode_to_control_flow_graph
-from pylingual.control_flow_reconstruction.cfg import CFG
+from utils.file_helpers import fetch_pyllmpatch_pyc_paths
 
 
-PATCHES = [remove_extended_arg, remove_nop, fix_indirect_jump, fix_unreachable, remove_extended_arg, replace_firstlno]
 CONTROL_FLOW_WEIGHT = 3
+
+
+def _load_bytecode_dependencies():
+    import xdis.opcodes
+    from xdis.load import load_module
+    from pylingual.control_flow_reconstruction.cfg import CFG
+    from pylingual.editable_bytecode import EditableBytecode, Inst
+    from pylingual.editable_bytecode.bytecode_patches import (
+        fix_indirect_jump,
+        fix_unreachable,
+        remove_extended_arg,
+        remove_nop,
+        replace_firstlno,
+    )
+    from pylingual.editable_bytecode.control_flow_graph import bytecode_to_control_flow_graph
+    from pylingual.equivalence_check import is_control_flow_equivalent, matching_iter
+
+    return {
+        "xdis_opcodes": xdis.opcodes,
+        "load_module": load_module,
+        "CFG": CFG,
+        "EditableBytecode": EditableBytecode,
+        "Inst": Inst,
+        "bytecode_to_control_flow_graph": bytecode_to_control_flow_graph,
+        "is_control_flow_equivalent": is_control_flow_equivalent,
+        "matching_iter": matching_iter,
+        "patches": [remove_extended_arg, remove_nop, fix_indirect_jump, fix_unreachable, remove_extended_arg, replace_firstlno],
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,21 +71,22 @@ def validate_input(path: Path) -> Path:
     return path
 
 
-def load_editable_bytecode_from_pyc(path: Path) -> EditableBytecode:
-    source_tuple = load_module(str(path))
+def load_editable_bytecode_from_pyc(path: Path):
+    deps = _load_bytecode_dependencies()
+    source_tuple = deps["load_module"](str(path))
     if len(source_tuple) < 4:
         raise ValueError(f"Unexpected xdis load result with {len(source_tuple)} fields")
 
     version = source_tuple[0]
     code = source_tuple[3]
-    opcode = getattr(xdis.opcodes, f"opcode_{version[0]}{version[1]}")
+    opcode = getattr(deps["xdis_opcodes"], f"opcode_{version[0]}{version[1]}")
 
-    bytecode = EditableBytecode(code, opcode, version)
-    bytecode.apply_patches(PATCHES)
+    bytecode = deps["EditableBytecode"](code, opcode, version)
+    bytecode.apply_patches(deps["patches"])
     return bytecode
 
 
-def normalize_argval(inst: Inst):
+def normalize_argval(inst):
     argval = getattr(inst, "argval", None)
 
     if hasattr(argval, "co_name"):
@@ -75,7 +98,7 @@ def normalize_argval(inst: Inst):
     return repr(argval)
 
 
-def instruction_signature(inst: Inst):
+def instruction_signature(inst):
     return (
         inst.opname,
         inst.opcode,
@@ -108,16 +131,18 @@ def levenshtein_distance(seq_a, seq_b) -> int:
     return previous[-1]
 
 
-def build_block_graph(bytecode: EditableBytecode):
-    cfg = bytecode_to_control_flow_graph(bytecode)
-    return CFG.from_graph(cfg, bytecode, iterate=False)
+def build_block_graph(bytecode):
+    deps = _load_bytecode_dependencies()
+    cfg = deps["bytecode_to_control_flow_graph"](bytecode)
+    return deps["CFG"].from_graph(cfg, bytecode, iterate=False)
 
 
-def control_flow_distance(bc_a: EditableBytecode, bc_b: EditableBytecode) -> int:
+def control_flow_distance(bc_a, bc_b) -> int:
     block_graph_a = build_block_graph(bc_a)
     block_graph_b = build_block_graph(bc_b)
 
-    if is_control_flow_equivalent(block_graph_a, block_graph_b):
+    deps = _load_bytecode_dependencies()
+    if deps["is_control_flow_equivalent"](block_graph_a, block_graph_b):
         return 0
 
     ordered_nodes_a = sorted(block_graph_a.nodes(data="offset", default=(float("inf"),)), key=lambda node: min(node[1]))
@@ -139,9 +164,10 @@ def control_flow_distance(bc_a: EditableBytecode, bc_b: EditableBytecode) -> int
 def compare_code_object_distances(pyc_a: Path, pyc_b: Path):
     prepared_a = load_editable_bytecode_from_pyc(pyc_a)
     prepared_b = load_editable_bytecode_from_pyc(pyc_b)
+    deps = _load_bytecode_dependencies()
 
     results = []
-    for bc_a, bc_b in matching_iter(prepared_a, prepared_b):
+    for bc_a, bc_b in deps["matching_iter"](prepared_a, prepared_b):
         name_a = bc_a.name if bc_a is not None else None
         name_b = bc_b.name if bc_b is not None else None
         len_a = len(bc_a) if bc_a is not None else 0
@@ -265,6 +291,33 @@ def save_results_csv(results, path: Path) -> None:
             writer.writerow({**result, "normalized_distance": f"{result['normalized_distance']:.6f}"})
         summary = summarize_results(results)
         writer.writerow({**summary, "normalized_distance": f"{summary['normalized_distance']:.6f}"})
+
+
+def validate_semantic_error_pyc_paths(dataset_path: Path | None = None) -> dict:
+    dataset_path = (dataset_path or (REPO_ROOT / "dataset" / "pyllmpatch_dataset.csv")).expanduser().resolve()
+    df = pd.read_csv(dataset_path)
+    semantic_df = df[df["error_type"] == "semantic_error"].copy()
+
+    missing_rows = []
+    for row in semantic_df.itertuples(index=False):
+        original_pyc, indented_pyc = fetch_pyllmpatch_pyc_paths(row.file_hash, row.source)
+        if original_pyc is None or indented_pyc is None:
+            missing_rows.append(
+                {
+                    "file_hash": row.file_hash,
+                    "source": row.source,
+                    "original_pyc": str(original_pyc) if original_pyc else None,
+                    "indented_pyc": str(indented_pyc) if indented_pyc else None,
+                }
+            )
+
+    return {
+        "dataset_path": str(dataset_path),
+        "semantic_error_count": int(len(semantic_df)),
+        "all_resolved": len(missing_rows) == 0,
+        "missing_count": len(missing_rows),
+        "missing_rows": missing_rows,
+    }
 
 
 def main() -> int:

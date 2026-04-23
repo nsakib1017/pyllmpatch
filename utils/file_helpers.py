@@ -8,6 +8,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+ROOT_FOR_FILES = Path(str(os.getenv("ROOT_FOR_FILES")))
+BASE_DIR_PYTHON_FILES_PYLINGUAL = ROOT_FOR_FILES / str(os.getenv("BASE_DIR_PYTHON_FILES_PYLINGUAL"))
+BASE_DIR_PYTHON_FILES_PYPI = ROOT_FOR_FILES / str(os.getenv("BASE_DIR_PYTHON_FILES_PYPI"))
+
 INDENTED_RE = re.compile(r"^indented_(\d+)(?:\.[^.]+)?$")  # matches indented_12 or indented_12.py
 INDENT_RE = re.compile(r"^(\s*)\S")
 DEF_CLASS_PREFIXES = ("def ", "class ", "async def ")
@@ -36,6 +40,51 @@ def norm_str(x: str | None) -> str | None:
         return None
     s = str(x).strip()
     return None if s == "" or s.lower() == "nan" else s
+
+
+def _first_top_level_pyc(hash_dir: Path) -> Optional[Path]:
+    candidates = sorted(
+        p for p in hash_dir.glob("*.pyc")
+        if p.is_file()
+    )
+    return candidates[0] if candidates else None
+
+
+def _first_matching_pyc(directory: Path, pattern: str) -> Optional[Path]:
+    candidates = sorted(
+        p for p in directory.glob(pattern)
+        if p.is_file()
+    )
+    return candidates[0] if candidates else None
+
+
+def fetch_pyllmpatch_pyc_paths(file_hash: str, source: str) -> Tuple[Optional[Path], Optional[Path]]:
+    file_hash = norm_str(file_hash)
+    source = norm_str(source)
+
+    if not file_hash or not source:
+        return None, None
+
+    is_pypi = source == "PyPi"
+    hash_dir = (BASE_DIR_PYTHON_FILES_PYPI if is_pypi else BASE_DIR_PYTHON_FILES_PYLINGUAL) / file_hash
+
+    if not hash_dir.exists():
+        return None, None
+
+    if is_pypi:
+        original_pyc = _first_matching_pyc(hash_dir / "__pycache__", "*.cpython-310.pyc")
+        indented_pyc = _first_matching_pyc(
+            hash_dir / "decompiled_output_pylingual" / "__pycache__",
+            "decompiled_*.cpython-310.pyc",
+        )
+        return original_pyc, indented_pyc
+
+    original_pyc = _first_top_level_pyc(hash_dir)
+    indented_dir = hash_dir / "decompiler_output"
+    highest_indented = highest_indented_file(indented_dir, "indented_*.pyc")
+    indented_pyc = highest_indented[0] if highest_indented else None
+
+    return original_pyc, indented_pyc
 
 def read_file(file_path: Path) -> Optional[str]:
     if file_path:
