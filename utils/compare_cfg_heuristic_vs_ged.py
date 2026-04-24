@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import signal
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pandas as pd
@@ -24,6 +26,7 @@ from utils.pyc_code_object_distance import (
 
 DEFAULT_DATASET_PATH = REPO_ROOT / "dataset" / "pyllmpatch_dataset.csv"
 DEFAULT_OUTPUT_PATH = REPO_ROOT / "dataset" / "results" / "cfg_heuristic_vs_ged.csv"
+DEFAULT_SAMPLE_TIMEOUT_SECONDS = 600
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -65,7 +68,35 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip pairs whose CFGs are exactly equivalent.",
     )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=DEFAULT_SAMPLE_TIMEOUT_SECONDS,
+        help=f"Per-sample timeout for CFG preparation/comparison. Defaults to {DEFAULT_SAMPLE_TIMEOUT_SECONDS} seconds.",
+    )
     return parser
+
+
+class SampleTimeoutError(TimeoutError):
+    pass
+
+
+@contextmanager
+def _sample_timeout(timeout_seconds: int):
+    if timeout_seconds <= 0:
+        yield
+        return
+
+    def _handle_timeout(_signum, _frame):
+        raise SampleTimeoutError(f"sample exceeded timeout of {timeout_seconds} seconds")
+
+    previous_handler = signal.signal(signal.SIGALRM, _handle_timeout)
+    signal.alarm(timeout_seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def _safe_float(value: float | None) -> str | None:
@@ -180,6 +211,7 @@ def run_comparison(
     file_limit: int | None = None,
     pair_limit: int | None = None,
     skip_equivalent: bool = False,
+    timeout_seconds: int = DEFAULT_SAMPLE_TIMEOUT_SECONDS,
 ) -> dict:
     dataset_path = dataset_path.expanduser().resolve()
     csv_out = csv_out.expanduser().resolve()
@@ -194,6 +226,7 @@ def run_comparison(
     files_seen = 0
     unresolved_files = 0
     failed_files = 0
+    timed_out_files = 0
     heuristic_values: list[float] = []
     ged_values: list[float] = []
     zero_case_matches = 0
@@ -215,31 +248,39 @@ def run_comparison(
                 continue
 
             try:
-                prepared_gt = prepare_pyc(gt_pyc)
-                prepared_derived = prepare_pyc(derived_pyc)
+                with _sample_timeout(timeout_seconds):
+                    prepared_gt = prepare_pyc(gt_pyc)
+                    prepared_derived = prepare_pyc(derived_pyc)
+
+                    for gt_obj, derived_obj in _iter_matched_code_objects(prepared_gt, prepared_derived):
+                        if pair_limit is not None and rows_written >= pair_limit:
+                            break
+                        if gt_obj is None or derived_obj is None:
+                            continue
+
+                        comparison_row = _row_for_pair(row.file_hash, row.source, gt_pyc, derived_pyc, gt_obj, derived_obj)
+                        total_pairs_checked += 1
+
+                        if skip_equivalent and comparison_row["equivalent_cfg"]:
+                            continue
+
+                        heuristic_values.append(comparison_row["heuristic_cfg_distance"])
+                        ged_values.append(comparison_row["ged_cfg_distance"])
+                        if (comparison_row["heuristic_cfg_distance"] == 0) == (comparison_row["ged_cfg_distance"] == 0):
+                            zero_case_matches += 1
+
+                        writer.writerow(comparison_row)
+                        rows_written += 1
+
+                        if pair_limit is not None and rows_written >= pair_limit:
+                            break
+            except SampleTimeoutError:
+                timed_out_files += 1
+                print(f"  skipped: exceeded timeout of {timeout_seconds} seconds")
+                continue
             except Exception:
                 failed_files += 1
                 continue
-
-            for gt_obj, derived_obj in _iter_matched_code_objects(prepared_gt, prepared_derived):
-                if pair_limit is not None and rows_written >= pair_limit:
-                    break
-                if gt_obj is None or derived_obj is None:
-                    continue
-
-                comparison_row = _row_for_pair(row.file_hash, row.source, gt_pyc, derived_pyc, gt_obj, derived_obj)
-                total_pairs_checked += 1
-
-                if skip_equivalent and comparison_row["equivalent_cfg"]:
-                    continue
-
-                heuristic_values.append(comparison_row["heuristic_cfg_distance"])
-                ged_values.append(comparison_row["ged_cfg_distance"])
-                if (comparison_row["heuristic_cfg_distance"] == 0) == (comparison_row["ged_cfg_distance"] == 0):
-                    zero_case_matches += 1
-
-                writer.writerow(comparison_row)
-                rows_written += 1
 
             if pair_limit is not None and rows_written >= pair_limit:
                 break
@@ -254,6 +295,7 @@ def run_comparison(
         "files_seen": files_seen,
         "unresolved_files": unresolved_files,
         "failed_files": failed_files,
+        "timed_out_files": timed_out_files,
         "rows_written": rows_written,
         "pairs_checked": total_pairs_checked,
         "zero_case_agreement": _safe_float(zero_case_matches / total_pairs_checked) if total_pairs_checked else None,
@@ -271,6 +313,7 @@ def main() -> int:
         file_limit=args.file_limit,
         pair_limit=args.pair_limit,
         skip_equivalent=args.skip_equivalent,
+        timeout_seconds=args.timeout_seconds,
     )
 
     print("\nComparison summary")
@@ -280,6 +323,7 @@ def main() -> int:
     print(f"files_seen: {summary['files_seen']}")
     print(f"unresolved_files: {summary['unresolved_files']}")
     print(f"failed_files: {summary['failed_files']}")
+    print(f"timed_out_files: {summary['timed_out_files']}")
     print(f"rows_written: {summary['rows_written']}")
     print(f"pairs_checked: {summary['pairs_checked']}")
     print(f"zero_case_agreement: {summary['zero_case_agreement']}")
