@@ -20,7 +20,7 @@ bitsandbytes==0.49.2
 peft==0.19.1
 
 # Repo utilities
-xdis==6.3.0
+xdis==6.1.5
 networkx==3.6.1
 pydot==4.0.1
 
