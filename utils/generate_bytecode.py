@@ -91,6 +91,9 @@ def compile_version(py_file, out_file, version):
     if version == sys.version_info:
         _compile_native(py_file=py_file, out_file=out_file)
     elif version in UV_VERSIONS:
-        _compile_uv(py_file=py_file, out_file=out_file, version=version)
+        try:
+            _compile_uv(py_file=py_file, out_file=out_file, version=version)
+        except CompileError:
+            _compile_pyenv(py_file=py_file, out_file=out_file, version=version)
     else:
         _compile_pyenv(py_file=py_file, out_file=out_file, version=version)

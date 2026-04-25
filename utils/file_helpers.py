@@ -86,6 +86,30 @@ def fetch_pyllmpatch_pyc_paths(file_hash: str, source: str) -> Tuple[Optional[Pa
 
     return original_pyc, indented_pyc
 
+
+def fetch_pyllmpatch_repair_paths(file_hash: str, source: str) -> Tuple[Optional[Path], Optional[Path], Optional[Path]]:
+    file_hash = norm_str(file_hash)
+    source = norm_str(source)
+
+    if not file_hash or not source:
+        return None, None, None
+
+    gt_pyc, derived_pyc = fetch_pyllmpatch_pyc_paths(file_hash, source)
+
+    is_pypi = source == "PyPi"
+    hash_dir = (BASE_DIR_PYTHON_FILES_PYPI if is_pypi else BASE_DIR_PYTHON_FILES_PYLINGUAL) / file_hash
+    if not hash_dir.exists():
+        return gt_pyc, derived_pyc, None
+
+    if is_pypi:
+        derived_source = _first_matching_pyc(hash_dir / "decompiled_output_pylingual", "decompiled_*.py")
+        return gt_pyc, derived_pyc, derived_source
+
+    indented_dir = hash_dir / "decompiler_output"
+    highest_indented = highest_indented_file(indented_dir, "indented_*.py")
+    derived_source = highest_indented[0] if highest_indented else None
+    return gt_pyc, derived_pyc, derived_source
+
 def read_file(file_path: Path) -> Optional[str]:
     if file_path:
         try:

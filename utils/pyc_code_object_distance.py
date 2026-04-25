@@ -723,6 +723,7 @@ def summarize_results(results):
     total_control_flow_distance = sum(result["control_flow_distance"] for result in results)
     total_interaction_penalty = sum(result["interaction_penalty"] for result in results)
     total_unmatched_penalty = sum(result["unmatched_penalty"] for result in results)
+    sum_normalized_instruction_distance = sum(result["normalized_instruction_distance"] for result in results)
     mean_normalized_instruction_distance = sum(result["normalized_instruction_distance"] for result in results) / max(len(results), 1)
     mean_normalized_cfg_distance = sum(result["normalized_cfg_distance"] for result in results) / max(len(results), 1)
     mean_normalized_interaction_penalty = sum(result["normalized_interaction_penalty"] for result in results) / max(len(results), 1)
@@ -742,6 +743,7 @@ def summarize_results(results):
         "control_flow_distance": total_control_flow_distance,
         "interaction_penalty": total_interaction_penalty,
         "unmatched_penalty": total_unmatched_penalty,
+        "sum_normalized_instruction_distance": sum_normalized_instruction_distance,
         "control_flow_weight": CONTROL_FLOW_WEIGHT,
         "combined_distance": total_combined_distance,
         "normalized_instruction_distance": mean_normalized_instruction_distance,
@@ -805,17 +807,18 @@ def save_results_csv(results, path: Path, file_hash: str | None = None) -> None:
                 "derived_code_object_count",
                 "total_gt_inst_count",
                 "total_derived_inst_count",
-                "total_instruction_distance",
-                "total_control_flow_distance",
-                "total_interaction_penalty",
-                "total_unmatched_penalty",
-                "mean_normalized_instruction_distance",
-                "mean_normalized_cfg_distance",
-                "mean_normalized_interaction_penalty",
-                "mean_normalized_unmatched_penalty",
+                "sum_instruction_distance",
+                "sum_control_flow_distance",
+                "sum_interaction_penalty",
+                "sum_unmatched_penalty",
+                "sum_code_object_normalized_instruction_distance",
+                "mean_code_object_normalized_instruction_distance",
+                "mean_code_object_normalized_cfg_distance",
+                "mean_code_object_normalized_interaction_penalty",
+                "mean_code_object_normalized_unmatched_penalty",
                 "control_flow_weight",
-                "total_combined_distance",
-                "normalized_combined_distance",
+                "sum_combined_distance",
+                "mean_code_object_normalized_combined_distance",
             ],
         )
         writer.writeheader()
@@ -827,17 +830,18 @@ def save_results_csv(results, path: Path, file_hash: str | None = None) -> None:
                 "derived_code_object_count": summary["derived_code_object_count"],
                 "total_gt_inst_count": summary["gt_inst_count"],
                 "total_derived_inst_count": summary["derived_inst_count"],
-                "total_instruction_distance": summary["instruction_distance"],
-                "total_control_flow_distance": summary["control_flow_distance"],
-                "total_interaction_penalty": summary["interaction_penalty"],
-                "total_unmatched_penalty": summary["unmatched_penalty"],
-                "mean_normalized_instruction_distance": f"{summary['normalized_instruction_distance']:.6f}",
-                "mean_normalized_cfg_distance": f"{summary['normalized_cfg_distance']:.6f}",
-                "mean_normalized_interaction_penalty": f"{summary['normalized_interaction_penalty']:.6f}",
-                "mean_normalized_unmatched_penalty": f"{summary['normalized_unmatched_penalty']:.6f}",
+                "sum_instruction_distance": summary["instruction_distance"],
+                "sum_control_flow_distance": summary["control_flow_distance"],
+                "sum_interaction_penalty": summary["interaction_penalty"],
+                "sum_unmatched_penalty": summary["unmatched_penalty"],
+                "sum_code_object_normalized_instruction_distance": f"{summary['sum_normalized_instruction_distance']:.6f}",
+                "mean_code_object_normalized_instruction_distance": f"{summary['normalized_instruction_distance']:.6f}",
+                "mean_code_object_normalized_cfg_distance": f"{summary['normalized_cfg_distance']:.6f}",
+                "mean_code_object_normalized_interaction_penalty": f"{summary['normalized_interaction_penalty']:.6f}",
+                "mean_code_object_normalized_unmatched_penalty": f"{summary['normalized_unmatched_penalty']:.6f}",
                 "control_flow_weight": summary["control_flow_weight"],
-                "total_combined_distance": summary["combined_distance"],
-                "normalized_combined_distance": f"{summary['normalized_combined_distance']:.6f}",
+                "sum_combined_distance": summary["combined_distance"],
+                "mean_code_object_normalized_combined_distance": f"{summary['normalized_combined_distance']:.6f}",
             }
         )
 

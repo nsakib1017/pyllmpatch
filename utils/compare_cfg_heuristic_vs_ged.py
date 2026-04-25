@@ -20,6 +20,7 @@ from utils.pyc_code_object_distance import (
     _heuristic_control_flow_distance,
     _is_control_flow_equivalent_serialized,
     _iter_matched_code_objects,
+    levenshtein_distance,
     prepare_pyc,
 )
 
@@ -154,6 +155,8 @@ def _comparison_fieldnames() -> list[str]:
         "derived_block_count",
         "gt_block_edge_count",
         "derived_block_edge_count",
+        "instruction_distance",
+        "normalized_instruction_distance",
         "equivalent_cfg",
         "heuristic_cfg_distance",
         "ged_cfg_distance",
@@ -164,6 +167,8 @@ def _comparison_fieldnames() -> list[str]:
 def _row_for_pair(file_hash: str, source: str, gt_pyc: Path, derived_pyc: Path, gt_obj: dict, derived_obj: dict) -> dict:
     gt_graph = gt_obj["block_graph"]
     derived_graph = derived_obj["block_graph"]
+    instruction_distance = levenshtein_distance(gt_obj["instruction_signatures"], derived_obj["instruction_signatures"])
+    instruction_basis = max(gt_obj["inst_count"], derived_obj["inst_count"], 1)
     gt_block_count = sum(1 for _, attrs in gt_graph.nodes(data=True) if attrs["category"] == "block")
     derived_block_count = sum(1 for _, attrs in derived_graph.nodes(data=True) if attrs["category"] == "block")
     gt_edge_count = sum(
@@ -197,6 +202,8 @@ def _row_for_pair(file_hash: str, source: str, gt_pyc: Path, derived_pyc: Path, 
         "derived_block_count": derived_block_count,
         "gt_block_edge_count": gt_edge_count,
         "derived_block_edge_count": derived_edge_count,
+        "instruction_distance": instruction_distance,
+        "normalized_instruction_distance": f"{instruction_distance / instruction_basis:.6f}",
         "equivalent_cfg": _is_control_flow_equivalent_serialized(gt_graph, derived_graph),
         "heuristic_cfg_distance": heuristic,
         "ged_cfg_distance": ged,
