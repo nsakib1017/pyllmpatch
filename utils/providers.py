@@ -1,10 +1,15 @@
 from openai import OpenAI
-from google import genai
-from google.genai import types
-from typing import List, Optional
+from typing import Any, List, Optional
 import asyncio
 from dotenv import load_dotenv
 import os
+
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None
+    types = None
 
 load_dotenv()
 
@@ -79,7 +84,7 @@ OPEN_LLM_MODELS =  [
 
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY") , base_url="https://api.openai.com/v1")
 deepseek_client = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com")  
-google_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+google_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY")) if genai is not None else None
 
 def make_openai_call(prompt, model: str = "gpt-4o", provider: str = "OpenAI"):
         client = openai_client if provider == "OpenAI" else deepseek_client if provider == "DeepSeek" else None
@@ -104,6 +109,9 @@ def make_openai_call(prompt, model: str = "gpt-4o", provider: str = "OpenAI"):
 
 async def make_gemini_call(system_text: str, user_text: str, model: str = "gemini-2.5-flash-lite"):
     try:
+        if google_client is None or types is None:
+            print("Google GenAI SDK is not available. Install google-genai to use Gemini.")
+            return None
         # Put the system prompt as the first content item (SDKs differ on 'system' support).
         budget = -1
         contents = [
@@ -185,3 +193,42 @@ def make_llm_call(prompt: List[dict], model: str = "gpt-4o", provider: str = "Op
     else:
         print(f"Unsupported provider: {provider}")
         return None
+
+
+def find_llm_config(provider: str, model: str | None = None) -> dict[str, Any]:
+    models = LLM_MODELS + OPEN_LLM_MODELS
+    for candidate in models:
+        if candidate["provider"] == provider and (model is None or candidate["name"] == model):
+            return candidate
+    model_names = ", ".join(f"{item['provider']}:{item['name']}" for item in models)
+    requested = f"{provider}:{model}" if model else provider
+    raise ValueError(f"Unsupported LLM config: {requested}. Available configs: {model_names}")
+
+
+def make_gemini_call_from_env(
+    system_text: str,
+    user_text: str,
+    model: str = "gemini-2.5-flash-lite",
+) -> Optional[dict]:
+    return asyncio.run(make_gemini_call(system_text, user_text, model=model))
+
+
+def make_llm_call_from_config(messages: List[dict], llm_config: dict[str, Any]) -> Optional[dict]:
+    provider = llm_config["provider"]
+    model = llm_config["name"]
+
+    if provider in {"OpenAI", "DeepSeek", "Google"}:
+        return make_llm_call(messages, model=model, provider=provider)
+
+    if "model_path" in llm_config:
+        from model.inference import call_llm_with_message
+
+        content = call_llm_with_message(
+            messages=messages,
+            model_path=llm_config["model_path"],
+            max_tokens=llm_config["token_for_completion"],
+            tokenizer_path=llm_config.get("tokenizer_path"),
+        )
+        return {"content": content, "usage": None}
+
+    raise ValueError(f"Unsupported provider config: {provider}:{model}")

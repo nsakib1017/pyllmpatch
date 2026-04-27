@@ -46,9 +46,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     repair_loop.add_argument(
         "--fixer",
-        choices=("oracle",),
+        choices=("oracle", "llm"),
         default="oracle",
         help="Fragment fixer backend to use",
+    )
+    repair_loop.add_argument(
+        "--llm-provider",
+        type=str,
+        default="Google",
+        help="Provider from utils.providers for --fixer llm",
+    )
+    repair_loop.add_argument(
+        "--llm-model",
+        type=str,
+        default="gemini-2.5-flash-lite",
+        help="Model name from utils.providers for --fixer llm",
+    )
+    repair_loop.add_argument(
+        "--max-iterations",
+        type=int,
+        default=1,
+        help="Maximum semantic repair iterations over recomputed mismatch targets",
     )
     repair_loop.add_argument(
         "--json-out",
@@ -94,10 +112,10 @@ def main() -> None:
         return
 
     if command == "semantic-repair":
-        from pipeline.code_object_repair_loop import CodeObjectRepairLoop, OracleFragmentFixer, run_dataset_repair_loop
+        from pipeline.code_object_repair_loop import CodeObjectRepairLoop, LLMFragmentFixer, OracleFragmentFixer, run_dataset_repair_loop
         from pipeline.config import BASE_DATASET_PATH
 
-        if args.fixer != "oracle":
+        if args.fixer not in {"oracle", "llm"}:
             raise ValueError(f"Unsupported fixer backend: {args.fixer}")
 
         if args.dataset_mode:
@@ -111,11 +129,19 @@ def main() -> None:
                 verify_with_pylingual=not args.skip_pylingual_verification,
                 verify_each_step_with_pylingual=not args.skip_step_verification,
                 reject_non_improving_candidates=not args.keep_non_improving,
+                max_iterations=args.max_iterations,
+                llm_provider=args.llm_provider,
+                llm_model=args.llm_model,
             )
         else:
             if args.gt_pyc is None or args.derived_pyc is None or args.derived_source is None:
                 raise ValueError("gt_pyc, derived_pyc, and derived_source are required unless --dataset-mode is used")
-            loop = CodeObjectRepairLoop(OracleFragmentFixer(args.gt_pyc))
+            fixer = (
+                OracleFragmentFixer(args.gt_pyc)
+                if args.fixer == "oracle"
+                else LLMFragmentFixer(provider=args.llm_provider, model=args.llm_model)
+            )
+            loop = CodeObjectRepairLoop(fixer)
             result = loop.run(
                 gt_pyc=args.gt_pyc,
                 derived_pyc=args.derived_pyc,
@@ -125,6 +151,7 @@ def main() -> None:
                 verify_with_pylingual=not args.skip_pylingual_verification,
                 verify_each_step_with_pylingual=not args.skip_step_verification,
                 reject_non_improving_candidates=not args.keep_non_improving,
+                max_iterations=args.max_iterations,
             )
         if args.json_out is not None:
             args.json_out.expanduser().resolve().write_text(json.dumps(result, indent=2), encoding="utf-8")
