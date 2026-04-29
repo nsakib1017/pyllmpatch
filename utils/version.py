@@ -16,7 +16,10 @@ class PythonVersion:
                 x = "3.10"
             x = str(x)
         if isinstance(x, str):
-            x = version_str.get(".".join(map(str.strip, x.split(".")[:2])))
+            cleaned = x.strip()
+            if cleaned == "3.1":
+                cleaned = "3.10"
+            x = version_str.get(".".join(map(str.strip, cleaned.split(".")[:2])))
         if isinstance(x, int):
             x = (3, x)
         if isinstance(x, tuple):

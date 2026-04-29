@@ -9,7 +9,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Project entrypoint.")
     subparsers = parser.add_subparsers(dest="command")
 
-    subparsers.add_parser("syntactic-repair", help="Run the existing syntax-repair experiment pipeline")
+    syntax = subparsers.add_parser("syntactic-repair", help="Run the existing syntax-repair experiment pipeline")
+    syntax.add_argument(
+        "--source",
+        type=str,
+        default=None,
+        help="Optional source filter for the syntax dataset (for example VirusTotal, pylingual, or PyPi)",
+    )
+    syntax.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional row limit for the syntax dataset after filtering",
+    )
 
     repair_loop = subparsers.add_parser(
         "semantic-repair",
@@ -108,7 +120,7 @@ def main() -> None:
         from pipeline.config import load_runtime_config
         from pipeline.runner import run_experiment
 
-        run_experiment(load_runtime_config())
+        run_experiment(load_runtime_config(), source=args.source, limit=args.limit)
         return
 
     if command == "semantic-repair":

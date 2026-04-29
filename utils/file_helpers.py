@@ -1,8 +1,11 @@
+import ast
 import shutil
+import io
 import pandas as pd
 from pathlib import Path
 import os
 import re
+import tokenize
 from typing import List, Tuple, Optional, Any
 from dotenv import load_dotenv
 
@@ -14,7 +17,41 @@ BASE_DIR_PYTHON_FILES_PYPI = ROOT_FOR_FILES / str(os.getenv("BASE_DIR_PYTHON_FIL
 
 INDENTED_RE = re.compile(r"^indented_(\d+)(?:\.[^.]+)?$")  # matches indented_12 or indented_12.py
 INDENT_RE = re.compile(r"^(\s*)\S")
-DEF_CLASS_PREFIXES = ("def ", "class ", "async def ")
+BLOCK_HEADER_KEYWORDS = (
+    "async def ",
+    "def ",
+    "class ",
+    "if ",
+    "elif ",
+    "else:",
+    "for ",
+    "while ",
+    "try:",
+    "except ",
+    "finally:",
+    "with ",
+    "match ",
+    "case ",
+)
+MAX_SYNTAX_CONTEXT_EXPANSION_STEPS = 3
+SYNTAX_ERROR_DELIMITER_HINTS = (
+    "unexpected eof",
+    "was never closed",
+    "unterminated",
+    "f-string",
+    "single '}' is not allowed",
+    "expecting '}'",
+    "unmatched ')'",
+    "unmatched ']'",
+    "unmatched '}'",
+)
+SYNTAX_ERROR_INDENTATION_HINTS = (
+    "indentationerror",
+    "expected an indented block",
+    "unexpected indent",
+    "unindent does not match",
+    "expected ':'",
+)
 
 def highest_indented_file(
     directory: Path | str,
@@ -306,9 +343,13 @@ def leading_spaces(line: str) -> int:
     return len(line) - len(line.lstrip(" "))
 
 
-def is_def_or_class(line: str) -> bool:
+def is_block_header(line: str) -> bool:
     stripped = line.lstrip()
-    return stripped.startswith(DEF_CLASS_PREFIXES) and stripped.rstrip().endswith(":")
+    return any(stripped.startswith(prefix) for prefix in BLOCK_HEADER_KEYWORDS) and stripped.rstrip().endswith(":")
+
+
+def is_def_or_class(line: str) -> bool:
+    return is_block_header(line)
 
 
 def strip_base_indent(lines: list[str], base_indent: str) -> list[str]:
@@ -333,6 +374,27 @@ def compute_base_indent(lines: List[str]) -> str:
     if not indents:
         return ""
     return " " * min(indents)
+
+
+def compute_anchor_indent(lines: List[str]) -> str:
+    """Return the indentation of the first non-empty line."""
+    for line in lines:
+        if line.strip():
+            return " " * leading_spaces(line)
+    return ""
+
+
+def _syntax_context_result(block_lines: List[str], start_idx: int, end_idx: int) -> tuple[str, int, int, str, str]:
+    base_indent = compute_base_indent(block_lines)
+    anchor_indent = compute_anchor_indent(block_lines)
+    normalized_lines = strip_base_indent(block_lines, base_indent)
+    return (
+        "\n".join(normalized_lines),
+        start_idx + 1,
+        end_idx + 1,
+        base_indent,
+        anchor_indent,
+    )
 
 
 
@@ -360,11 +422,97 @@ def build_triple_quote_mask(lines):
     return mask
 
 
+def _syntax_context_parses(snippet: str) -> bool:
+    try:
+        ast.parse(snippet)
+        return True
+    except SyntaxError:
+        return False
+
+
+def _syntax_error_category(error_description: str | None) -> str:
+    if not error_description:
+        return "generic"
+    lowered = error_description.lower()
+    if any(marker in lowered for marker in SYNTAX_ERROR_DELIMITER_HINTS):
+        return "delimiter"
+    if any(marker in lowered for marker in SYNTAX_ERROR_INDENTATION_HINTS):
+        return "indentation"
+    return "generic"
+
+
+def _syntax_context_strategy_order(error_description: str | None) -> list[str]:
+    category = _syntax_error_category(error_description)
+    prefer_blocks = _prefer_block_localization(error_description)
+
+    if category == "delimiter":
+        return ["delimiter", "block", "line"] if prefer_blocks else ["delimiter", "line", "block"]
+
+    if category == "indentation":
+        return ["block", "line", "delimiter"] if prefer_blocks else ["line", "block", "delimiter"]
+
+    if prefer_blocks:
+        return ["block", "line", "delimiter"]
+    return ["line", "block", "delimiter"]
+
+
+def _syntax_context_for_strategy(
+    strategy: str,
+    file_path: Path,
+    error_line: int,
+    error_description: str | None,
+    expansion_level: int,
+) -> Optional[Tuple[str, int, int, str, str]]:
+    if strategy == "delimiter":
+        return _delimiter_localization_context(file_path, error_line, error_description, expansion_level)
+    if strategy == "block":
+        return fetch_based_on_blocks(file_path, error_line, expansion_level)
+    if strategy == "line":
+        return fetch_based_on_lines(file_path, error_line, expansion_level)
+    return None
+
+
+def _find_string_opener_line(lines: list[str], scan_limit: int, prefer_fstring: bool = False) -> tuple[int, int] | None:
+    scan_limit = min(len(lines), max(1, scan_limit))
+
+    def _matched_quote_index(line: str, quote: str) -> int:
+        idx = line.find(quote)
+        if idx == -1:
+            return -1
+        return idx
+
+    for line_idx in range(scan_limit - 1, -1, -1):
+        line = lines[line_idx]
+        if prefer_fstring:
+            candidates = [
+                _matched_quote_index(line, 'f"'),
+                _matched_quote_index(line, "f'"),
+                _matched_quote_index(line, 'F"'),
+                _matched_quote_index(line, "F'"),
+            ]
+            opener_col = max(candidates)
+            if opener_col != -1:
+                return line_idx + 1, opener_col
+
+        for quote in ('"""', "'''"):
+            opener_col = _matched_quote_index(line, quote)
+            if opener_col != -1:
+                return line_idx + 1, opener_col
+
+        for quote in ('"', "'"):
+            opener_col = _matched_quote_index(line, quote)
+            if opener_col != -1:
+                return line_idx + 1, opener_col
+
+    return None
+
+
 def fetch_based_on_lines(
     file_path: Path,
     error_line: int,
+    expansion_level: int = 0,
     fallback_upward_lines: int = 100,
-) -> Optional[Tuple[str, int, int, str]]:
+) -> Optional[Tuple[str, int, int, str, str]]:
     """Return a syntax context window around an error line."""
 
     content = read_file(file_path)
@@ -407,16 +555,7 @@ def fetch_based_on_lines(
             end_idx = len(lines) - 1
 
         block_lines = lines[start_idx:end_idx + 1]
-        base_indent = compute_base_indent(block_lines)
-
-        normalized_lines = strip_base_indent(block_lines, base_indent)
-
-        return (
-            "\n".join(normalized_lines), 
-            start_idx + 1,
-            end_idx + 1,
-            base_indent,                
-        )
+        return _syntax_context_result(block_lines, start_idx, end_idx)
 
     start_idx = idx
     for i in range(idx, -1, -1):
@@ -432,18 +571,11 @@ def fetch_based_on_lines(
     else:
         end_idx = len(lines) - 1
 
-    expanded_start = max(0, start_idx - fallback_upward_lines)
-    block_lines = lines[expanded_start:end_idx + 1]
-    base_indent = compute_base_indent(block_lines)
-
-    normalized_lines = strip_base_indent(block_lines, base_indent)
-
-    return (
-        "\n".join(normalized_lines),
-        expanded_start + 1,
-        end_idx + 1,
-        base_indent,
-    )
+    extra = max(0, int(expansion_level))
+    expanded_start = max(0, start_idx - fallback_upward_lines - extra)
+    expanded_end = min(len(lines) - 1, end_idx + extra)
+    block_lines = lines[expanded_start:expanded_end + 1]
+    return _syntax_context_result(block_lines, expanded_start, expanded_end)
 
 
 
@@ -451,7 +583,8 @@ def fetch_based_on_lines(
 def fetch_based_on_blocks(
     file_path: Path,
     error_line: int,
-) -> Optional[Tuple[str, int, int, int]]:
+    expansion_level: int = 0,
+) -> Optional[Tuple[str, int, int, str, str]]:
 
     content = read_file(file_path)
     if not content:
@@ -494,16 +627,11 @@ def fetch_based_on_blocks(
                 end_idx = j - 1
                 break
 
+        extra = max(0, int(expansion_level))
+        start_idx = max(0, start_idx - extra)
+        end_idx = min(len(lines) - 1, end_idx + extra)
         block_lines = lines[start_idx:end_idx + 1]
-        base_indent = compute_base_indent(block_lines)
-        normalized = strip_base_indent(block_lines, base_indent)
-
-        return (
-            "\n".join(normalized),
-            start_idx + 1,
-            end_idx + 1,
-            base_indent,
-        )
+        return _syntax_context_result(block_lines, start_idx, end_idx)
 
     start_idx = 0
     for i in range(idx - 1, -1, -1):
@@ -517,34 +645,157 @@ def fetch_based_on_blocks(
             end_idx = j - 1
             break
 
+    extra = max(0, int(expansion_level))
+    start_idx = max(0, start_idx - extra)
+    end_idx = min(len(lines) - 1, end_idx + extra)
     block_lines = lines[start_idx:end_idx + 1]
-    base_indent = compute_base_indent(block_lines)
-    normalized = strip_base_indent(block_lines, base_indent)
+    return _syntax_context_result(block_lines, start_idx, end_idx)
 
-    return (
-        "\n".join(normalized),
-        start_idx + 1,
-        end_idx + 1,
-        base_indent,
+
+def _delimiter_localization_context(
+    file_path: Path,
+    error_line: int,
+    error_description: str | None = None,
+    expansion_level: int = 0,
+) -> Optional[Tuple[str, int, int, str, str]]:
+    content = read_file(file_path)
+    if not content:
+        return None
+
+    lines = content.splitlines()
+    if not lines:
+        return None
+
+    opener_to_closer = {"(": ")", "[": "]", "{": "}"}
+    closer_to_opener = {v: k for k, v in opener_to_closer.items()}
+    stack: list[tuple[str, int, int]] = []
+    issue_kind: str | None = None
+    issue_line: int | None = None
+
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(content).readline):
+            if tok.type != tokenize.OP:
+                continue
+            if tok.string in opener_to_closer:
+                stack.append((tok.string, tok.start[0], tok.start[1]))
+                continue
+            if tok.string in closer_to_opener:
+                if stack and stack[-1][0] == closer_to_opener[tok.string]:
+                    stack.pop()
+                else:
+                    issue_kind = "unmatched_closer"
+                    issue_line = tok.start[0]
+                    break
+    except (tokenize.TokenError, IndentationError, SyntaxError) as exc:
+        message = str(exc)
+        lowered = message.lower()
+        if "multi-line string" in lowered:
+            issue_kind = "unterminated_string"
+        elif "multi-line statement" in lowered:
+            issue_kind = "unterminated_statement"
+
+    if issue_kind is None and error_description:
+        lowered = error_description.lower()
+        if "f-string" in lowered or "expecting '}'" in lowered or "single '}' is not allowed" in lowered:
+            issue_kind = "unterminated_string"
+        elif any(marker in lowered for marker in ("unexpected eof", "was never closed", "unterminated")):
+            issue_kind = "unterminated_statement"
+
+    if issue_kind == "unmatched_closer" and issue_line is not None:
+        extra = max(0, int(expansion_level))
+        start_idx = max(0, issue_line - 3 - extra)
+        end_idx = min(len(lines) - 1, issue_line + 1 + extra)
+        block_lines = lines[start_idx:end_idx + 1]
+        return _syntax_context_result(block_lines, start_idx, end_idx)
+
+    if issue_kind in {"unterminated_string", "unterminated_statement"}:
+        scan_limit = min(len(lines), max(1, error_line))
+        prefer_fstring = bool(error_description and "f-string" in error_description.lower())
+        opener = _find_string_opener_line(lines, scan_limit, prefer_fstring=prefer_fstring)
+        opener_line = opener[0] if opener is not None else None
+        if opener_line is not None:
+            extra = max(0, int(expansion_level))
+            start_idx = max(0, opener_line - 1 - extra)
+            end_idx = min(len(lines) - 1, max(error_line, opener_line) + 1 + extra)
+            block_lines = lines[start_idx:end_idx + 1]
+            return _syntax_context_result(block_lines, start_idx, end_idx)
+
+    if not stack:
+        return None
+
+    idx = max(0, min(len(lines) - 1, error_line - 1))
+    candidate_openers = [item for item in stack if item[1] <= error_line]
+    opener = candidate_openers[-1] if candidate_openers else stack[-1]
+    extra = max(0, int(expansion_level))
+    start_idx = max(0, opener[1] - 1 - extra)
+
+    end_idx = len(lines) - 1
+    for j in range(idx + 1, len(lines)):
+        if lines[j].strip() and leading_spaces(lines[j]) == 0 and is_block_header(lines[j]):
+            end_idx = j - 1
+            break
+
+    if end_idx < start_idx:
+        end_idx = len(lines) - 1
+
+    end_idx = min(len(lines) - 1, end_idx + extra)
+
+    block_lines = lines[start_idx:end_idx + 1]
+    return _syntax_context_result(block_lines, start_idx, end_idx)
+
+
+def _prefer_block_localization(error_description: str | None) -> bool:
+    if not error_description:
+        return False
+    lowered = error_description.lower()
+    if any(marker in lowered for marker in SYNTAX_ERROR_INDENTATION_HINTS):
+        return True
+    return any(
+        marker in lowered
+        for marker in (
+            "unexpected eof",
+            "was never closed",
+            "unterminated",
+            "f-string",
+            "single '}' is not allowed",
+            "expecting '}'",
+            "unmatched ')'",
+            "unmatched ']'",
+            "unmatched '}'",
+        )
     )
 
 
 def fetch_syntax_context(
     file_path: Path,
     error_line: int,
-    outer_idx: int = 0,
-) -> Optional[Tuple[str, int, int, int]]:
+    error_description: str | None = None,
+    expansion_level: int = 0,
+) -> Optional[Tuple[str, int, int, str, str]]:
+    if error_line is None:
+        return None
 
-    if outer_idx == 2:
-        return fetch_based_on_blocks(
-            file_path,
-            error_line,
-        )
-    else:
-        return fetch_based_on_lines(
-            file_path,
-            error_line,
-        )
+    start_expansion = max(0, int(expansion_level))
+    max_expansion = start_expansion + MAX_SYNTAX_CONTEXT_EXPANSION_STEPS
+    strategy_order = _syntax_context_strategy_order(error_description)
+    best_context: Optional[Tuple[str, int, int, str, str]] = None
+    best_span: Optional[int] = None
+
+    for extra_expansion in range(start_expansion, max_expansion + 1):
+        for strategy in strategy_order:
+            context = _syntax_context_for_strategy(strategy, file_path, error_line, error_description, extra_expansion)
+            if context is None:
+                continue
+
+            span = max(0, context[2] - context[1])
+            if _syntax_context_parses(context[0]):
+                return context
+
+            if best_span is None or span < best_span:
+                best_context = context
+                best_span = span
+
+    return best_context
     
 
 def normalize_lines(text: str) -> List[str]:
@@ -562,11 +813,13 @@ def apply_base_indent(lines: List[str], base_indent: str) -> List[str]:
 def align_indentation(
     patched_block: str,
     base_indent: str,
+    anchor_indent: str | None = None,
 ) -> str:
     """Align a patched block to the original base indentation."""
 
     patched_lines = normalize_lines(patched_block)
-    aligned = apply_base_indent(patched_lines, base_indent)
+    indent_prefix = anchor_indent if anchor_indent is not None else base_indent
+    aligned = apply_base_indent(patched_lines, indent_prefix)
     return "\n".join(aligned)
 
 

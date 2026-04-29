@@ -20,7 +20,7 @@ from utils.token_helpers import (
     get_user_prompt,
 )
 
-RepairResult = Tuple[str, Dict[str, Any], bool, Optional[int], Optional[int], Optional[str]]
+RepairResult = Tuple[str, Dict[str, Any], bool, Optional[int], Optional[int], Optional[str], Optional[str]]
 
 
 def make_call_to_local_llm(
@@ -88,22 +88,26 @@ def make_call_to_api_llm(content: str, model: dict, error: str):
     return make_llm_call(prompt, model=model["name"], provider=model["provider"])
 
 
-def process_file_in_single_run(content: str, model: dict, error: str, affected_file_path: Path, outer_idx: int) -> Tuple[str, Dict[str, Any]]:
+def process_file_in_single_run(
+    content: str,
+    model: dict,
+    error: str,
+    affected_file_path: Path,
+    enable_syntax_explanation: bool,
+) -> Tuple[str, Dict[str, Any]]:
     model_name = f"{model['provider']} - {model['name']}"
     print(f"{Colors.OKGREEN}    -> Content fits in a single run for {model_name}. Processing...{Colors.ENDC}")
     t0 = time.perf_counter()
 
-    current_explanation = (
-        explain_current_code_syntax_error(
+    current_explanation = ""
+    if enable_syntax_explanation and model.get("model_path"):
+        current_explanation = explain_current_code_syntax_error(
             content,
             error,
             model["model_path"],
             model["token_for_completion"],
             model.get("tokenizer_path"),
         )
-        if outer_idx != 0
-        else ""
-    )
     if model["name"] in {m["name"] for m in OPEN_LLM_MODELS}:
         llm_raw = make_call_to_local_llm(
             content,
@@ -141,7 +145,8 @@ def process_file_for_syntax_error_patching(
     affected_file_path: Path,
     log_rec=None,
     llm=OPEN_LLM_MODELS[1],
-    outer_idx=0,
+    expansion_level: int = 0,
+    enable_syntax_explanation: bool = True,
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
     if log_rec is None:
         log_rec = {}
@@ -183,7 +188,13 @@ def process_file_for_syntax_error_patching(
         }
     )
 
-    return process_file_in_single_run(initial_content, llm, error_description, affected_file_path, outer_idx)
+    return process_file_in_single_run(
+        initial_content,
+        llm,
+        error_description,
+        affected_file_path,
+        enable_syntax_explanation=enable_syntax_explanation,
+    )
 
 
 def extract_bytecode_major_minor(src: str) -> Optional[str]:
@@ -199,9 +210,10 @@ def attempt_repair(
     log_rec: Dict[str, Any],
     strategy_state: Dict[str, Dict[str, Any]],
     try_whole_file: bool,
-    outer_idx: int,
+    expansion_level: int,
     affected_file_path: Path,
     fetch_syntax_context,
+    enable_syntax_explanation: bool,
 ) -> Optional[RepairResult]:
     strategies = ["syntax_context"]
     if try_whole_file:
@@ -217,17 +229,18 @@ def attempt_repair(
         start_ln = None
         end_ln = None
         base_indent = None
+        anchor_indent = None
 
         if not try_whole_file:
             from pipeline.logging_utils import extract_line_number
 
             error_line = extract_line_number(error_description)
-            syntax_context = fetch_syntax_context(copy_dir, error_line, outer_idx)
+            syntax_context = fetch_syntax_context(copy_dir, error_line, error_description, expansion_level)
             if not syntax_context:
                 state["failures"] += 1
                 continue
 
-            initial_content, start_ln, end_ln, base_indent = syntax_context
+            initial_content, start_ln, end_ln, base_indent, anchor_indent = syntax_context
             with_pin_point = True
 
             if not initial_content:
@@ -240,7 +253,8 @@ def attempt_repair(
                 affected_file_path,
                 log_rec=log_rec,
                 llm=llm,
-                outer_idx=outer_idx,
+                expansion_level=expansion_level,
+                enable_syntax_explanation=enable_syntax_explanation,
             )
         else:
             initial_content = read_file(copy_dir)
@@ -250,7 +264,8 @@ def attempt_repair(
                 affected_file_path,
                 log_rec=log_rec,
                 llm=llm,
-                outer_idx=outer_idx,
+                expansion_level=expansion_level,
+                enable_syntax_explanation=enable_syntax_explanation,
             )
 
         if processed is None:
@@ -260,6 +275,6 @@ def attempt_repair(
 
         state["failures"] = 0
         final_code, llm_metrics = processed
-        return final_code, llm_metrics, with_pin_point, start_ln, end_ln, base_indent
+        return final_code, llm_metrics, with_pin_point, start_ln, end_ln, base_indent, anchor_indent
 
     return None

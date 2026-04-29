@@ -1,8 +1,12 @@
 import tiktoken
 from .providers import LLM_MODELS, OPEN_LLM_MODELS
-from google import genai
 from typing import Optional
 import os
+
+try:
+    from google import genai  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    genai = None
 
 SYSTEM_PROMPT_FOR_LOCAL = (
     "You are an expert Python programmer and syntax repair specialist.\n"
@@ -203,7 +207,7 @@ def count_tokens(text: str, encoding_name: str = "cl100k_base", model_name = "ge
     if not text:
         return 0
     
-    if encoding_name == LLM_MODELS[3]['provider']:
+    if encoding_name == LLM_MODELS[3]['provider'] and genai is not None:
         client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
         response = client.models.count_tokens(model=model_name, contents=text)
         return response.total_tokens

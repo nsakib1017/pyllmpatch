@@ -37,9 +37,9 @@ class RuntimeConfig:
     previous_run_log_path: Path | None
     delete_only_mode: bool
     enable_delete_only_fallback: bool
+    enable_syntax_explanation: bool
+    enable_whole_file_repair: bool
     use_local_llm: bool
-    config_idx_start: int
-    config_idx_range: int
     delete_only_infinite_iters: bool
     delete_only_max_iters: int
     delete_only_base_window: int
@@ -64,9 +64,9 @@ def load_runtime_config() -> RuntimeConfig:
         previous_run_log_path=previous_run_log_path,
         delete_only_mode=flag("DELETE_ONLY_MODE"),
         enable_delete_only_fallback=flag("ENABLE_DELETE_ONLY_FALLBACK", "1"),
+        enable_syntax_explanation=flag("ENABLE_SYNTAX_EXPLANATION", "1"),
+        enable_whole_file_repair=flag("ENABLE_WHOLE_FILE_REPAIR"),
         use_local_llm=flag("USE_LOCAL_LLM", "True"),
-        config_idx_start=int(os.getenv("CONFIG_IDX_START", 0)),
-        config_idx_range=int(os.getenv("CONFIG_IDX_RANGE", 1)),
         delete_only_infinite_iters=delete_only_infinite_iters,
         delete_only_max_iters=(10**9) if delete_only_infinite_iters else int(os.getenv("DELETE_ONLY_MAX_ITERS", "5000")),
         delete_only_base_window=int(os.getenv("DELETE_ONLY_BASE_WINDOW", "1")),
