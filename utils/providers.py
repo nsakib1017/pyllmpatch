@@ -26,7 +26,7 @@ class Colors:
     UNDERLINE = '\033[4m'
 
 LLM_MODELS = [
-    {'provider': 'OpenAI', 'name': 'gpt-4o', 'token_for_completion': 16384},
+    {'provider': 'OpenAI', 'name': 'gpt-5.5-1', 'token_for_completion': 16384},
     {'provider': 'DeepSeek', 'name': 'deepseek-chat', 'token_for_completion': 8192},
     {'provider': 'DeepSeek', 'name': 'deepseek-reasoner', 'token_for_completion': 8192},
     {'provider': 'Google', 'name': 'gemini-2.5-pro', 'token_for_completion': 65536},
@@ -82,11 +82,11 @@ OPEN_LLM_MODELS =  [
     # {'provider': 'Google', 'name': 'gemma-3-12b-it-unsloth-bnb-4bit', 'token_for_completion': 32768, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth/gemma-3-12b-it-unsloth-bnb-4bit/run_1769095208/checkpoint-200"}
 ]
 
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY") , base_url="https://api.openai.com/v1")
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY") , base_url="https://ai-for-cybersecurity-east2-resou.services.ai.azure.com/openai/v1")
 deepseek_client = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com")  
 google_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY")) if genai is not None else None
 
-def make_openai_call(prompt, model: str = "gpt-4o", provider: str = "OpenAI"):
+def make_openai_call(prompt, model: str = "gpt-5.5-1", provider: str = "OpenAI"):
         client = openai_client if provider == "OpenAI" else deepseek_client if provider == "DeepSeek" else None
         if not client:
             print("No client configured for the selected provider.")

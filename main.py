@@ -54,7 +54,6 @@ def build_parser() -> argparse.ArgumentParser:
     repair_loop.add_argument(
         "--llm-model",
         type=str,
-        default="gemini-2.5-pro",
         help="Model name from utils.providers for --fixer llm",
     )
     repair_loop.add_argument(
@@ -92,6 +91,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional file hash filter for dataset mode",
     )
+    repair_loop.add_argument(
+        "--source",
+        type=str,
+        default=None,
+        help="Optional source filter for dataset mode (for example VirusTotal, pylingual, or PyPi)",
+    )
     return parser
 
 
@@ -120,6 +125,7 @@ def main() -> None:
                 output_dir=args.output_dir,
                 limit=args.limit,
                 file_hash=args.file_hash,
+                source=args.source,
                 verify_with_pylingual=not args.skip_pylingual_verification,
                 verify_each_step_with_pylingual=not args.skip_step_verification,
                 reject_non_improving_candidates=not args.keep_non_improving,

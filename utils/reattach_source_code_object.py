@@ -1063,7 +1063,7 @@ def _should_accept_candidate(
     return False, "candidate did not improve combined distance or PyLingual success count"
 
 
-def _module_failed_line(verification: dict | None) -> int | None:
+def _module_failed_line(verification: dict | None, derived_code_object: Any | None = None) -> int | None:
     if verification is None:
         return None
     for result in verification.get("results", []):
@@ -1071,6 +1071,43 @@ def _module_failed_line(verification: dict | None) -> int | None:
             line_number = result.get("failed_line_number")
             if line_number is not None:
                 return int(line_number)
+            if derived_code_object is not None:
+                failed_offset = result.get("failed_offset")
+                inferred_line = _infer_line_number_from_instruction_records(
+                    _instruction_records(derived_code_object),
+                    None if failed_offset is None else int(failed_offset),
+                )
+                if inferred_line is not None:
+                    return inferred_line
+    return None
+
+
+def _infer_line_number_from_instruction_records(records: list[dict], failed_offset: int | None) -> int | None:
+    if not records:
+        return None
+
+    if failed_offset is None:
+        focus_index = 0
+    else:
+        exact = [record["index"] for record in records if record["offset"] == failed_offset]
+        if exact:
+            focus_index = exact[0]
+        else:
+            focus_index = min(
+                range(len(records)),
+                key=lambda idx: abs(int(records[idx]["offset"]) - int(failed_offset)),
+            )
+
+    for idx in range(focus_index, -1, -1):
+        starts_line = records[idx].get("starts_line")
+        if starts_line is not None:
+            return int(starts_line)
+
+    for idx in range(focus_index + 1, len(records)):
+        starts_line = records[idx].get("starts_line")
+        if starts_line is not None:
+            return int(starts_line)
+
     return None
 
 
@@ -1383,7 +1420,6 @@ def _store_semantic_step(
     file_hash: str | None = None,
 ) -> None:
     steps.append(step_record)
-    _append_semantic_step_log(log_file, run_id, step_record)
     repair_operation = step_record.get("repair_operation")
     qualname = step_record.get("qualname")
     iteration = step_record.get("iteration")
@@ -1673,7 +1709,7 @@ def repair_mismatching_code_objects(
                     )
                     continue
                 try:
-                    line_number = _module_failed_line(current_pylingual_verification)
+                    line_number = _module_failed_line(current_pylingual_verification, derived_bytecode)
                     if line_number is None:
                         raise ReattachError("module repair requires a PyLingual failed line; full-file module repair is disabled")
                     _, start_index, end_index = _find_top_level_statement_for_line(current_text, line_number)

@@ -338,7 +338,7 @@ def _dataset_fieldnames() -> list[str]:
         "file_hash",
         "source",
         "error_type",
-        "status",
+        "perfect_decompilation",
         "gt_pyc",
         "derived_pyc",
         "derived_source",
@@ -359,11 +359,15 @@ def _dataset_fieldnames() -> list[str]:
 def _dataset_result_row(row, result: dict, result_json_path: Path) -> dict:
     accepted_steps = sum(1 for step in result["steps"] if step["accepted"])
     verification = result.get("pylingual_verification")
+    if verification is None:
+        perfect_decompilation = None
+    else:
+        perfect_decompilation = bool(verification.get("all_equal") is True)
     return {
         "file_hash": row.file_hash,
         "source": row.source,
         "error_type": row.error_type,
-        "status": "repaired",
+        "perfect_decompilation": perfect_decompilation,
         "gt_pyc": result["gt_pyc"],
         "derived_pyc": result["derived_pyc"],
         "derived_source": result["derived_source"],
@@ -386,7 +390,7 @@ def _dataset_error_row(row, gt_pyc: Path | None, derived_pyc: Path | None, deriv
         "file_hash": row.file_hash,
         "source": row.source,
         "error_type": row.error_type,
-        "status": "failed",
+        "perfect_decompilation": None,
         "gt_pyc": str(gt_pyc) if gt_pyc else None,
         "derived_pyc": str(derived_pyc) if derived_pyc else None,
         "derived_source": str(derived_source) if derived_source else None,
@@ -404,6 +408,23 @@ def _dataset_error_row(row, gt_pyc: Path | None, derived_pyc: Path | None, deriv
     }
 
 
+def _filter_semantic_dataset_rows(
+    df: pd.DataFrame,
+    *,
+    source: str | None = None,
+    file_hash: str | None = None,
+    limit: int | None = None,
+) -> pd.DataFrame:
+    semantic_df = df[df["error_type"] == "semantic_error"].copy()
+    if source is not None:
+        semantic_df = semantic_df[semantic_df["source"].astype(str).str.lower() == str(source).lower()]
+    if file_hash is not None:
+        semantic_df = semantic_df[semantic_df["file_hash"].astype(str) == str(file_hash)]
+    if limit is not None:
+        semantic_df = semantic_df.head(limit)
+    return semantic_df
+
+
 def run_dataset_repair_loop(
     *,
     fixer_name: str,
@@ -411,6 +432,7 @@ def run_dataset_repair_loop(
     output_dir: Path | None = None,
     limit: int | None = None,
     file_hash: str | None = None,
+    source: str | None = None,
     verify_with_pylingual: bool = True,
     verify_each_step_with_pylingual: bool = True,
     reject_non_improving_candidates: bool = True,
@@ -430,11 +452,7 @@ def run_dataset_repair_loop(
     results_csv = log_base / f"semantic_repair_results_{dataset_path.stem}.csv"
 
     df = pd.read_csv(dataset_path)
-    semantic_df = df[df["error_type"] == "semantic_error"].copy()
-    if file_hash is not None:
-        semantic_df = semantic_df[semantic_df["file_hash"].astype(str) == str(file_hash)]
-    if limit is not None:
-        semantic_df = semantic_df.head(limit)
+    semantic_df = _filter_semantic_dataset_rows(df, source=source, file_hash=file_hash, limit=limit)
 
     processed = 0
     repaired = 0
@@ -612,6 +630,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional file hash filter for dataset-mode",
     )
+    parser.add_argument(
+        "--source",
+        type=str,
+        default=None,
+        help="Optional source filter for dataset-mode (for example VirusTotal, pylingual, or PyPi)",
+    )
     return parser
 
 
@@ -630,6 +654,7 @@ def main() -> int:
             output_dir=args.output_dir,
             limit=args.limit,
             file_hash=args.file_hash,
+            source=args.source,
             verify_with_pylingual=not args.skip_pylingual_verification,
             verify_each_step_with_pylingual=not args.skip_step_verification,
             reject_non_improving_candidates=not args.keep_non_improving,
