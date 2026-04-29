@@ -5,11 +5,12 @@ import ast
 import dis
 import json
 import os
+import re
 import sys
 import textwrap
 from collections.abc import Callable
-from typing import Any
 from pathlib import Path
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PYLINGUAL_ROOT = REPO_ROOT / "pylingual"
@@ -18,6 +19,8 @@ if str(REPO_ROOT) not in sys.path:
 if str(PYLINGUAL_ROOT) not in sys.path:
     sys.path.insert(0, str(PYLINGUAL_ROOT))
 
+from pipeline.config import now_iso
+from pipeline.logging_utils import append_log
 from utils.generate_bytecode import CompileError, compile_version
 from utils.map_source_code_objects import MappingError, map_source_to_pyc
 from utils.pyc_code_object_distance import (
@@ -785,9 +788,13 @@ def compile_source_to_pyc(source_path: Path, output_pyc: Path | None) -> Path:
     prior_uv_cache_dir = os.environ.get("UV_CACHE_DIR")
     os.environ["UV_CACHE_DIR"] = str((Path("/tmp") / "uv-cache").resolve())
     try:
+        source_text = source_path.read_text(encoding="utf-8")
+        ast.parse(source_text, filename=str(source_path))
         compile_version(source_path, output_pyc, (3, 10))
     except CompileError as exc:
         raise ReattachError(f"Python 3.10 compilation failed:\n{exc}") from exc
+    except SyntaxError as exc:
+        raise ReattachError(f"Python source parsing failed:\n{exc}") from exc
     finally:
         if prior_uv_cache_dir is None:
             os.environ.pop("UV_CACHE_DIR", None)
@@ -806,6 +813,12 @@ def infer_source_from_pyc(pyc_path: Path) -> Path:
     if pyc_path.parent.name == "__pycache__":
         stem = pyc_path.name.split(".cpython-", 1)[0]
         candidate = pyc_path.parent.parent / f"{stem}.py"
+        if candidate.is_file():
+            return candidate.resolve()
+    name = pyc_path.name
+    if ".cpython-" in name:
+        stem = name.split(".cpython-", 1)[0]
+        candidate = pyc_path.with_name(f"{stem}.py")
         if candidate.is_file():
             return candidate.resolve()
     candidate = pyc_path.with_suffix(".py")
@@ -1210,28 +1223,203 @@ def _module_failed_result(verification: dict | None) -> dict | None:
     return None
 
 
-def _build_module_repair_context(
+def _failed_result_for_target(verification: dict | None, qualname: str) -> dict | None:
+    if verification is None:
+        return None
+    for result in verification.get("results", []):
+        if result.get("names") == qualname and not result.get("success"):
+            return result
+    return None
+
+
+def _format_instruction_record(record: dict) -> str:
+    line = f"idx={record['index']} offset={record['offset']} line={record['starts_line']} {record['opname']}"
+    if record["argrepr"]:
+        line += f" {record['argrepr']}"
+    elif record["argval"] != "None":
+        line += f" {record['argval']}"
+    return line
+
+
+def _instruction_diff_context(
+    gt_code_object: Any,
+    derived_code_object: Any,
+    failed_offset: int | None,
     *,
+    radius: int = 3,
+) -> dict:
+    gt_records = _instruction_records(gt_code_object)
+    derived_records = _instruction_records(derived_code_object)
+    if not gt_records or not derived_records:
+        return {
+            "failed_offset": failed_offset,
+            "alignment_tag": "unavailable",
+            "instruction_diff": "<instruction diff unavailable>",
+        }
+
+    if failed_offset is None:
+        derived_index = 0
+    else:
+        exact = [record["index"] for record in derived_records if record["offset"] == failed_offset]
+        if exact:
+            derived_index = exact[0]
+        else:
+            derived_index = min(
+                range(len(derived_records)),
+                key=lambda idx: abs(int(derived_records[idx]["offset"]) - int(failed_offset)),
+            )
+
+    gt_start = max(0, min(derived_index, len(gt_records) - 1))
+    gt_end = gt_start + 1
+    derived_start = derived_index
+    derived_end = derived_index + 1
+    alignment_tag = "nearest_index"
+    sm = __import__("difflib").SequenceMatcher(
+        a=[_instruction_alignment_signature(record) for record in gt_records],
+        b=[_instruction_alignment_signature(record) for record in derived_records],
+    )
+    for tag, a1, a2, b1, b2 in sm.get_opcodes():
+        if b1 <= derived_index < max(b2, b1 + 1):
+            alignment_tag = tag
+            derived_start, derived_end = b1, b2
+            if tag == "equal" and b2 > b1:
+                gt_start = a1 + (derived_index - b1)
+                gt_end = gt_start + 1
+            else:
+                gt_start, gt_end = a1, a2
+            break
+
+    gt_window = _instruction_window(gt_records, gt_start, gt_end, radius)
+    derived_window = _instruction_window(derived_records, derived_start, derived_end, radius)
+    focus_offsets = {int(failed_offset)} if failed_offset is not None else set()
+    diff_lines: list[str] = []
+    max_len = max(len(gt_window), len(derived_window))
+    for idx in range(max_len):
+        gt_record = gt_window[idx] if idx < len(gt_window) else None
+        derived_record = derived_window[idx] if idx < len(derived_window) else None
+        marker = "=>" if (
+            (gt_record is not None and gt_record["offset"] in focus_offsets)
+            or (derived_record is not None and derived_record["offset"] in focus_offsets)
+        ) else "  "
+        if gt_record is None:
+            diff_lines.append(f"{marker} + derived: {_format_instruction_record(derived_record)}")
+            continue
+        if derived_record is None:
+            diff_lines.append(f"{marker} - gt: {_format_instruction_record(gt_record)}")
+            continue
+        if (
+            gt_record["opname"] == derived_record["opname"]
+            and gt_record["argval"] == derived_record["argval"]
+        ):
+            diff_lines.append(f"{marker} = {_format_instruction_record(gt_record)}")
+        else:
+            diff_lines.append(f"{marker} gt: {_format_instruction_record(gt_record)}")
+            diff_lines.append(f"{marker} derived: {_format_instruction_record(derived_record)}")
+
+    return {
+        "failed_offset": failed_offset,
+        "alignment_tag": alignment_tag,
+        "instruction_diff": "\n".join(diff_lines) if diff_lines else "<instruction diff unavailable>",
+    }
+
+
+def _build_target_repair_context(
+    *,
+    qualname: str,
     gt_code_object: Any,
     derived_code_object: Any,
     verification: dict | None,
-    line_number: int,
+    line_number: int | None = None,
     rejected_attempts: list[dict],
 ) -> dict:
-    failed_result = _module_failed_result(verification)
+    failed_result = _failed_result_for_target(verification, qualname)
     failed_offset = None if failed_result is None else failed_result.get("failed_offset")
-    instruction_context = _localized_instruction_context(
+    if line_number is None and failed_result is not None:
+        line_number = failed_result.get("failed_line_number")
+    instruction_context = _instruction_diff_context(
         gt_code_object,
         derived_code_object,
         None if failed_offset is None else int(failed_offset),
+        radius=2 if qualname != "<module>" else 3,
     )
     return {
-        "target_kind": "module_statement",
+        "target_kind": "module_statement" if qualname == "<module>" else "code_object_fragment",
+        "qualname": qualname,
         "localized_line_number": line_number,
+        "failed_offset": instruction_context.get("failed_offset"),
+        "alignment_tag": instruction_context.get("alignment_tag"),
         "pylingual_failed_result": failed_result,
-        "localized_instruction_context": instruction_context,
-        "rejected_attempts": rejected_attempts[-3:],
+        "instruction_diff": instruction_context.get("instruction_diff"),
+        "rejected_attempts": rejected_attempts[-1:],
     }
+
+
+def _append_semantic_step_log(log_file: Path | None, run_id: str | None, step_record: dict[str, Any]) -> None:
+    if log_file is None:
+        return
+    append_log(
+        log_file,
+        {
+            "run_id": run_id,
+            "timestamp": now_iso(),
+            "mode": "semantic_repair",
+            "stage": "step",
+            **step_record,
+        },
+    )
+
+
+def _semantic_print(message: str, *, indent: int = 0, tagged: bool = True) -> None:
+    prefix = "[semantic_repair] " if tagged else ""
+    print(f"{'  ' * max(0, indent)}{prefix}{message}", flush=True)
+
+
+def _store_semantic_step(
+    steps: list[dict],
+    step_record: dict[str, Any],
+    *,
+    log_file: Path | None = None,
+    run_id: str | None = None,
+    file_hash: str | None = None,
+) -> None:
+    steps.append(step_record)
+    _append_semantic_step_log(log_file, run_id, step_record)
+    repair_operation = step_record.get("repair_operation")
+    qualname = step_record.get("qualname")
+    iteration = step_record.get("iteration")
+    step = step_record.get("step")
+    accepted = step_record.get("accepted")
+    acceptance_reason = step_record.get("acceptance_reason")
+    target_before = step_record.get("target_score_before") or {}
+    target_after = step_record.get("target_score_after") or {}
+    before_distance = target_before.get("combined_distance") if isinstance(target_before, dict) else None
+    after_distance = target_after.get("combined_distance") if isinstance(target_after, dict) else None
+    status = "accepted" if accepted else "rejected"
+    _semantic_print(
+        f"-> step {step} iter {iteration} {qualname} ({repair_operation}) -> {status} "
+        f"(combined_distance {before_distance} -> {after_distance})",
+        indent=1,
+        tagged=False,
+    )
+    if acceptance_reason:
+        _semantic_print(f"-> reason: {acceptance_reason}", indent=2, tagged=False)
+
+
+def _announce_semantic_step(
+    *,
+    step_index: int,
+    iteration: int,
+    qualname: str,
+    repair_operation: str,
+    source_kind: str | None = None,
+    file_hash: str | None = None,
+) -> None:
+    extra = f" source_kind={source_kind}" if source_kind else ""
+    _semantic_print(
+        f"-> starting step {step_index} iter {iteration} {qualname} ({repair_operation}){extra}",
+        indent=1,
+        tagged=False,
+    )
 
 
 def _find_top_level_statement_for_line(source_text: str, line_number: int) -> tuple[ast.stmt, int, int]:
@@ -1341,9 +1529,13 @@ def repair_mismatching_code_objects(
     derived_pyc: Path,
     derived_source: Path,
     *,
+    gt_source: Path | None = None,
     output_dir: Path | None = None,
+    log_file: Path | None = None,
+    run_id: str | None = None,
+    file_hash: str | None = None,
     fragment_fixer: FragmentFixer | None = None,
-    strict_map: bool = True,
+    strict_map: bool = False,
     verify_with_pylingual: bool = True,
     verify_each_step_with_pylingual: bool = True,
     reject_non_improving_candidates: bool = True,
@@ -1352,7 +1544,7 @@ def repair_mismatching_code_objects(
     gt_pyc = validate_input(gt_pyc)
     derived_pyc = validate_input(derived_pyc)
     derived_source = derived_source.expanduser().resolve()
-    gt_source: Path | None = None
+    gt_source = gt_source.expanduser().resolve() if gt_source is not None else None
     gt_source_text: str | None = None
 
     def load_gt_source_text() -> tuple[Path, str]:
@@ -1462,7 +1654,8 @@ def repair_mismatching_code_objects(
                 if derived_bytecode is None:
                     raise ReattachError(f"No derived bytecode found for qualname: {qualname}")
                 if fragment_fixer is None:
-                    steps.append(
+                    _store_semantic_step(
+                        steps,
                         {
                             "step": step_index,
                             "iteration": iteration,
@@ -1473,7 +1666,10 @@ def repair_mismatching_code_objects(
                             "target_score_after": None,
                             "accepted": False,
                             "acceptance_reason": "module repair requires a fragment fixer",
-                        }
+                        },
+                        log_file=log_file,
+                        run_id=run_id,
+                        file_hash=file_hash,
                     )
                     continue
                 try:
@@ -1482,12 +1678,20 @@ def repair_mismatching_code_objects(
                         raise ReattachError("module repair requires a PyLingual failed line; full-file module repair is disabled")
                     _, start_index, end_index = _find_top_level_statement_for_line(current_text, line_number)
                     extracted_before = current_text[start_index:end_index]
-                    repair_context = _build_module_repair_context(
+                    repair_context = _build_target_repair_context(
+                        qualname=qualname,
                         gt_code_object=gt_bytecode,
                         derived_code_object=derived_bytecode,
                         verification=current_pylingual_verification,
                         line_number=line_number,
                         rejected_attempts=module_rejected_attempts,
+                    )
+                    _announce_semantic_step(
+                        step_index=step_index,
+                        iteration=iteration,
+                        qualname=qualname,
+                        repair_operation="repair_module_statement",
+                        file_hash=file_hash,
                     )
                     replacement_text = fragment_fixer(
                         qualname,
@@ -1515,7 +1719,7 @@ def repair_mismatching_code_objects(
                         reject_non_improving_candidates=reject_non_improving_candidates,
                     )
                     step["repair_context"] = repair_context
-                    steps.append(step)
+                    _store_semantic_step(steps, step, log_file=log_file, run_id=run_id, file_hash=file_hash)
                     if accepted:
                         accepted_this_iteration += 1
                         current_source = next_source
@@ -1542,7 +1746,8 @@ def repair_mismatching_code_objects(
                             "acceptance_reason": f"module repair candidate unavailable: {exc}",
                         }
                     )
-                    steps.append(
+                    _store_semantic_step(
+                        steps,
                         {
                             "step": step_index,
                             "iteration": iteration,
@@ -1553,7 +1758,10 @@ def repair_mismatching_code_objects(
                             "target_score_after": None,
                             "accepted": False,
                             "acceptance_reason": f"module repair candidate unavailable: {exc}",
-                        }
+                        },
+                        log_file=log_file,
+                        run_id=run_id,
+                        file_hash=file_hash,
                     )
                 continue
             target_row = _find_target_row(current_source, current_pyc, qualname, strict_map=strict_map)
@@ -1566,17 +1774,32 @@ def repair_mismatching_code_objects(
                 raise ReattachError(f"No ground-truth code object found for qualname: {qualname}")
             if derived_code_object is None:
                 raise ReattachError(f"No derived code object found for qualname: {qualname}")
+            repair_context = _build_target_repair_context(
+                qualname=qualname,
+                gt_code_object=gt_code_object,
+                derived_code_object=derived_code_object,
+                verification=current_pylingual_verification,
+                rejected_attempts=[],
+            )
             if fragment_fixer is None:
                 source_path, source_text = load_gt_source_text()
                 gt_row = _find_target_row(source_path, gt_pyc, qualname, strict_map=strict_map)
                 replacement_text = extract_source_segment(source_text, gt_row)
             else:
+                _announce_semantic_step(
+                    step_index=step_index,
+                    iteration=iteration,
+                    qualname=qualname,
+                    repair_operation="repair_source_fragment",
+                    source_kind=target_row.get("source_kind"),
+                    file_hash=file_hash,
+                )
                 replacement_text = fragment_fixer(
                     qualname,
                     gt_code_object,
                     derived_code_object,
                     extracted_before,
-                    None,
+                    repair_context,
                 )
             replacement_text = normalize_semantic_replacement_indentation(
                 replacement_text,
@@ -1609,7 +1832,8 @@ def repair_mismatching_code_objects(
             if not reject_non_improving_candidates:
                 accepted = True
                 acceptance_reason = "candidate retained without acceptance filtering"
-            steps.append(
+            _store_semantic_step(
+                steps,
                 {
                     "step": step_index,
                     "iteration": iteration,
@@ -1627,7 +1851,10 @@ def repair_mismatching_code_objects(
                     "pylingual_verification": step_pylingual_verification,
                     "accepted": accepted,
                     "acceptance_reason": acceptance_reason,
-                }
+                },
+                log_file=log_file,
+                run_id=run_id,
+                file_hash=file_hash,
             )
             if accepted:
                 accepted_this_iteration += 1
@@ -1660,7 +1887,8 @@ def repair_mismatching_code_objects(
                 target_row = _find_target_row(current_source, current_pyc, qualname, strict_map=strict_map)
             except ReattachError as exc:
                 unsupported_extra_targets.add(qualname)
-                steps.append(
+                _store_semantic_step(
+                    steps,
                     {
                         "step": step_index,
                         "iteration": iteration,
@@ -1670,13 +1898,17 @@ def repair_mismatching_code_objects(
                         "target_score_after": None,
                         "accepted": False,
                         "acceptance_reason": f"extra source could not be mapped: {exc}",
-                    }
+                    },
+                    log_file=log_file,
+                    run_id=run_id,
+                    file_hash=file_hash,
                 )
                 continue
 
             if target_row["source_kind"] not in {"function", "async_function", "class"}:
                 unsupported_extra_targets.add(qualname)
-                steps.append(
+                _store_semantic_step(
+                    steps,
                     {
                         "step": step_index,
                         "iteration": iteration,
@@ -1686,7 +1918,10 @@ def repair_mismatching_code_objects(
                         "target_score_after": None,
                         "accepted": False,
                         "acceptance_reason": f"extra source kind is not safely statement-deletable: {target_row['source_kind']}",
-                    }
+                    },
+                    log_file=log_file,
+                    run_id=run_id,
+                    file_hash=file_hash,
                 )
                 continue
 
@@ -1715,7 +1950,8 @@ def repair_mismatching_code_objects(
                     fragment_path.write_text(replacement_text, encoding="utf-8")
                 except ReattachError as fallback_exc:
                     unsupported_extra_targets.add(qualname)
-                    steps.append(
+                    _store_semantic_step(
+                        steps,
                         {
                             "step": step_index,
                             "iteration": iteration,
@@ -1732,7 +1968,10 @@ def repair_mismatching_code_objects(
                             "accepted": False,
                             "acceptance_reason": f"deletion candidate did not compile: {fallback_exc}",
                             "initial_compile_error": compile_error,
-                        }
+                        },
+                        log_file=log_file,
+                        run_id=run_id,
+                        file_hash=file_hash,
                     )
                     continue
 
@@ -1755,7 +1994,8 @@ def repair_mismatching_code_objects(
             if not reject_non_improving_candidates:
                 accepted = True
                 acceptance_reason = "candidate retained without acceptance filtering"
-            steps.append(
+            _store_semantic_step(
+                steps,
                 {
                     "step": step_index,
                     "iteration": iteration,
@@ -1773,7 +2013,10 @@ def repair_mismatching_code_objects(
                     "pylingual_verification": step_pylingual_verification,
                     "accepted": accepted,
                     "acceptance_reason": acceptance_reason,
-                }
+                },
+                log_file=log_file,
+                run_id=run_id,
+                file_hash=file_hash,
             )
             if accepted:
                 accepted_this_iteration += 1
@@ -1810,7 +2053,8 @@ def repair_mismatching_code_objects(
                 gt_row = _find_target_row(source_path, gt_pyc, qualname, strict_map=strict_map)
                 if gt_row["source_kind"] not in {"function", "async_function", "class"}:
                     unsupported_missing_targets.add(qualname)
-                    steps.append(
+                    _store_semantic_step(
+                        steps,
                         {
                             "step": step_index,
                             "iteration": iteration,
@@ -1818,18 +2062,36 @@ def repair_mismatching_code_objects(
                             "repair_operation": "insert_missing",
                             "accepted": False,
                             "acceptance_reason": f"missing source kind is not statement-insertable: {gt_row['source_kind']}",
-                        }
+                        },
+                    log_file=log_file,
+                    run_id=run_id,
+                    file_hash=file_hash,
                     )
                     continue
                 gt_fragment = extract_source_segment(source_text, gt_row)
                 replacement_text = gt_fragment
             else:
+                repair_context = _build_target_repair_context(
+                    qualname=qualname,
+                    gt_code_object=gt_code_object,
+                    derived_code_object=current_code_objects.get(qualname),
+                    verification=current_pylingual_verification,
+                    rejected_attempts=[],
+                )
+                _announce_semantic_step(
+                    step_index=step_index,
+                    iteration=iteration,
+                    qualname=qualname,
+                    repair_operation="insert_missing",
+                    source_kind=parent_row.get("source_kind") if parent_row is not None else None,
+                    file_hash=file_hash,
+                )
                 replacement_text = fragment_fixer(
                     qualname,
                     gt_code_object,
                     current_code_objects.get(qualname),
                     insertion_context,
-                    None,
+                    repair_context,
                 )
 
             updated_text, parent_qualname, insertion_indent = insert_missing_source_segment(
@@ -1868,7 +2130,8 @@ def repair_mismatching_code_objects(
             if not reject_non_improving_candidates:
                 accepted = True
                 acceptance_reason = "candidate retained without acceptance filtering"
-            steps.append(
+            _store_semantic_step(
+                steps,
                 {
                     "step": step_index,
                     "iteration": iteration,
@@ -1888,7 +2151,10 @@ def repair_mismatching_code_objects(
                     "pylingual_verification": step_pylingual_verification,
                     "accepted": accepted,
                     "acceptance_reason": acceptance_reason,
-                }
+                },
+                log_file=log_file,
+                run_id=run_id,
+                file_hash=file_hash,
             )
             if accepted:
                 accepted_this_iteration += 1

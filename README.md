@@ -104,7 +104,6 @@ Optional semantic repair flags:
 ```bash
 --dataset-path /path/to/dataset.csv
 --file-hash <hash>
---strict-map
 --skip-pylingual-verification
 --skip-step-verification
 --keep-non-improving

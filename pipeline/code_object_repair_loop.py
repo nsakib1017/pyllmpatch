@@ -13,7 +13,7 @@ import pandas as pd
 
 from pipeline.config import BASE_DATASET_PATH, build_run_paths, current_run_timestamp, now_iso
 from pipeline.logging_utils import append_log
-from utils.file_helpers import fetch_pyllmpatch_repair_paths, strip_code_fences
+from utils.file_helpers import fetch_pyllmpatch_repair_paths, fetch_pyllmpatch_source_path, strip_code_fences
 from utils.providers import find_llm_config, make_llm_call_from_config
 from utils.reattach_source_code_object import (
     _find_target_row,
@@ -25,9 +25,10 @@ from utils.reattach_source_code_object import (
 SEMANTIC_REPAIR_SYSTEM_PROMPT = """You are a Python bytecode-aware semantic repair specialist.
 
 You will receive:
-- the target ground-truth Python code object metadata and either disassembly or a localized instruction window
-- the current derived Python code object metadata and either disassembly or a localized instruction window
-- the source fragment from the derived source file that produced the derived code object
+- the target ground-truth Python code object metadata
+- the current derived Python code object metadata
+- a localized instruction diff derived from the ground-truth and derived bytecode
+- the editable source fragment from the derived source file
 
 Edit only the provided source fragment. Preserve the same public names, function/class boundary, decorators, parameters, and return shape unless the bytecode evidence clearly requires a small change. Make the minimal source changes that best align the derived code object with the ground-truth code object. Keep relative indentation valid. Return only the repaired Python source fragment, with no markdown fences and no explanation.
 """
@@ -77,11 +78,23 @@ def _format_code_object_summary_for_prompt(code_object: Any) -> str:
     return "\n".join(fields)
 
 
-def _format_repair_context(repair_context: dict | None) -> str:
+def _format_module_code_object_for_prompt(code_object: Any) -> str:
+    if code_object is None:
+        return "<missing>"
+    fields = [
+        f"co_name: {getattr(code_object, 'co_name', None)}",
+        f"co_firstlineno: {getattr(code_object, 'co_firstlineno', None)}",
+        f"co_flags: {getattr(code_object, 'co_flags', None)}",
+    ]
+    return "\n".join(fields)
+
+
+def _format_repair_context(repair_context: dict | None, *, module_mode: bool = False) -> str:
     if not repair_context:
         return ""
-    instruction_context = repair_context.get("localized_instruction_context", {})
     rejected_attempts = repair_context.get("rejected_attempts") or []
+    if module_mode and rejected_attempts:
+        rejected_attempts = rejected_attempts[-1:]
     rejected_text = "<none>"
     if rejected_attempts:
         rejected_text = "\n\n".join(
@@ -94,19 +107,15 @@ def _format_repair_context(repair_context: dict | None) -> str:
     failed = repair_context.get("pylingual_failed_result") or {}
     return f"""Localized repair context:
 - target_kind: {repair_context.get("target_kind")}
+- qualname: {repair_context.get("qualname")}
 - localized_line_number: {repair_context.get("localized_line_number")}
-- failed_offset: {instruction_context.get("failed_offset")}
-- alignment_tag: {instruction_context.get("alignment_tag")}
+- failed_offset: {repair_context.get("failed_offset")}
+- alignment_tag: {repair_context.get("alignment_tag")}
 - pylingual_message: {failed.get("message")}
 
-Ground-truth instruction window:
+Instruction diff:
 ```text
-{instruction_context.get("gt_instruction_window", "<unavailable>")}
-```
-
-Current derived instruction window:
-```text
-{instruction_context.get("derived_instruction_window", "<unavailable>")}
+{repair_context.get("instruction_diff", "<unavailable>")}
 ```
 
 Previous rejected attempts:
@@ -124,19 +133,19 @@ def build_semantic_repair_messages(
 ) -> list[dict]:
     if qualname == "<module>":
         task_text = "Edit only the localized top-level module source statement. Preserve valid Python syntax and make the smallest source change that best aligns the module bytecode with the ground-truth module bytecode."
+        gt_code_object_text = _format_module_code_object_for_prompt(gt_code_object)
+        derived_code_object_text = _format_module_code_object_for_prompt(derived_code_object)
         source_label = "Current derived top-level module statement"
-        gt_code_object_text = _format_code_object_summary_for_prompt(gt_code_object)
-        derived_code_object_text = _format_code_object_summary_for_prompt(derived_code_object)
     elif derived_code_object is None:
         task_text = "The target code object is missing from the derived bytecode. Synthesize only the missing Python source fragment that should be inserted into the derived source."
-        source_label = "Derived insertion context"
         gt_code_object_text = _format_code_object_for_prompt(gt_code_object)
         derived_code_object_text = _format_code_object_for_prompt(derived_code_object)
+        source_label = "Derived insertion context"
     else:
         task_text = "Edit only the current derived source fragment."
-        source_label = "Current derived source fragment"
         gt_code_object_text = _format_code_object_for_prompt(gt_code_object)
         derived_code_object_text = _format_code_object_for_prompt(derived_code_object)
+        source_label = "Current derived source fragment"
 
     user_prompt = f"""Task: {task_text}
 
@@ -148,7 +157,7 @@ Ground-truth code object:
 Current derived code object:
 {derived_code_object_text}
 
-{_format_repair_context(repair_context)}
+{_format_repair_context(repair_context, module_mode=qualname == "<module>")}
 
 {source_label}:
 ```python
@@ -177,9 +186,9 @@ class FragmentFixer(ABC):
 
 
 class OracleFragmentFixer(FragmentFixer):
-    def __init__(self, gt_pyc: Path):
+    def __init__(self, gt_pyc: Path, gt_source: Path | None = None):
         self.gt_pyc = gt_pyc.expanduser().resolve()
-        self.gt_source = infer_source_from_pyc(self.gt_pyc)
+        self.gt_source = gt_source.expanduser().resolve() if gt_source is not None else infer_source_from_pyc(self.gt_pyc)
         self.gt_source_text = self.gt_source.read_text(encoding="utf-8")
 
     def generate_candidate(
@@ -195,7 +204,7 @@ class OracleFragmentFixer(FragmentFixer):
         del derived_code_object
         del derived_source_fragment
         del repair_context
-        row = _find_target_row(self.gt_source, self.gt_pyc, qualname, strict_map=True)
+        row = _find_target_row(self.gt_source, self.gt_pyc, qualname, strict_map=False)
         return extract_source_segment(self.gt_source_text, row)
 
 
@@ -203,6 +212,12 @@ class LLMFragmentFixer(FragmentFixer):
     def __init__(self, *, provider: str = "Google", model: str = "gemini-2.5-flash-lite"):
         self.llm_config = find_llm_config(provider, model)
         self.calls: list[dict] = []
+        self.prompt_output_dir: Path | None = None
+        self._prompt_call_index = 0
+
+    def set_prompt_output_dir(self, prompt_output_dir: Path | None) -> None:
+        self.prompt_output_dir = None if prompt_output_dir is None else prompt_output_dir.expanduser().resolve()
+        self._prompt_call_index = 0
 
     def generate_candidate(
         self,
@@ -220,25 +235,51 @@ class LLMFragmentFixer(FragmentFixer):
             derived_source_fragment=derived_source_fragment,
             repair_context=repair_context,
         )
+        prompt_record = {
+            "provider": self.llm_config["provider"],
+            "model": self.llm_config["name"],
+            "qualname": qualname,
+            "messages": messages,
+            "system_prompt": messages[0]["content"] if messages else None,
+            "user_prompt": messages[1]["content"] if len(messages) > 1 else None,
+        }
         started = time.perf_counter()
         response = make_llm_call_from_config(messages, self.llm_config)
         elapsed_ms = int((time.perf_counter() - started) * 1000)
-        content = strip_code_fences(response)
-        self.calls.append(
+        response_text = strip_code_fences(response)
+        content = response_text.strip()
+        prompt_record.update(
             {
-                "provider": self.llm_config["provider"],
-                "model": self.llm_config["name"],
                 "latency_ms": elapsed_ms,
                 "usage": None if response is None else str(response.get("usage")),
-                "qualname": qualname,
+                "response_text": response_text,
+                "returned_text": content if content else derived_source_fragment,
             }
         )
-        return content or derived_source_fragment
+        if self.prompt_output_dir is not None:
+            self.prompt_output_dir.mkdir(parents=True, exist_ok=True)
+            self._prompt_call_index += 1
+            safe_qualname = (
+                qualname.replace("<", "").replace(">", "").replace(".", "_").replace("/", "_").replace("\\", "_")
+            )
+            prompt_path = self.prompt_output_dir / f"{self._prompt_call_index:04d}_{safe_qualname}.json"
+            prompt_path.write_text(json.dumps(prompt_record, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+        self.calls.append(prompt_record)
+        return content if content else derived_source_fragment
 
 
 class CodeObjectRepairLoop:
     def __init__(self, fixer: FragmentFixer):
         self.fixer = fixer
+
+    def _set_prompt_output_dir(self, output_dir: Path | None, derived_source: Path) -> None:
+        prompt_dir: Path | None
+        if output_dir is None:
+            prompt_dir = derived_source.parent / f"{derived_source.stem}_repair_pipeline" / "prompts"
+        else:
+            prompt_dir = output_dir / "prompts"
+        if hasattr(self.fixer, "set_prompt_output_dir"):
+            getattr(self.fixer, "set_prompt_output_dir")(prompt_dir)
 
     def run(
         self,
@@ -247,19 +288,25 @@ class CodeObjectRepairLoop:
         derived_pyc: Path,
         derived_source: Path,
         output_dir: Path | None = None,
-        strict_map: bool = True,
+        log_file: Path | None = None,
+        run_id: str | None = None,
+        file_hash: str | None = None,
         verify_with_pylingual: bool = True,
         verify_each_step_with_pylingual: bool = True,
         reject_non_improving_candidates: bool = True,
         max_iterations: int = 1,
     ) -> dict:
+        self._set_prompt_output_dir(output_dir, derived_source)
         result = repair_mismatching_code_objects(
             gt_pyc=gt_pyc,
             derived_pyc=derived_pyc,
             derived_source=derived_source,
             output_dir=output_dir,
+            log_file=log_file,
+            run_id=run_id,
+            file_hash=file_hash,
             fragment_fixer=self._fix_fragment,
-            strict_map=strict_map,
+            strict_map=False,
             verify_with_pylingual=verify_with_pylingual,
             verify_each_step_with_pylingual=verify_each_step_with_pylingual,
             reject_non_improving_candidates=reject_non_improving_candidates,
@@ -364,7 +411,6 @@ def run_dataset_repair_loop(
     output_dir: Path | None = None,
     limit: int | None = None,
     file_hash: str | None = None,
-    strict_map: bool = True,
     verify_with_pylingual: bool = True,
     verify_each_step_with_pylingual: bool = True,
     reject_non_improving_candidates: bool = True,
@@ -400,9 +446,10 @@ def run_dataset_repair_loop(
 
         for row in semantic_df.itertuples(index=False):
             processed += 1
+            gt_source = fetch_pyllmpatch_source_path(row.file_hash, row.source)
             gt_pyc, derived_pyc, derived_source = fetch_pyllmpatch_repair_paths(row.file_hash, row.source)
-            if gt_pyc is None or derived_pyc is None or derived_source is None:
-                error_row = _dataset_error_row(row, gt_pyc, derived_pyc, derived_source, "Could not resolve gt_pyc, derived_pyc, and/or derived_source")
+            if gt_source is None or gt_pyc is None or derived_pyc is None or derived_source is None:
+                error_row = _dataset_error_row(row, gt_pyc, derived_pyc, derived_source, "Could not resolve gt_source, gt_pyc, derived_pyc, and/or derived_source")
                 writer.writerow(error_row)
                 append_log(
                     log_file,
@@ -410,6 +457,7 @@ def run_dataset_repair_loop(
                         "run_id": run_id,
                         "timestamp": now_iso(),
                         "mode": "semantic_repair",
+                        "stage": "error",
                         **error_row,
                     },
                 )
@@ -423,17 +471,20 @@ def run_dataset_repair_loop(
                 if fixer_name not in {"oracle", "llm"}:
                     raise ValueError(f"Unsupported fixer backend: {fixer_name}")
                 fixer = (
-                    OracleFragmentFixer(gt_pyc)
+                    OracleFragmentFixer(gt_pyc, gt_source)
                     if fixer_name == "oracle"
                     else LLMFragmentFixer(provider=llm_provider, model=llm_model)
                 )
                 loop = CodeObjectRepairLoop(fixer)
+                print(f"[semantic_repair] file_hash={row.file_hash}", flush=True)
                 result = loop.run(
                     gt_pyc=gt_pyc,
                     derived_pyc=derived_pyc,
                     derived_source=derived_source,
                     output_dir=row_output_dir,
-                    strict_map=strict_map,
+                    log_file=log_file,
+                    run_id=run_id,
+                    file_hash=str(row.file_hash),
                     verify_with_pylingual=verify_with_pylingual,
                     verify_each_step_with_pylingual=verify_each_step_with_pylingual,
                     reject_non_improving_candidates=reject_non_improving_candidates,
@@ -448,6 +499,7 @@ def run_dataset_repair_loop(
                         "run_id": run_id,
                         "timestamp": now_iso(),
                         "mode": "semantic_repair",
+                        "stage": "result",
                         **result_row,
                     },
                 )
@@ -461,6 +513,7 @@ def run_dataset_repair_loop(
                         "run_id": run_id,
                         "timestamp": now_iso(),
                         "mode": "semantic_repair",
+                        "stage": "error",
                         **error_row,
                     },
                 )
@@ -490,11 +543,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Directory for intermediate repaired files and fragments",
-    )
-    parser.add_argument(
-        "--strict-map",
-        action="store_true",
-        help="Require strict source-to-pyc mapping for span lookup",
     )
     parser.add_argument(
         "--skip-pylingual-verification",
@@ -582,7 +630,6 @@ def main() -> int:
             output_dir=args.output_dir,
             limit=args.limit,
             file_hash=args.file_hash,
-            strict_map=args.strict_map,
             verify_with_pylingual=not args.skip_pylingual_verification,
             verify_each_step_with_pylingual=not args.skip_step_verification,
             reject_non_improving_candidates=not args.keep_non_improving,
@@ -604,7 +651,6 @@ def main() -> int:
             derived_pyc=args.derived_pyc,
             derived_source=args.derived_source,
             output_dir=args.output_dir,
-            strict_map=args.strict_map,
             verify_with_pylingual=not args.skip_pylingual_verification,
             verify_each_step_with_pylingual=not args.skip_step_verification,
             reject_non_improving_candidates=not args.keep_non_improving,

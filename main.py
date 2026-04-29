@@ -25,11 +25,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory for intermediate repaired files and fragments",
     )
     repair_loop.add_argument(
-        "--strict-map",
-        action="store_true",
-        help="Require strict source-to-pyc mapping for span lookup",
-    )
-    repair_loop.add_argument(
         "--skip-pylingual-verification",
         action="store_true",
         help="Disable final and per-step PyLingual equivalence checks",
@@ -59,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     repair_loop.add_argument(
         "--llm-model",
         type=str,
-        default="gemini-2.5-flash-lite",
+        default="gemini-2.5-pro",
         help="Model name from utils.providers for --fixer llm",
     )
     repair_loop.add_argument(
@@ -125,7 +120,6 @@ def main() -> None:
                 output_dir=args.output_dir,
                 limit=args.limit,
                 file_hash=args.file_hash,
-                strict_map=args.strict_map,
                 verify_with_pylingual=not args.skip_pylingual_verification,
                 verify_each_step_with_pylingual=not args.skip_step_verification,
                 reject_non_improving_candidates=not args.keep_non_improving,
@@ -147,7 +141,6 @@ def main() -> None:
                 derived_pyc=args.derived_pyc,
                 derived_source=args.derived_source,
                 output_dir=args.output_dir,
-                strict_map=args.strict_map,
                 verify_with_pylingual=not args.skip_pylingual_verification,
                 verify_each_step_with_pylingual=not args.skip_step_verification,
                 reject_non_improving_candidates=not args.keep_non_improving,

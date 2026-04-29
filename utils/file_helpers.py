@@ -58,6 +58,60 @@ def _first_matching_pyc(directory: Path, pattern: str) -> Optional[Path]:
     return candidates[0] if candidates else None
 
 
+def _first_matching_file(directory: Path, pattern: str) -> Optional[Path]:
+    candidates = sorted(
+        p for p in directory.glob(pattern)
+        if p.is_file()
+    )
+    return candidates[0] if candidates else None
+
+
+def _choose_source_py(hash_dir: Path) -> Optional[Path]:
+    candidates = [
+        p for p in hash_dir.iterdir()
+        if p.is_file()
+        and p.suffix == ".py"
+        and not p.name.startswith("decompiled")
+    ]
+
+    if not candidates:
+        return None
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def _find_decompiled_source_py(out_dir: Path, pyc_file: Path | None = None) -> Optional[Path]:
+    if pyc_file is not None:
+        expected_name = f"decompiled_{pyc_file.name.replace('.pyc', '.py')}"
+        expected_path = out_dir / expected_name
+        if expected_path.exists():
+            return expected_path
+
+    candidates = list(out_dir.rglob("decompiled_*.py"))
+    if not candidates:
+        return None
+
+    if pyc_file is not None:
+        pyc_stem = pyc_file.stem
+
+        exact_stem_matches = [p for p in candidates if p.stem == f"decompiled_{pyc_stem}"]
+        if exact_stem_matches:
+            exact_stem_matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            return exact_stem_matches[0]
+
+        loose_matches = [p for p in candidates if pyc_stem in p.stem]
+        if loose_matches:
+            loose_matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            return loose_matches[0]
+
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
 def fetch_pyllmpatch_pyc_paths(file_hash: str, source: str) -> Tuple[Optional[Path], Optional[Path]]:
     file_hash = norm_str(file_hash)
     source = norm_str(source)
@@ -72,8 +126,8 @@ def fetch_pyllmpatch_pyc_paths(file_hash: str, source: str) -> Tuple[Optional[Pa
         return None, None
 
     if is_pypi:
-        original_pyc = _first_matching_pyc(hash_dir / "__pycache__", "*.cpython-310.pyc")
-        indented_pyc = _first_matching_pyc(
+        original_pyc = _first_matching_file(hash_dir / "__pycache__", "*.cpython-310.pyc")
+        indented_pyc = _first_matching_file(
             hash_dir / "decompiled_output_pylingual" / "__pycache__",
             "decompiled_*.cpython-310.pyc",
         )
@@ -85,6 +139,27 @@ def fetch_pyllmpatch_pyc_paths(file_hash: str, source: str) -> Tuple[Optional[Pa
     indented_pyc = highest_indented[0] if highest_indented else None
 
     return original_pyc, indented_pyc
+
+
+def fetch_pyllmpatch_source_path(file_hash: str, source: str) -> Optional[Path]:
+    file_hash = norm_str(file_hash)
+    source = norm_str(source)
+
+    if not file_hash or not source:
+        return None
+
+    is_pypi = source == "PyPi"
+    hash_dir = (BASE_DIR_PYTHON_FILES_PYPI if is_pypi else BASE_DIR_PYTHON_FILES_PYLINGUAL) / file_hash
+
+    if not hash_dir.exists():
+        return None
+
+    if is_pypi:
+        return _choose_source_py(hash_dir)
+
+    indented_dir = hash_dir / "decompiler_output"
+    highest_indented = highest_indented_file(indented_dir, "indented_*.py")
+    return highest_indented[0] if highest_indented else None
 
 
 def fetch_pyllmpatch_repair_paths(file_hash: str, source: str) -> Tuple[Optional[Path], Optional[Path], Optional[Path]]:
@@ -102,7 +177,7 @@ def fetch_pyllmpatch_repair_paths(file_hash: str, source: str) -> Tuple[Optional
         return gt_pyc, derived_pyc, None
 
     if is_pypi:
-        derived_source = _first_matching_pyc(hash_dir / "decompiled_output_pylingual", "decompiled_*.py")
+        derived_source = _find_decompiled_source_py(hash_dir / "decompiled_output_pylingual", derived_pyc)
         return gt_pyc, derived_pyc, derived_source
 
     indented_dir = hash_dir / "decompiler_output"
