@@ -1,4 +1,5 @@
 import ast
+from dataclasses import dataclass
 import shutil
 import io
 import pandas as pd
@@ -51,6 +52,9 @@ SYNTAX_ERROR_INDENTATION_HINTS = (
     "unexpected indent",
     "unindent does not match",
     "expected ':'",
+)
+SYNTAX_ERROR_NUMERIC_HINTS = (
+    "invalid decimal literal",
 )
 
 def highest_indented_file(
@@ -397,6 +401,28 @@ def _syntax_context_result(block_lines: List[str], start_idx: int, end_idx: int)
     )
 
 
+@dataclass(frozen=True)
+class SyntaxSegment:
+    text: str
+    start_line: int
+    end_line: int
+    base_indent: str
+    anchor_indent: str
+    segment_kind: str
+    line_roles: tuple[str, ...]
+
+
+def _syntax_segment_roles(line_count: int) -> tuple[str, ...]:
+    if line_count <= 0:
+        return tuple()
+    if line_count == 1:
+        return ("B/E",)
+    roles = ["I"] * line_count
+    roles[0] = "B"
+    roles[-1] = "E"
+    return tuple(roles)
+
+
 
 def build_triple_quote_mask(lines):
     """Return a mask showing whether each line is inside a triple-quoted string."""
@@ -438,7 +464,26 @@ def _syntax_error_category(error_description: str | None) -> str:
         return "delimiter"
     if any(marker in lowered for marker in SYNTAX_ERROR_INDENTATION_HINTS):
         return "indentation"
+    if any(marker in lowered for marker in SYNTAX_ERROR_NUMERIC_HINTS):
+        return "numeric"
     return "generic"
+
+
+def _line_has_token_shape_issue(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return False
+
+    malformed_number_re = re.compile(r"\b\d+(?:\.\d+){2,}\b")
+    malformed_identifier_re = re.compile(r"\b\d[A-Za-z_:][\w:]*\b")
+    if malformed_number_re.search(line) or malformed_identifier_re.search(line):
+        return True
+
+    if "=" in line:
+        lhs = line.split("=", 1)[0].strip()
+        if lhs and (lhs[0].isdigit() or ":" in lhs or "." in lhs or re.search(r"\d[A-Za-z_:]", lhs)):
+            return True
+    return False
 
 
 def _syntax_context_strategy_order(error_description: str | None) -> list[str]:
@@ -450,6 +495,9 @@ def _syntax_context_strategy_order(error_description: str | None) -> list[str]:
 
     if category == "indentation":
         return ["block", "line", "delimiter"] if prefer_blocks else ["line", "block", "delimiter"]
+
+    if category == "numeric":
+        return ["line", "delimiter", "block"]
 
     if prefer_blocks:
         return ["block", "line", "delimiter"]
@@ -470,6 +518,19 @@ def _syntax_context_for_strategy(
     if strategy == "line":
         return fetch_based_on_lines(file_path, error_line, expansion_level)
     return None
+
+
+def _syntax_context_for_strategy_with_kind(
+    strategy: str,
+    file_path: Path,
+    error_line: int,
+    error_description: str | None,
+    expansion_level: int,
+) -> Optional[tuple[Tuple[str, int, int, str, str], str]]:
+    context = _syntax_context_for_strategy(strategy, file_path, error_line, error_description, expansion_level)
+    if context is None:
+        return None
+    return context, strategy
 
 
 def _find_string_opener_line(lines: list[str], scan_limit: int, prefer_fstring: bool = False) -> tuple[int, int] | None:
@@ -775,6 +836,14 @@ def fetch_syntax_context(
     if error_line is None:
         return None
 
+    content = read_file(file_path)
+    if content is None:
+        return None
+
+    lines = content.splitlines()
+    if not lines:
+        return None
+
     start_expansion = max(0, int(expansion_level))
     max_expansion = start_expansion + MAX_SYNTAX_CONTEXT_EXPANSION_STEPS
     strategy_order = _syntax_context_strategy_order(error_description)
@@ -783,9 +852,10 @@ def fetch_syntax_context(
 
     for extra_expansion in range(start_expansion, max_expansion + 1):
         for strategy in strategy_order:
-            context = _syntax_context_for_strategy(strategy, file_path, error_line, error_description, extra_expansion)
-            if context is None:
+            context_with_kind = _syntax_context_for_strategy_with_kind(strategy, file_path, error_line, error_description, extra_expansion)
+            if context_with_kind is None:
                 continue
+            context, _ = context_with_kind
 
             span = max(0, context[2] - context[1])
             if _syntax_context_parses(context[0]):
@@ -796,6 +866,35 @@ def fetch_syntax_context(
                 best_span = span
 
     return best_context
+
+
+def segment_syntax_context(
+    file_path: Path,
+    error_line: int,
+    error_description: str | None = None,
+    expansion_level: int = 0,
+) -> Optional[SyntaxSegment]:
+    context = fetch_syntax_context(
+        file_path=file_path,
+        error_line=error_line,
+        error_description=error_description,
+        expansion_level=expansion_level,
+    )
+    if context is None:
+        return None
+
+    text, start_line, end_line, base_indent, anchor_indent = context
+    line_count = max(1, end_line - start_line + 1)
+    segment_kind = "statement" if line_count == 1 else "block"
+    return SyntaxSegment(
+        text=text,
+        start_line=start_line,
+        end_line=end_line,
+        base_indent=base_indent,
+        anchor_indent=anchor_indent,
+        segment_kind=segment_kind,
+        line_roles=_syntax_segment_roles(line_count),
+    )
     
 
 def normalize_lines(text: str) -> List[str]:

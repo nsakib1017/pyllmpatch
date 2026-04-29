@@ -212,7 +212,7 @@ def attempt_repair(
     try_whole_file: bool,
     expansion_level: int,
     affected_file_path: Path,
-    fetch_syntax_context,
+    segment_syntax_context,
     enable_syntax_explanation: bool,
 ) -> Optional[RepairResult]:
     strategies = ["syntax_context"]
@@ -235,12 +235,22 @@ def attempt_repair(
             from pipeline.logging_utils import extract_line_number
 
             error_line = extract_line_number(error_description)
-            syntax_context = fetch_syntax_context(copy_dir, error_line, error_description, expansion_level)
-            if not syntax_context:
+            syntax_segment = segment_syntax_context(copy_dir, error_line, error_description, expansion_level)
+            if not syntax_segment:
                 state["failures"] += 1
                 continue
 
-            initial_content, start_ln, end_ln, base_indent, anchor_indent = syntax_context
+            log_rec.update(
+                {
+                    "segment_kind": syntax_segment.segment_kind,
+                    "segment_line_roles": list(syntax_segment.line_roles),
+                }
+            )
+            initial_content = syntax_segment.text
+            start_ln = syntax_segment.start_line
+            end_ln = syntax_segment.end_line
+            base_indent = syntax_segment.base_indent
+            anchor_indent = syntax_segment.anchor_indent
             with_pin_point = True
 
             if not initial_content:

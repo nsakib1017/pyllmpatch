@@ -17,7 +17,8 @@ SYSTEM_PROMPT_FOR_LOCAL = (
     "Do NOT refactor, reformat, rename symbols, or modify any code that is already syntactically valid.\n\n"
 
     "The provided error message is for reference only and may point to the wrong line. "
-    "You must inspect surrounding lines and earlier code to identify the true root cause of any syntax error.\n\n"
+    "You must inspect surrounding lines and earlier code to identify the true root cause of any syntax error. "
+    "If the error description does not match the snippet exactly, trust the snippet and its local structure over the reported line number.\n\n"
 
     "If there are orphaned 'break', 'continue', or similar statements that cause invalid syntax, "
     "you may add the smallest possible syntactic wrapper (such as a dummy loop) solely to make the code syntactically valid.\n"
@@ -80,6 +81,8 @@ USER_PROMPT_TEMPLATE_LOCAL = (
     "{error_message}\n\n"
     "Initial code snippet:\n"
     "{code_snippet}\n\n"
+    "The error message may describe a different location than the snippet. "
+    "Use the snippet and surrounding structure as the source of truth when they disagree.\n\n"
     "Explanation of the root cause of the syntax error (CONTEXT ONLY — do not repeat or paraphrase):\n"
     "{current_explanation}\n\n"
     "Apply minimal syntax-only fixes based on the code and the explanation above.\n"
@@ -94,6 +97,8 @@ USER_PROMPT_TEMPLATE_LOCAL_WITHOUT_EXPLANATION = (
     "{error_message}\n\n"
     "Initial code snippet:\n"
     "{code_snippet}\n\n"
+    "The error message may describe a different location than the snippet. "
+    "Use the snippet and surrounding structure as the source of truth when they disagree.\n\n"
     "Apply minimal syntax-only fixes based on the code above.\n"
     "Output ONLY the corrected Python code.\n"
     "If the code contains no syntax errors or the errors cannot be fixed, return the code unchanged."
@@ -163,6 +168,7 @@ def get_user_prompt(code_snippet: str, error_message: str, retry_attempt=False, 
         "It is highly important that you find and fix every syntax error present in the snippet. \n"
         "Apply the modifications required to fix the errors within the snippet.\n"
         "You must ensure that the corrected snippet does not introduce any new syntax errors.\n"
+        "If the reported error line or description does not match the snippet exactly, trust the snippet and its local structure over the reported line.\n"
 
         "## Initial Error Message was:  ##\n"
         f"{error_message}\n\n"

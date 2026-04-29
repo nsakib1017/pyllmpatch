@@ -17,7 +17,7 @@ from pipeline.config import (
 from pipeline.dataset import filter_dataset_rows, prepare_snippets_for_repair, resolve_syntax_dataset_source_path
 from pipeline.logging_utils import append_log, extract_line_number, failure_cleanup
 from utils.delete_only_compilation import delete_lines_until_compilable_with_oracle
-from utils.file_helpers import align_indentation, copy_file, create_file_from_response, fetch_syntax_context, get_error_word_message_from_content, norm_str, read_file, reattach_block
+from utils.file_helpers import align_indentation, copy_file, create_file_from_response, get_error_word_message_from_content, norm_str, read_file, reattach_block, segment_syntax_context
 from utils.generate_bytecode import CompileError, compile_version
 from utils.providers import Colors
 from utils.version import PythonVersion
@@ -241,7 +241,7 @@ def run_experiment(config: RuntimeConfig, *, source: str | None = None, limit: i
                         try_whole_file=try_whole_file,
                         expansion_level=total_attempts_completed,
                         affected_file_path=affected_file_path,
-                        fetch_syntax_context=fetch_syntax_context,
+                        segment_syntax_context=segment_syntax_context,
                         enable_syntax_explanation=config.enable_syntax_explanation,
                     )
                     if repair_result is None:
