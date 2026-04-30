@@ -39,6 +39,8 @@ You will receive:
 Edit only the provided source fragment. Preserve the same public names, function/class boundary, decorators, parameters, and return shape unless the bytecode evidence clearly requires a small change. Make the minimal source changes that best align the derived code object with the ground-truth code object. Keep relative indentation valid. Return only the repaired Python source fragment, with no markdown fences and no explanation.
 """
 
+SEMANTIC_PROMPT_VARIANT = "semantic_v4_indent_contract_line_numbers_compact_metadata"
+
 INDENTATION_CONTRACT = """Indentation contract:
 - Preserve the first line's relative indentation exactly as shown.
 - If the fragment starts with `def`, `async def`, or `class`, do not dedent or reindent that header.
@@ -359,7 +361,12 @@ def _format_repair_context(repair_context: dict | None, *, module_mode: bool = F
             for item in rejected_attempts
         )
     failed = repair_context.get("pylingual_failed_result") or {}
-    return f"""Failure context:
+    heuristic_hint = repair_context.get("rendered_heuristic_hint")
+    heuristic_section = f"""Likely source issue:
+{heuristic_hint}
+
+""" if heuristic_hint else ""
+    return f"""{heuristic_section}Failure context:
 - target_kind: {repair_context.get("target_kind")}
 - qualname: {repair_context.get("qualname")}
 - localized_line_number: {repair_context.get("localized_line_number")}
@@ -377,7 +384,27 @@ Previous rejected attempts:
 """
 
 
-def build_semantic_repair_messages(
+def _prompt_feature_flags(user_prompt: str, repair_context: dict | None) -> dict[str, bool]:
+    return {
+        "indentation_contract": "Indentation contract:" in user_prompt,
+        "line_numbered_source": bool(re.search(r"(?m)^\d{3,}\| ", user_prompt)),
+        "compact_metadata": "Identical fields:" in user_prompt or "co_firstlineno:" not in user_prompt,
+        "localized_instruction_diff": _instruction_diff_available(repair_context),
+        "bytecode_evidence_fallback": "Bytecode evidence fallback:" in user_prompt,
+        "rejected_attempt_feedback": bool(repair_context and repair_context.get("rejected_attempts")),
+        "heuristic_hint": bool(repair_context and repair_context.get("rendered_heuristic_hint")),
+        "gt_instruction_window": bool(repair_context and repair_context.get("gt_instruction_window")),
+        "derived_instruction_window": bool(repair_context and repair_context.get("derived_instruction_window")),
+    }
+
+
+def _public_repair_context(repair_context: dict | None) -> dict | None:
+    if repair_context is None:
+        return None
+    return {key: value for key, value in repair_context.items() if not str(key).startswith("_")}
+
+
+def build_semantic_repair_prompt_payload(
     *,
     qualname: str,
     gt_code_object: Any,
@@ -386,7 +413,7 @@ def build_semantic_repair_messages(
     repair_context: dict | None = None,
     gt_bytecode: Any | None = None,
     derived_bytecode: Any | None = None,
-) -> list[dict]:
+) -> dict:
     if qualname == "<module>":
         task_text = "Edit only the localized top-level module source statement. Preserve valid Python syntax and make the smallest source change that best aligns the module bytecode with the ground-truth module bytecode."
         source_label = "Current derived top-level module statement"
@@ -409,11 +436,71 @@ def build_semantic_repair_messages(
         derived_bytecode=derived_bytecode,
         repair_context=repair_context,
     )
-    bytecode_section = f"\n\n{bytecode_evidence}" if bytecode_evidence else ""
     source_start_line = 1
     if repair_context and repair_context.get("source_lineno") is not None:
         source_start_line = int(repair_context["source_lineno"])
-    numbered_fragment = _format_line_numbered_source_fragment(derived_source_fragment, start_line=source_start_line)
+    line_numbered_source_fragment = _format_line_numbered_source_fragment(derived_source_fragment, start_line=source_start_line)
+    public_context = _public_repair_context(repair_context)
+    return {
+        "prompt_variant": SEMANTIC_PROMPT_VARIANT,
+        "task_text": task_text,
+        "target_qualname": qualname,
+        "source_label": source_label,
+        "source_fragment": derived_source_fragment,
+        "line_numbered_source_fragment": line_numbered_source_fragment,
+        "source_start_line": source_start_line,
+        "indentation_contract": INDENTATION_CONTRACT,
+        "repair_context": public_context,
+        "heuristic_context": {
+            "detected_heuristics": [] if not repair_context else repair_context.get("detected_heuristics", []),
+            "rendered_heuristic_hint": None if not repair_context else repair_context.get("rendered_heuristic_hint"),
+        },
+        "bytecode_context": None if not repair_context else {
+            "gt_instruction_range": repair_context.get("gt_instruction_range"),
+            "derived_instruction_range": repair_context.get("derived_instruction_range"),
+            "gt_instruction_window": repair_context.get("gt_instruction_window"),
+            "derived_instruction_window": repair_context.get("derived_instruction_window"),
+            "instruction_diff": repair_context.get("instruction_diff"),
+            "instruction_renderer_version": repair_context.get("instruction_renderer_version"),
+            "bytecode_window_radius": repair_context.get("bytecode_window_radius"),
+            "bytecode_window_max_records": repair_context.get("bytecode_window_max_records"),
+            "bytecode_window_truncated": repair_context.get("bytecode_window_truncated"),
+        },
+        "metadata_context": {
+            "metadata_text": metadata_text,
+            "gt_code_object_metadata": _code_object_prompt_values(gt_code_object),
+            "derived_code_object_metadata": _code_object_prompt_values(derived_code_object),
+        },
+        "bytecode_evidence_fallback": bytecode_evidence or None,
+        "return_contract": "Return only the repaired source fragment.",
+    }
+
+
+def build_semantic_repair_messages(
+    *,
+    qualname: str,
+    gt_code_object: Any,
+    derived_code_object: Any,
+    derived_source_fragment: str,
+    repair_context: dict | None = None,
+    gt_bytecode: Any | None = None,
+    derived_bytecode: Any | None = None,
+) -> list[dict]:
+    payload = build_semantic_repair_prompt_payload(
+        qualname=qualname,
+        gt_code_object=gt_code_object,
+        derived_code_object=derived_code_object,
+        derived_source_fragment=derived_source_fragment,
+        repair_context=repair_context,
+        gt_bytecode=gt_bytecode,
+        derived_bytecode=derived_bytecode,
+    )
+    task_text = payload["task_text"]
+    source_label = payload["source_label"]
+    metadata_text = payload["metadata_context"]["metadata_text"]
+    bytecode_evidence = payload["bytecode_evidence_fallback"]
+    bytecode_section = f"\n\n{bytecode_evidence}" if bytecode_evidence else ""
+    numbered_fragment = payload["line_numbered_source_fragment"]
 
     user_prompt = f"""Task: {task_text}
 
@@ -495,6 +582,13 @@ class LLMFragmentFixer(FragmentFixer):
         derived_source_fragment: str,
         repair_context: dict | None = None,
     ) -> str:
+        prompt_reconstruction_inputs = build_semantic_repair_prompt_payload(
+            qualname=qualname,
+            gt_code_object=gt_code_object,
+            derived_code_object=derived_code_object,
+            derived_source_fragment=derived_source_fragment,
+            repair_context=repair_context,
+        )
         messages = build_semantic_repair_messages(
             qualname=qualname,
             gt_code_object=gt_code_object,
@@ -506,6 +600,11 @@ class LLMFragmentFixer(FragmentFixer):
             "provider": self.llm_config["provider"],
             "model": self.llm_config["name"],
             "qualname": qualname,
+            "prompt_variant": SEMANTIC_PROMPT_VARIANT,
+            "prompt_features": _prompt_feature_flags(messages[1]["content"] if len(messages) > 1 else "", repair_context),
+            "detected_heuristics": [] if not repair_context else repair_context.get("detected_heuristics", []),
+            "rendered_heuristic_hint": None if not repair_context else repair_context.get("rendered_heuristic_hint"),
+            "prompt_reconstruction_inputs": prompt_reconstruction_inputs,
             "messages": messages,
             "system_prompt": messages[0]["content"] if messages else None,
             "user_prompt": messages[1]["content"] if len(messages) > 1 else None,
@@ -533,7 +632,10 @@ class LLMFragmentFixer(FragmentFixer):
             )
             prompt_path = self.prompt_output_dir / f"{self._prompt_call_index:04d}_{safe_qualname}.json"
             prompt_path.write_text(json.dumps(prompt_record, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+            prompt_record["prompt_path"] = str(prompt_path)
         self.calls.append(prompt_record)
+        if repair_context is not None:
+            repair_context["_llm_prompt_record"] = prompt_record
         return content if content else derived_source_fragment
 
 

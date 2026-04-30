@@ -1323,7 +1323,112 @@ def select_missing_repair_targets(distance_rows: list[dict]) -> list[str]:
         if row["status"] == "missing"
         and row["gt_name"]
         and row["gt_name"] != "<module>"
+        and not _is_expression_child_qualname(row["gt_name"])
     ]
+
+
+EXPRESSION_CHILD_QUALNAME_PARTS = (
+    ".<lambda>",
+    ".<listcomp>",
+    ".<dictcomp>",
+    ".<setcomp>",
+    ".<genexpr>",
+)
+
+
+def _is_expression_child_qualname(qualname: str | None) -> bool:
+    return bool(qualname and any(part in qualname for part in EXPRESSION_CHILD_QUALNAME_PARTS))
+
+
+def _expression_child_parent_qualname(qualname: str | None) -> str | None:
+    if not qualname:
+        return None
+    text = str(qualname)
+    split_points = [
+        text.index(part)
+        for part in EXPRESSION_CHILD_QUALNAME_PARTS
+        if part in text
+    ]
+    if not split_points:
+        return None
+    return text[: min(split_points)]
+
+
+def select_missing_expression_child_parent_targets(distance_rows: list[dict]) -> list[str]:
+    """Route missing expression-level children to their enclosing code object.
+
+    Lambdas and comprehensions are expression-level source, so standalone
+    insertion is usually underconstrained. Repairing the parent gives the model
+    the expression that must create the child code object.
+    """
+    available_names = {
+        name
+        for row in distance_rows
+        for name in (row.get("gt_name"), row.get("derived_name"))
+        if name
+    }
+    parents = []
+    for row in distance_rows:
+        if row.get("status") != "missing":
+            continue
+        parent = _expression_child_parent_qualname(row.get("gt_name"))
+        if parent and parent in available_names and parent != "<module>":
+            parents.append(parent)
+    return sorted(set(parents), key=lambda name: (_qualname_depth(name), name))
+
+
+def _expression_child_kind(qualname: str | None) -> str | None:
+    if not qualname:
+        return None
+    for part in EXPRESSION_CHILD_QUALNAME_PARTS:
+        if part in qualname:
+            return part.strip(".<>")
+    return None
+
+
+def _detected_heuristics_for_qualname(distance_rows: list[dict], qualname: str) -> list[dict]:
+    heuristics = []
+    for row in distance_rows:
+        if row.get("status") != "missing":
+            continue
+        child_qualname = row.get("gt_name")
+        parent = _expression_child_parent_qualname(child_qualname)
+        if parent != qualname:
+            continue
+        child_kind = _expression_child_kind(child_qualname)
+        heuristics.append(
+            {
+                "name": "missing_expression_child_routed_to_parent",
+                "category": "missing_expression_child",
+                "confidence": 0.95,
+                "evidence": {
+                    "child_kind": child_kind,
+                    "child_qualname": child_qualname,
+                    "parent_qualname": parent,
+                },
+                "hint_rendered": True,
+                "hint_text": (
+                    f"A missing {child_kind or 'expression child'} is expression-level source; "
+                    "repair the enclosing parent expression instead of inserting a standalone child fragment."
+                ),
+            }
+        )
+    return heuristics
+
+
+def _render_heuristic_hint(heuristics: list[dict]) -> str | None:
+    if not heuristics:
+        return None
+    lines = []
+    for heuristic in heuristics:
+        hint_text = heuristic.get("hint_text")
+        evidence = heuristic.get("evidence") or {}
+        child_qualname = evidence.get("child_qualname")
+        if hint_text:
+            lines.append(f"- {hint_text}")
+        if child_qualname:
+            lines.append(f"- Missing child code object: `{child_qualname}`.")
+    return "\n".join(lines) if lines else None
 
 
 def select_extra_repair_targets(distance_rows: list[dict]) -> list[str]:
@@ -1861,12 +1966,21 @@ def _instruction_diff_context(
         f"gt_range=[{gt_start}:{gt_end}]; derived_range=[{derived_start}:{derived_end}]; "
         f"failed_offset={failed_offset}"
     )
-    if len(diff_lines) > 40:
+    bytecode_window_truncated = len(diff_lines) > 40
+    if bytecode_window_truncated:
         diff_lines = diff_lines[:20] + ["  ... <instruction diff truncated> ..."] + diff_lines[-20:]
 
     return {
         "failed_offset": failed_offset,
         "alignment_tag": alignment_tag,
+        "gt_instruction_range": [gt_start, gt_end],
+        "derived_instruction_range": [derived_start, derived_end],
+        "gt_instruction_window": gt_window,
+        "derived_instruction_window": derived_window,
+        "bytecode_window_radius": radius,
+        "bytecode_window_max_records": 40,
+        "bytecode_window_truncated": bytecode_window_truncated,
+        "instruction_renderer_version": "editable_bytecode_v1",
         "instruction_diff": "\n".join([summary, *diff_lines]) if diff_lines else "<instruction diff unavailable>",
     }
 
@@ -1879,6 +1993,7 @@ def _build_target_repair_context(
     verification: dict | None,
     line_number: int | None = None,
     rejected_attempts: list[dict],
+    detected_heuristics: list[dict] | None = None,
 ) -> dict:
     failed_result = _failed_result_for_target(verification, qualname)
     failed_offset = None if failed_result is None else failed_result.get("failed_offset")
@@ -1898,23 +2013,193 @@ def _build_target_repair_context(
         "alignment_tag": instruction_context.get("alignment_tag"),
         "pylingual_failed_result": failed_result,
         "instruction_diff": instruction_context.get("instruction_diff"),
+        "gt_instruction_range": instruction_context.get("gt_instruction_range"),
+        "derived_instruction_range": instruction_context.get("derived_instruction_range"),
+        "gt_instruction_window": instruction_context.get("gt_instruction_window"),
+        "derived_instruction_window": instruction_context.get("derived_instruction_window"),
+        "bytecode_window_radius": instruction_context.get("bytecode_window_radius"),
+        "bytecode_window_max_records": instruction_context.get("bytecode_window_max_records"),
+        "bytecode_window_truncated": instruction_context.get("bytecode_window_truncated"),
+        "instruction_renderer_version": instruction_context.get("instruction_renderer_version"),
+        "detected_heuristics": detected_heuristics or [],
+        "rendered_heuristic_hint": _render_heuristic_hint(detected_heuristics or []),
         "rejected_attempts": rejected_attempts[-1:],
     }
 
 
-def _append_semantic_step_log(log_file: Path | None, run_id: str | None, step_record: dict[str, Any]) -> None:
+def _compact_semantic_step_record(step_record: dict[str, Any]) -> dict[str, Any]:
+    """Keep the normal run log small; heavy prompt data goes to accepted JSONL."""
+    compact = dict(step_record)
+    repair_context = compact.pop("repair_context", None)
+    if isinstance(repair_context, dict):
+        compact["repair_context_summary"] = {
+            "target_kind": repair_context.get("target_kind"),
+            "qualname": repair_context.get("qualname"),
+            "localized_line_number": repair_context.get("localized_line_number"),
+            "failed_offset": repair_context.get("failed_offset"),
+            "alignment_tag": repair_context.get("alignment_tag"),
+            "has_instruction_diff": bool(repair_context.get("instruction_diff")),
+            "detected_heuristic_names": [
+                item.get("name")
+                for item in repair_context.get("detected_heuristics", [])
+                if isinstance(item, dict)
+            ],
+            "has_llm_prompt_record": bool(repair_context.get("_llm_prompt_record")),
+        }
+    return compact
+
+
+def _append_semantic_step_log(log_file: Path | None, run_id: str | None, file_hash: str | None, step_record: dict[str, Any]) -> None:
     if log_file is None:
         return
     append_log(
         log_file,
-        {
+        _json_safe(
+            {
             "run_id": run_id,
             "timestamp": now_iso(),
             "mode": "semantic_repair",
             "stage": "step",
-            **step_record,
-        },
+            "file_hash": file_hash,
+            **_compact_semantic_step_record(step_record),
+            }
+        ),
     )
+
+
+def _json_safe(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def _accepted_code_object_dataset_path(log_file: Path | None) -> Path | None:
+    if log_file is None:
+        return None
+    return log_file.expanduser().resolve().parent / "semantic_repair_accepted_code_objects.jsonl"
+
+
+def _success_count_from_verification(verification: dict | None) -> int | None:
+    if verification is None:
+        return None
+    return _count_pylingual_successes(verification)
+
+
+def _failed_targets_from_verification(verification: dict | None) -> list[str]:
+    if verification is None:
+        return []
+    return [
+        str(result.get("names"))
+        for result in verification.get("results", [])
+        if result.get("names") and not result.get("success")
+    ]
+
+
+def _accepted_code_object_dataset_record(
+    *,
+    run_id: str | None,
+    file_hash: str | None,
+    step_record: dict[str, Any],
+) -> dict[str, Any]:
+    repair_context = step_record.get("repair_context") or {}
+    pylingual_after = step_record.get("pylingual_verification")
+    prompt_record = repair_context.get("_llm_prompt_record")
+    return _json_safe({
+        "run_id": run_id,
+        "timestamp": now_iso(),
+        "source_file_hash": file_hash,
+        "qualname": step_record.get("qualname"),
+        "repair_operation": step_record.get("repair_operation"),
+        "iteration": step_record.get("iteration"),
+        "step": step_record.get("step"),
+        "accepted": step_record.get("accepted"),
+        "acceptance_reason": step_record.get("acceptance_reason"),
+        "target_kind": repair_context.get("target_kind"),
+        "source_kind": step_record.get("source_kind"),
+        "extracted_before": step_record.get("extracted_before"),
+        "replacement_text": step_record.get("replacement_text"),
+        "target_score_before": step_record.get("target_score_before"),
+        "target_score_after": step_record.get("target_score_after"),
+        "combined_distance_delta": _step_combined_distance_delta(step_record),
+        "reattachment": {
+            "candidate_kind": step_record.get("reattachment_candidate_kind"),
+            "parse_ok": step_record.get("reattachment_parse_ok"),
+            "parse_error": step_record.get("reattachment_parse_error"),
+            "structure_ok": step_record.get("reattachment_structure_ok"),
+            "structure_reason": step_record.get("reattachment_structure_reason"),
+        },
+        "bytecode_context": {
+            "failed_offset": repair_context.get("failed_offset"),
+            "alignment_tag": repair_context.get("alignment_tag"),
+            "gt_range": repair_context.get("gt_instruction_range"),
+            "derived_range": repair_context.get("derived_instruction_range"),
+            "gt_instruction_window": repair_context.get("gt_instruction_window"),
+            "derived_instruction_window": repair_context.get("derived_instruction_window"),
+            "instruction_diff": repair_context.get("instruction_diff"),
+            "window_radius": repair_context.get("bytecode_window_radius"),
+            "window_max_records": repair_context.get("bytecode_window_max_records"),
+            "window_truncated": repair_context.get("bytecode_window_truncated"),
+            "renderer_version": repair_context.get("instruction_renderer_version"),
+        },
+        "pylingual_after": {
+            "all_equal": None if pylingual_after is None else pylingual_after.get("all_equal"),
+            "success_count": _success_count_from_verification(pylingual_after),
+            "failed_targets": _failed_targets_from_verification(pylingual_after),
+        },
+        "detected_heuristics": repair_context.get("detected_heuristics") or [],
+        "rendered_heuristic_hint": repair_context.get("rendered_heuristic_hint"),
+        "heuristic_outcome": step_record.get("heuristic_outcome") or [],
+        "prompt": prompt_record,
+    })
+
+
+def _append_accepted_code_object_dataset(log_file: Path | None, run_id: str | None, file_hash: str | None, step_record: dict[str, Any]) -> None:
+    if not step_record.get("accepted"):
+        return
+    path = _accepted_code_object_dataset_path(log_file)
+    if path is None:
+        return
+    append_log(
+        path,
+        _accepted_code_object_dataset_record(
+            run_id=run_id,
+            file_hash=file_hash,
+            step_record=step_record,
+        ),
+    )
+
+
+def _step_combined_distance_delta(step_record: dict[str, Any]) -> int | None:
+    before = step_record.get("target_score_before") or {}
+    after = step_record.get("target_score_after") or {}
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return None
+    before_distance = before.get("combined_distance")
+    after_distance = after.get("combined_distance")
+    if before_distance is None or after_distance is None:
+        return None
+    return int(after_distance) - int(before_distance)
+
+
+def _attach_heuristic_outcome(step_record: dict[str, Any]) -> None:
+    repair_context = step_record.get("repair_context") or {}
+    heuristics = repair_context.get("detected_heuristics") or step_record.get("detected_heuristics") or []
+    if not heuristics or step_record.get("heuristic_outcome"):
+        return
+    distance_delta = _step_combined_distance_delta(step_record)
+    accepted = bool(step_record.get("accepted"))
+    likely_helped = "weak_true" if accepted and (distance_delta is None or distance_delta <= 0) else "false_or_insufficient"
+    step_record["heuristic_outcome"] = [
+        {
+            "name": heuristic.get("name"),
+            "present": True,
+            "prompt_hint_rendered": bool(heuristic.get("hint_rendered")),
+            "accepted": accepted,
+            "combined_distance_delta": distance_delta,
+            "acceptance_reason": step_record.get("acceptance_reason"),
+            "likely_helped": likely_helped,
+            "label_source": "automatic_weak",
+        }
+        for heuristic in heuristics
+    ]
 
 
 def _semantic_print(message: str, *, indent: int = 0, tagged: bool = True) -> None:
@@ -1930,6 +2215,7 @@ def _store_semantic_step(
     run_id: str | None = None,
     file_hash: str | None = None,
 ) -> None:
+    _attach_heuristic_outcome(step_record)
     steps.append(step_record)
     repair_operation = step_record.get("repair_operation")
     qualname = step_record.get("qualname")
@@ -1950,6 +2236,8 @@ def _store_semantic_step(
     )
     if acceptance_reason:
         _semantic_print(f"-> reason: {acceptance_reason}", indent=2, tagged=False)
+    _append_semantic_step_log(log_file, run_id, file_hash, step_record)
+    _append_accepted_code_object_dataset(log_file, run_id, file_hash, step_record)
 
 
 def _announce_semantic_step(
@@ -2157,6 +2445,16 @@ def repair_mismatching_code_objects(
             if target_attempt_counts.get(qualname, 0) < max_iterations
             and _pylingual_target_is_equal(current_pylingual_verification, qualname) is not True
         ]
+        expression_child_parent_targets = [
+            qualname
+            for qualname in select_missing_expression_child_parent_targets(iteration_rows)
+            if target_attempt_counts.get(qualname, 0) < max_iterations
+            and _pylingual_target_is_equal(current_pylingual_verification, qualname) is not True
+        ]
+        iteration_targets = sorted(
+            set(iteration_targets + expression_child_parent_targets),
+            key=lambda name: (_qualname_depth(name), name),
+        )
         iteration_missing_targets = [
             qualname
             for qualname in select_missing_repair_targets(iteration_rows)
@@ -2337,6 +2635,7 @@ def repair_mismatching_code_objects(
                 derived_code_object=derived_bytecode,
                 verification=current_pylingual_verification,
                 rejected_attempts=[],
+                detected_heuristics=_detected_heuristics_for_qualname(iteration_rows, qualname),
             )
             if fragment_fixer is None:
                 source_path, source_text = load_gt_source_text()
@@ -2405,6 +2704,7 @@ def repair_mismatching_code_objects(
                     "step": step_index,
                     "iteration": iteration,
                     "qualname": qualname,
+                    "source_kind": target_row.get("source_kind"),
                     "fragment_path": str(fragment_path),
                     "output_source": str(next_source),
                     "output_pyc": str(next_pyc),
@@ -2421,6 +2721,7 @@ def repair_mismatching_code_objects(
                     "target_score_after": target_score_after,
                     "summary": step_summary,
                     "pylingual_verification": step_pylingual_verification,
+                    "repair_context": repair_context,
                     "accepted": accepted,
                     "acceptance_reason": acceptance_reason,
                 },
@@ -2712,6 +3013,7 @@ def repair_mismatching_code_objects(
                     "qualname": qualname,
                     "repair_operation": "insert_missing",
                     "parent_qualname": parent_qualname,
+                    "source_kind": parent_row.get("source_kind") if parent_row is not None else None,
                     "fragment_path": str(fragment_path),
                     "output_source": str(next_source),
                     "output_pyc": str(next_pyc),
@@ -2723,6 +3025,7 @@ def repair_mismatching_code_objects(
                     "target_score_after": target_score_after,
                     "summary": step_summary,
                     "pylingual_verification": step_pylingual_verification,
+                    "repair_context": repair_context if fragment_fixer is not None else None,
                     "accepted": accepted,
                     "acceptance_reason": acceptance_reason,
                 },

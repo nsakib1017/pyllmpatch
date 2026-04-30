@@ -27,6 +27,7 @@ class Colors:
 
 LLM_MODELS = [
     {'provider': 'OpenAI', 'name': 'gpt-5.5-1', 'token_for_completion': 16384},
+    {'provider': 'OpenAI', 'name': 'gpt-5.4-mini', 'token_for_completion': 16384},
     {'provider': 'DeepSeek', 'name': 'deepseek-chat', 'token_for_completion': 8192},
     {'provider': 'DeepSeek', 'name': 'deepseek-reasoner', 'token_for_completion': 8192},
     {'provider': 'Google', 'name': 'gemini-2.5-pro', 'token_for_completion': 65536},
