@@ -165,8 +165,8 @@ def main() -> None:
                 max_iterations=args.max_iterations,
             )
         if args.json_out is not None:
-            args.json_out.expanduser().resolve().write_text(json.dumps(result, indent=2), encoding="utf-8")
-        print(json.dumps(result, indent=2))
+            args.json_out.expanduser().resolve().write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+        print(json.dumps(result, indent=2, default=str))
         return
 
     raise ValueError(f"Unknown command: {command}")

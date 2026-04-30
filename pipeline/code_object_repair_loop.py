@@ -205,7 +205,28 @@ def _code_object_prompt_values(code_object: Any) -> dict[str, Any]:
     if code_object is None:
         return {}
     code_object = _code_object_from_prompt_object(code_object)
-    return {field: getattr(code_object, field, None if field != "co_consts" else ()) for field in CODE_OBJECT_PROMPT_FIELDS}
+
+    def serialize_value(value: Any) -> Any:
+        if hasattr(value, "co_name") and hasattr(value, "co_consts"):
+            return {
+                "co_name": getattr(value, "co_name", None),
+                "co_qualname": getattr(value, "co_qualname", None),
+                "co_firstlineno": getattr(value, "co_firstlineno", None),
+            }
+        if isinstance(value, tuple):
+            return [serialize_value(item) for item in value]
+        if isinstance(value, list):
+            return [serialize_value(item) for item in value]
+        if isinstance(value, set):
+            return [serialize_value(item) for item in sorted(value, key=repr)]
+        if isinstance(value, dict):
+            return {str(key): serialize_value(item) for key, item in value.items()}
+        return value
+
+    return {
+        field: serialize_value(getattr(code_object, field, None if field != "co_consts" else ()))
+        for field in CODE_OBJECT_PROMPT_FIELDS
+    }
 
 
 def _format_code_object_metadata_for_prompt(code_object: Any) -> str:
@@ -361,12 +382,7 @@ def _format_repair_context(repair_context: dict | None, *, module_mode: bool = F
             for item in rejected_attempts
         )
     failed = repair_context.get("pylingual_failed_result") or {}
-    heuristic_hint = repair_context.get("rendered_heuristic_hint")
-    heuristic_section = f"""Likely source issue:
-{heuristic_hint}
-
-""" if heuristic_hint else ""
-    return f"""{heuristic_section}Failure context:
+    return f"""Failure context:
 - target_kind: {repair_context.get("target_kind")}
 - qualname: {repair_context.get("qualname")}
 - localized_line_number: {repair_context.get("localized_line_number")}
@@ -392,7 +408,6 @@ def _prompt_feature_flags(user_prompt: str, repair_context: dict | None) -> dict
         "localized_instruction_diff": _instruction_diff_available(repair_context),
         "bytecode_evidence_fallback": "Bytecode evidence fallback:" in user_prompt,
         "rejected_attempt_feedback": bool(repair_context and repair_context.get("rejected_attempts")),
-        "heuristic_hint": bool(repair_context and repair_context.get("rendered_heuristic_hint")),
         "gt_instruction_window": bool(repair_context and repair_context.get("gt_instruction_window")),
         "derived_instruction_window": bool(repair_context and repair_context.get("derived_instruction_window")),
     }
@@ -451,10 +466,6 @@ def build_semantic_repair_prompt_payload(
         "source_start_line": source_start_line,
         "indentation_contract": INDENTATION_CONTRACT,
         "repair_context": public_context,
-        "heuristic_context": {
-            "detected_heuristics": [] if not repair_context else repair_context.get("detected_heuristics", []),
-            "rendered_heuristic_hint": None if not repair_context else repair_context.get("rendered_heuristic_hint"),
-        },
         "bytecode_context": None if not repair_context else {
             "gt_instruction_range": repair_context.get("gt_instruction_range"),
             "derived_instruction_range": repair_context.get("derived_instruction_range"),
@@ -602,8 +613,6 @@ class LLMFragmentFixer(FragmentFixer):
             "qualname": qualname,
             "prompt_variant": SEMANTIC_PROMPT_VARIANT,
             "prompt_features": _prompt_feature_flags(messages[1]["content"] if len(messages) > 1 else "", repair_context),
-            "detected_heuristics": [] if not repair_context else repair_context.get("detected_heuristics", []),
-            "rendered_heuristic_hint": None if not repair_context else repair_context.get("rendered_heuristic_hint"),
             "prompt_reconstruction_inputs": prompt_reconstruction_inputs,
             "messages": messages,
             "system_prompt": messages[0]["content"] if messages else None,
@@ -879,7 +888,7 @@ def run_dataset_repair_loop(
                     reject_non_improving_candidates=reject_non_improving_candidates,
                     max_iterations=max_iterations,
                 )
-                result_json_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+                result_json_path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
                 result_row = _dataset_result_row(row, result, result_json_path)
                 writer.writerow(result_row)
                 append_log(
@@ -1054,9 +1063,9 @@ def main() -> int:
         )
 
     if args.json_out is not None:
-        args.json_out.expanduser().resolve().write_text(json.dumps(result, indent=2), encoding="utf-8")
+        args.json_out.expanduser().resolve().write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
 
-    print(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2, default=str))
     return 0
 
 

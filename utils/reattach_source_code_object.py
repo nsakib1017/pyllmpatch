@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import argparse
 import ast
 import json
@@ -133,7 +134,118 @@ def _span_to_indices(
     return start_index, end_index
 
 
-def _find_target_row(source_path: Path, pyc_path: Path, qualname: str, strict_map: bool) -> dict:
+_MAPPING_IDENTITY_FIELDS = (
+    "source_qualname",
+    "source_kind",
+    "source_lineno",
+    "source_end_lineno",
+    "source_col_offset",
+    "source_end_col_offset",
+    "source_occurrence_index",
+    "source_sibling_ordinal",
+    "source_ordinal_path",
+    "source_immediate_child_count",
+    "source_collision_size",
+    "pyc_qualname",
+    "pyc_firstlineno",
+    "pyc_occurrence_index",
+    "pyc_sibling_ordinal",
+    "pyc_ordinal_path",
+    "pyc_immediate_child_count",
+    "pyc_collision_size",
+    "match_reason",
+    "matched",
+)
+
+
+def _optional_int(value: Any, default: int = 10**9) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _ordinal_path_sort_key(raw: Any) -> tuple[int, ...]:
+    if not raw:
+        return (10**9,)
+    try:
+        return tuple(int(part) for part in str(raw).split(".") if part != "")
+    except Exception:
+        return (10**9,)
+
+
+def _mapping_row_identity(row: dict | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {field: row.get(field) for field in _MAPPING_IDENTITY_FIELDS if field in row}
+
+
+def _mapping_ambiguity_summary(candidates: list[dict]) -> dict[str, Any]:
+    return {
+        "candidate_count": len(candidates),
+        "source_spans": [
+            {
+                "source_kind": row.get("source_kind"),
+                "source_lineno": row.get("source_lineno"),
+                "source_col_offset": row.get("source_col_offset"),
+                "source_end_lineno": row.get("source_end_lineno"),
+                "source_end_col_offset": row.get("source_end_col_offset"),
+                "source_occurrence_index": row.get("source_occurrence_index"),
+                "source_ordinal_path": row.get("source_ordinal_path"),
+                "source_collision_size": row.get("source_collision_size"),
+                "pyc_firstlineno": row.get("pyc_firstlineno"),
+                "pyc_occurrence_index": row.get("pyc_occurrence_index"),
+                "pyc_ordinal_path": row.get("pyc_ordinal_path"),
+                "pyc_collision_size": row.get("pyc_collision_size"),
+                "match_reason": row.get("match_reason"),
+                "matched": row.get("matched"),
+            }
+            for row in candidates
+        ],
+    }
+
+
+def _mapping_identity_matches(row: dict, target_identity: dict[str, Any]) -> bool:
+    for key, expected in target_identity.items():
+        if expected is None or key not in _MAPPING_IDENTITY_FIELDS:
+            continue
+        actual = row.get(key)
+        if actual != expected and str(actual) != str(expected):
+            return False
+    return True
+
+
+def _mapping_resolution_sort_key(row: dict, qualname: str) -> tuple[Any, ...]:
+    matched = row.get("matched")
+    source_lineno = _optional_int(row.get("source_lineno"))
+    pyc_firstlineno = _optional_int(row.get("pyc_firstlineno"))
+    return (
+        0 if row.get("pyc_qualname") == qualname else 1,
+        0 if matched is True else 1,
+        abs(source_lineno - pyc_firstlineno) if pyc_firstlineno != 10**9 else 10**9,
+        _optional_int(row.get("source_collision_size")),
+        _optional_int(row.get("pyc_collision_size")),
+        _ordinal_path_sort_key(row.get("source_ordinal_path")),
+        _ordinal_path_sort_key(row.get("pyc_ordinal_path")),
+        _optional_int(row.get("source_occurrence_index")),
+        _optional_int(row.get("pyc_occurrence_index")),
+        source_lineno,
+        _optional_int(row.get("source_col_offset")),
+        _optional_int(row.get("source_end_lineno")),
+        _optional_int(row.get("source_end_col_offset")),
+    )
+
+
+def _find_target_row(
+    source_path: Path,
+    pyc_path: Path,
+    qualname: str,
+    strict_map: bool,
+    target_identity: dict[str, Any] | None = None,
+) -> dict:
+
     rows = map_source_to_pyc(source_path, pyc_path, strict=strict_map)
     candidates = [
         row
@@ -142,8 +254,26 @@ def _find_target_row(source_path: Path, pyc_path: Path, qualname: str, strict_ma
     ]
     if not candidates:
         raise ReattachError(f"No mapped source code object found for qualname: {qualname}")
+    if target_identity:
+        identity_matches = [row for row in candidates if _mapping_identity_matches(row, target_identity)]
+        if identity_matches:
+            candidates = identity_matches
     if len(candidates) > 1:
-        raise ReattachError(f"Qualname is ambiguous across {len(candidates)} rows: {qualname}")
+        summary = _mapping_ambiguity_summary(candidates)
+        if strict_map:
+            raise ReattachError(
+                f"Qualname is ambiguous across {len(candidates)} rows: {qualname}; "
+                f"candidate identity summary: {json.dumps(summary, sort_keys=True, default=str)}"
+            )
+        candidates = sorted(candidates, key=lambda row: _mapping_resolution_sort_key(row, qualname))
+        selected = dict(candidates[0])
+        selected["_mapping_resolution"] = {
+            "ambiguous": True,
+            "resolution": "ranked_by_mapping_identity",
+            "candidate_count": len(candidates),
+            "candidate_summary": summary,
+        }
+        return selected
     return candidates[0]
 
 
@@ -1386,51 +1516,6 @@ def _expression_child_kind(qualname: str | None) -> str | None:
     return None
 
 
-def _detected_heuristics_for_qualname(distance_rows: list[dict], qualname: str) -> list[dict]:
-    heuristics = []
-    for row in distance_rows:
-        if row.get("status") != "missing":
-            continue
-        child_qualname = row.get("gt_name")
-        parent = _expression_child_parent_qualname(child_qualname)
-        if parent != qualname:
-            continue
-        child_kind = _expression_child_kind(child_qualname)
-        heuristics.append(
-            {
-                "name": "missing_expression_child_routed_to_parent",
-                "category": "missing_expression_child",
-                "confidence": 0.95,
-                "evidence": {
-                    "child_kind": child_kind,
-                    "child_qualname": child_qualname,
-                    "parent_qualname": parent,
-                },
-                "hint_rendered": True,
-                "hint_text": (
-                    f"A missing {child_kind or 'expression child'} is expression-level source; "
-                    "repair the enclosing parent expression instead of inserting a standalone child fragment."
-                ),
-            }
-        )
-    return heuristics
-
-
-def _render_heuristic_hint(heuristics: list[dict]) -> str | None:
-    if not heuristics:
-        return None
-    lines = []
-    for heuristic in heuristics:
-        hint_text = heuristic.get("hint_text")
-        evidence = heuristic.get("evidence") or {}
-        child_qualname = evidence.get("child_qualname")
-        if hint_text:
-            lines.append(f"- {hint_text}")
-        if child_qualname:
-            lines.append(f"- Missing child code object: `{child_qualname}`.")
-    return "\n".join(lines) if lines else None
-
-
 def select_extra_repair_targets(distance_rows: list[dict]) -> list[str]:
     candidates = [
         row["derived_name"]
@@ -1993,7 +2078,6 @@ def _build_target_repair_context(
     verification: dict | None,
     line_number: int | None = None,
     rejected_attempts: list[dict],
-    detected_heuristics: list[dict] | None = None,
 ) -> dict:
     failed_result = _failed_result_for_target(verification, qualname)
     failed_offset = None if failed_result is None else failed_result.get("failed_offset")
@@ -2021,8 +2105,6 @@ def _build_target_repair_context(
         "bytecode_window_max_records": instruction_context.get("bytecode_window_max_records"),
         "bytecode_window_truncated": instruction_context.get("bytecode_window_truncated"),
         "instruction_renderer_version": instruction_context.get("instruction_renderer_version"),
-        "detected_heuristics": detected_heuristics or [],
-        "rendered_heuristic_hint": _render_heuristic_hint(detected_heuristics or []),
         "rejected_attempts": rejected_attempts[-1:],
     }
 
@@ -2039,32 +2121,14 @@ def _compact_semantic_step_record(step_record: dict[str, Any]) -> dict[str, Any]
             "failed_offset": repair_context.get("failed_offset"),
             "alignment_tag": repair_context.get("alignment_tag"),
             "has_instruction_diff": bool(repair_context.get("instruction_diff")),
-            "detected_heuristic_names": [
-                item.get("name")
-                for item in repair_context.get("detected_heuristics", [])
-                if isinstance(item, dict)
-            ],
             "has_llm_prompt_record": bool(repair_context.get("_llm_prompt_record")),
         }
     return compact
 
 
 def _append_semantic_step_log(log_file: Path | None, run_id: str | None, file_hash: str | None, step_record: dict[str, Any]) -> None:
-    if log_file is None:
-        return
-    append_log(
-        log_file,
-        _json_safe(
-            {
-            "run_id": run_id,
-            "timestamp": now_iso(),
-            "mode": "semantic_repair",
-            "stage": "step",
-            "file_hash": file_hash,
-            **_compact_semantic_step_record(step_record),
-            }
-        ),
-    )
+    del log_file, run_id, file_hash, step_record
+    return
 
 
 def _json_safe(value: Any) -> Any:
@@ -2075,6 +2139,203 @@ def _accepted_code_object_dataset_path(log_file: Path | None) -> Path | None:
     if log_file is None:
         return None
     return log_file.expanduser().resolve().parent / "semantic_repair_accepted_code_objects.jsonl"
+
+
+def _accepted_case_telemetry_path(log_file: Path | None) -> Path | None:
+    if log_file is None:
+        return None
+    return log_file.expanduser().resolve().parent / "semantic_repair_accepted_case_telemetry.jsonl"
+
+
+def _leading_indent_width(text: str | None) -> int | None:
+    if not text:
+        return None
+    for line in text.splitlines():
+        if line.strip():
+            return len(line) - len(line.lstrip(" "))
+    return None
+
+
+def _line_count(text: str | None) -> int | None:
+    if text is None:
+        return None
+    return len(text.splitlines())
+
+
+def _fragment_feature_snapshot(fragment: str | None) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {
+        "parse_ok": False,
+        "dedented_parse_ok": False,
+        "statement_types": [],
+        "control_flow_nodes": [],
+        "loaded_names": [],
+        "bound_names": [],
+        "top_level_statement_count": None,
+        "node_count": None,
+    }
+    if not fragment:
+        return snapshot
+
+    snapshot["line_count"] = _line_count(fragment)
+    snapshot["char_count"] = len(fragment)
+    snapshot["indent_width"] = _leading_indent_width(fragment)
+
+    candidates = [fragment, textwrap.dedent(fragment)]
+    for index, candidate in enumerate(candidates):
+        try:
+            parsed = ast.parse(candidate)
+        except SyntaxError:
+            continue
+        snapshot["parse_ok"] = index == 0
+        snapshot["dedented_parse_ok"] = True
+        snapshot["top_level_statement_count"] = len(parsed.body)
+        snapshot["statement_types"] = sorted({type(node).__name__ for node in parsed.body})
+        snapshot["node_count"] = sum(1 for _ in ast.walk(parsed))
+        loaded_names = sorted(
+            {
+                child.id
+                for child in ast.walk(parsed)
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+            }
+        )
+        bound_names = sorted(
+            {
+                child.id
+                for child in ast.walk(parsed)
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+            }
+        )
+        control_flow_nodes = sorted(
+            {
+                type(child).__name__
+                for child in ast.walk(parsed)
+                if isinstance(child, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try, ast.Match, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            }
+        )
+        snapshot["loaded_names"] = loaded_names
+        snapshot["bound_names"] = bound_names
+        snapshot["control_flow_nodes"] = control_flow_nodes
+        return snapshot
+    return snapshot
+
+
+def _fragment_feature_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    before_names = set(before.get("loaded_names") or []) | set(before.get("bound_names") or [])
+    after_names = set(after.get("loaded_names") or []) | set(after.get("bound_names") or [])
+    before_controls = set(before.get("control_flow_nodes") or [])
+    after_controls = set(after.get("control_flow_nodes") or [])
+    before_statements = set(before.get("statement_types") or [])
+    after_statements = set(after.get("statement_types") or [])
+    return {
+        "line_count_delta": _safe_int_delta(before.get("line_count"), after.get("line_count")),
+        "char_count_delta": _safe_int_delta(before.get("char_count"), after.get("char_count")),
+        "indent_width_delta": _safe_int_delta(before.get("indent_width"), after.get("indent_width")),
+        "parse_transition": f"{bool(before.get('parse_ok'))}->{bool(after.get('parse_ok'))}",
+        "dedented_parse_transition": f"{bool(before.get('dedented_parse_ok'))}->{bool(after.get('dedented_parse_ok'))}",
+        "statement_types_added": sorted(after_statements - before_statements),
+        "statement_types_removed": sorted(before_statements - after_statements),
+        "control_flow_added": sorted(after_controls - before_controls),
+        "control_flow_removed": sorted(before_controls - after_controls),
+        "names_added": sorted(after_names - before_names),
+        "names_removed": sorted(before_names - after_names),
+    }
+
+
+def _safe_int_delta(before: int | None, after: int | None) -> int | None:
+    if before is None or after is None:
+        return None
+    return int(after) - int(before)
+
+
+def _accepted_case_telemetry_record(
+    *,
+    run_id: str | None,
+    file_hash: str | None,
+    step_record: dict[str, Any],
+) -> dict[str, Any]:
+    repair_context = step_record.get("repair_context") or {}
+    pylingual_after = step_record.get("pylingual_verification")
+    extracted_before = step_record.get("extracted_before")
+    replacement_text = step_record.get("replacement_text")
+    before_features = _fragment_feature_snapshot(extracted_before)
+    after_features = _fragment_feature_snapshot(replacement_text)
+    prompt_record = repair_context.get("_llm_prompt_record")
+    source_span = {
+        "localized_line_number": repair_context.get("localized_line_number"),
+        "source_lineno": step_record.get("source_lineno", repair_context.get("source_lineno")),
+        "source_col_offset": step_record.get("source_col_offset", repair_context.get("source_col_offset")),
+        "source_end_lineno": step_record.get("source_end_lineno", repair_context.get("source_end_lineno")),
+        "source_end_col_offset": step_record.get("source_end_col_offset", repair_context.get("source_end_col_offset")),
+        "parent_qualname": step_record.get("parent_qualname"),
+        "source_kind": step_record.get("source_kind"),
+        "module_body_strategy": step_record.get("module_body_strategy"),
+        "target_identity": step_record.get("target_identity"),
+        "parent_target_identity": step_record.get("parent_target_identity"),
+        "gt_target_identity": step_record.get("gt_target_identity"),
+        "target_mapping_resolution": step_record.get("target_mapping_resolution"),
+        "parent_mapping_resolution": step_record.get("parent_mapping_resolution"),
+        "gt_mapping_resolution": step_record.get("gt_mapping_resolution"),
+    }
+    case_fingerprint = {
+        "source_file_hash": file_hash,
+        "qualname": step_record.get("qualname"),
+        "repair_operation": step_record.get("repair_operation"),
+        "iteration": step_record.get("iteration"),
+        "step": step_record.get("step"),
+        "localized_line_number": source_span["localized_line_number"],
+        "source_lineno": source_span["source_lineno"],
+        "source_col_offset": source_span["source_col_offset"],
+        "source_end_lineno": source_span["source_end_lineno"],
+        "source_end_col_offset": source_span["source_end_col_offset"],
+        "source_kind": source_span["source_kind"],
+        "target_identity": source_span["target_identity"],
+        "parent_target_identity": source_span["parent_target_identity"],
+        "gt_target_identity": source_span["gt_target_identity"],
+    }
+    case_id = hashlib.sha1(json.dumps(case_fingerprint, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    return _json_safe({
+        "case_id": case_id,
+        "run_id": run_id,
+        "timestamp": now_iso(),
+        "source_file_hash": file_hash,
+        "qualname": step_record.get("qualname"),
+        "repair_operation": step_record.get("repair_operation"),
+        "iteration": step_record.get("iteration"),
+        "step": step_record.get("step"),
+        "accepted": step_record.get("accepted"),
+        "acceptance_reason": step_record.get("acceptance_reason"),
+        "target_kind": repair_context.get("target_kind"),
+        "source_span": source_span,
+        "repair_context_summary": {
+            "failed_offset": repair_context.get("failed_offset"),
+            "alignment_tag": repair_context.get("alignment_tag"),
+            "has_instruction_diff": bool(repair_context.get("instruction_diff")),
+            "has_llm_prompt_record": bool(prompt_record),
+        },
+        "before_fragment": extracted_before,
+        "after_fragment": replacement_text,
+        "before_features": before_features,
+        "after_features": after_features,
+        "feature_delta": _fragment_feature_delta(before_features, after_features),
+        "semantic_delta": {
+            "combined_distance_delta": _step_combined_distance_delta(step_record),
+            "target_score_before": step_record.get("target_score_before"),
+            "target_score_after": step_record.get("target_score_after"),
+        },
+        "reattachment": {
+            "candidate_kind": step_record.get("reattachment_candidate_kind"),
+            "parse_ok": step_record.get("reattachment_parse_ok"),
+            "parse_error": step_record.get("reattachment_parse_error"),
+            "structure_ok": step_record.get("reattachment_structure_ok"),
+            "structure_reason": step_record.get("reattachment_structure_reason"),
+        },
+        "pylingual_after": {
+            "all_equal": None if pylingual_after is None else pylingual_after.get("all_equal"),
+            "success_count": _success_count_from_verification(pylingual_after),
+            "failed_targets": _failed_targets_from_verification(pylingual_after),
+        },
+        "prompt": prompt_record,
+    })
 
 
 def _success_count_from_verification(verification: dict | None) -> int | None:
@@ -2114,6 +2375,12 @@ def _accepted_code_object_dataset_record(
         "acceptance_reason": step_record.get("acceptance_reason"),
         "target_kind": repair_context.get("target_kind"),
         "source_kind": step_record.get("source_kind"),
+        "target_identity": step_record.get("target_identity"),
+        "parent_target_identity": step_record.get("parent_target_identity"),
+        "gt_target_identity": step_record.get("gt_target_identity"),
+        "target_mapping_resolution": step_record.get("target_mapping_resolution"),
+        "parent_mapping_resolution": step_record.get("parent_mapping_resolution"),
+        "gt_mapping_resolution": step_record.get("gt_mapping_resolution"),
         "extracted_before": step_record.get("extracted_before"),
         "replacement_text": step_record.get("replacement_text"),
         "target_score_before": step_record.get("target_score_before"),
@@ -2144,9 +2411,6 @@ def _accepted_code_object_dataset_record(
             "success_count": _success_count_from_verification(pylingual_after),
             "failed_targets": _failed_targets_from_verification(pylingual_after),
         },
-        "detected_heuristics": repair_context.get("detected_heuristics") or [],
-        "rendered_heuristic_hint": repair_context.get("rendered_heuristic_hint"),
-        "heuristic_outcome": step_record.get("heuristic_outcome") or [],
         "prompt": prompt_record,
     })
 
@@ -2167,6 +2431,22 @@ def _append_accepted_code_object_dataset(log_file: Path | None, run_id: str | No
     )
 
 
+def _append_accepted_case_telemetry(log_file: Path | None, run_id: str | None, file_hash: str | None, step_record: dict[str, Any]) -> None:
+    if not step_record.get("accepted"):
+        return
+    path = _accepted_case_telemetry_path(log_file)
+    if path is None:
+        return
+    append_log(
+        path,
+        _accepted_case_telemetry_record(
+            run_id=run_id,
+            file_hash=file_hash,
+            step_record=step_record,
+        ),
+    )
+
+
 def _step_combined_distance_delta(step_record: dict[str, Any]) -> int | None:
     before = step_record.get("target_score_before") or {}
     after = step_record.get("target_score_after") or {}
@@ -2177,29 +2457,6 @@ def _step_combined_distance_delta(step_record: dict[str, Any]) -> int | None:
     if before_distance is None or after_distance is None:
         return None
     return int(after_distance) - int(before_distance)
-
-
-def _attach_heuristic_outcome(step_record: dict[str, Any]) -> None:
-    repair_context = step_record.get("repair_context") or {}
-    heuristics = repair_context.get("detected_heuristics") or step_record.get("detected_heuristics") or []
-    if not heuristics or step_record.get("heuristic_outcome"):
-        return
-    distance_delta = _step_combined_distance_delta(step_record)
-    accepted = bool(step_record.get("accepted"))
-    likely_helped = "weak_true" if accepted and (distance_delta is None or distance_delta <= 0) else "false_or_insufficient"
-    step_record["heuristic_outcome"] = [
-        {
-            "name": heuristic.get("name"),
-            "present": True,
-            "prompt_hint_rendered": bool(heuristic.get("hint_rendered")),
-            "accepted": accepted,
-            "combined_distance_delta": distance_delta,
-            "acceptance_reason": step_record.get("acceptance_reason"),
-            "likely_helped": likely_helped,
-            "label_source": "automatic_weak",
-        }
-        for heuristic in heuristics
-    ]
 
 
 def _semantic_print(message: str, *, indent: int = 0, tagged: bool = True) -> None:
@@ -2215,7 +2472,6 @@ def _store_semantic_step(
     run_id: str | None = None,
     file_hash: str | None = None,
 ) -> None:
-    _attach_heuristic_outcome(step_record)
     steps.append(step_record)
     repair_operation = step_record.get("repair_operation")
     qualname = step_record.get("qualname")
@@ -2236,8 +2492,8 @@ def _store_semantic_step(
     )
     if acceptance_reason:
         _semantic_print(f"-> reason: {acceptance_reason}", indent=2, tagged=False)
-    _append_semantic_step_log(log_file, run_id, file_hash, step_record)
     _append_accepted_code_object_dataset(log_file, run_id, file_hash, step_record)
+    _append_accepted_case_telemetry(log_file, run_id, file_hash, step_record)
 
 
 def _announce_semantic_step(
@@ -2340,6 +2596,10 @@ def _apply_module_statement_candidate(
         "repair_operation": "repair_module_statement",
         "module_body_strategy": "localized_module_statement_repair",
         "localized_line_number": line_number,
+        "source_lineno": line_number,
+        "source_col_offset": int(getattr(node, "col_offset", 0)),
+        "source_end_lineno": int(getattr(node, "end_lineno", line_number)),
+        "source_end_col_offset": int(getattr(node, "end_col_offset", 0)),
         "fragment_path": str(fragment_path),
         "output_source": str(next_source),
         "output_pyc": str(next_pyc),
@@ -2635,13 +2895,18 @@ def repair_mismatching_code_objects(
                 derived_code_object=derived_bytecode,
                 verification=current_pylingual_verification,
                 rejected_attempts=[],
-                detected_heuristics=_detected_heuristics_for_qualname(iteration_rows, qualname),
             )
+            repair_context["_target_identity"] = _mapping_row_identity(target_row)
+            repair_context["_target_mapping_resolution"] = target_row.get("_mapping_resolution")
+            gt_target_identity = None
             if fragment_fixer is None:
                 source_path, source_text = load_gt_source_text()
                 gt_row = _find_target_row(source_path, gt_pyc, qualname, strict_map=strict_map)
+                gt_target_identity = _mapping_row_identity(gt_row)
+                gt_mapping_resolution = gt_row.get("_mapping_resolution")
                 replacement_text = extract_source_segment(source_text, gt_row)
             else:
+                gt_mapping_resolution = None
                 _announce_semantic_step(
                     step_index=step_index,
                     iteration=iteration,
@@ -2704,7 +2969,16 @@ def repair_mismatching_code_objects(
                     "step": step_index,
                     "iteration": iteration,
                     "qualname": qualname,
+                    "repair_operation": "repair_source_fragment",
                     "source_kind": target_row.get("source_kind"),
+                    "source_lineno": int(target_row["source_lineno"]),
+                    "source_col_offset": int(target_row["source_col_offset"]),
+                    "source_end_lineno": int(target_row["source_end_lineno"]),
+                    "source_end_col_offset": int(target_row["source_end_col_offset"]),
+                    "target_identity": _mapping_row_identity(target_row),
+                    "gt_target_identity": gt_target_identity,
+                    "target_mapping_resolution": target_row.get("_mapping_resolution"),
+                    "gt_mapping_resolution": gt_mapping_resolution,
                     "fragment_path": str(fragment_path),
                     "output_source": str(next_source),
                     "output_pyc": str(next_pyc),
@@ -2789,6 +3063,8 @@ def repair_mismatching_code_objects(
                         "repair_operation": "delete_extra",
                         "target_score_before": target_score_before,
                         "target_score_after": None,
+                        "target_identity": _mapping_row_identity(target_row),
+                        "target_mapping_resolution": target_row.get("_mapping_resolution"),
                         "accepted": False,
                         "acceptance_reason": f"extra source kind is not safely statement-deletable: {target_row['source_kind']}",
                     },
@@ -2836,6 +3112,8 @@ def repair_mismatching_code_objects(
                             "output_pyc": None,
                             "extracted_before": extracted_before,
                             "replacement_text": replacement_text,
+                            "target_identity": _mapping_row_identity(target_row),
+                            "target_mapping_resolution": target_row.get("_mapping_resolution"),
                             "target_score_before": target_score_before,
                             "target_score_after": None,
                             "accepted": False,
@@ -2875,6 +3153,13 @@ def repair_mismatching_code_objects(
                     "qualname": qualname,
                     "repair_operation": "delete_extra",
                     "deletion_strategy": deletion_strategy,
+                    "source_kind": target_row.get("source_kind"),
+                    "source_lineno": int(target_row["source_lineno"]),
+                    "source_col_offset": int(target_row["source_col_offset"]),
+                    "source_end_lineno": int(target_row["source_end_lineno"]),
+                    "source_end_col_offset": int(target_row["source_end_col_offset"]),
+                    "target_identity": _mapping_row_identity(target_row),
+                    "target_mapping_resolution": target_row.get("_mapping_resolution"),
                     "fragment_path": str(fragment_path),
                     "output_source": str(next_source),
                     "output_pyc": str(next_pyc),
@@ -2926,6 +3211,8 @@ def repair_mismatching_code_objects(
             if fragment_fixer is None:
                 source_path, source_text = load_gt_source_text()
                 gt_row = _find_target_row(source_path, gt_pyc, qualname, strict_map=strict_map)
+                gt_target_identity = _mapping_row_identity(gt_row)
+                gt_mapping_resolution = gt_row.get("_mapping_resolution")
                 if gt_row["source_kind"] not in {"function", "async_function", "class"}:
                     unsupported_missing_targets.add(qualname)
                     _store_semantic_step(
@@ -2935,23 +3222,36 @@ def repair_mismatching_code_objects(
                             "iteration": iteration,
                             "qualname": qualname,
                             "repair_operation": "insert_missing",
+                            "source_kind": gt_row["source_kind"],
+                            "source_lineno": int(gt_row["source_lineno"]),
+                            "source_col_offset": int(gt_row["source_col_offset"]),
+                            "source_end_lineno": int(gt_row["source_end_lineno"]),
+                            "source_end_col_offset": int(gt_row["source_end_col_offset"]),
+                            "gt_target_identity": gt_target_identity,
+                            "gt_mapping_resolution": gt_mapping_resolution,
                             "accepted": False,
                             "acceptance_reason": f"missing source kind is not statement-insertable: {gt_row['source_kind']}",
                         },
-                    log_file=log_file,
-                    run_id=run_id,
-                    file_hash=file_hash,
+                        log_file=log_file,
+                        run_id=run_id,
+                        file_hash=file_hash,
                     )
                     continue
                 gt_fragment = extract_source_segment(source_text, gt_row)
                 replacement_text = gt_fragment
             else:
+                gt_target_identity = None
+                gt_mapping_resolution = None
                 repair_context = _build_target_repair_context(
                     qualname=qualname,
                     gt_code_object=gt_bytecode,
                     derived_code_object=current_bytecodes.get(qualname),
                     verification=current_pylingual_verification,
                     rejected_attempts=[],
+                )
+                repair_context["_parent_target_identity"] = _mapping_row_identity(parent_row)
+                repair_context["_parent_mapping_resolution"] = (
+                    parent_row.get("_mapping_resolution") if parent_row is not None else None
                 )
                 _announce_semantic_step(
                     step_index=step_index,
@@ -3014,6 +3314,14 @@ def repair_mismatching_code_objects(
                     "repair_operation": "insert_missing",
                     "parent_qualname": parent_qualname,
                     "source_kind": parent_row.get("source_kind") if parent_row is not None else None,
+                    "source_lineno": int(parent_row["source_lineno"]) if parent_row is not None else None,
+                    "source_col_offset": int(parent_row["source_col_offset"]) if parent_row is not None else None,
+                    "source_end_lineno": int(parent_row["source_end_lineno"]) if parent_row is not None else None,
+                    "source_end_col_offset": int(parent_row["source_end_col_offset"]) if parent_row is not None else None,
+                    "parent_target_identity": _mapping_row_identity(parent_row),
+                    "gt_target_identity": gt_target_identity,
+                    "parent_mapping_resolution": parent_row.get("_mapping_resolution") if parent_row is not None else None,
+                    "gt_mapping_resolution": gt_mapping_resolution,
                     "fragment_path": str(fragment_path),
                     "output_source": str(next_source),
                     "output_pyc": str(next_pyc),
