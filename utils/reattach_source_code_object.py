@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import argparse
 import ast
-import dis
 import json
 import os
 import re
 import sys
 import textwrap
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +35,16 @@ class ReattachError(RuntimeError):
 
 
 FragmentFixer = Callable[[str, Any, Any, str, dict | None], str]
+
+
+@dataclass(frozen=True)
+class ReattachmentCandidate:
+    kind: str
+    replacement_text: str
+    updated_source: str
+    target_row: dict
+    parse_ok: bool
+    parse_error: str | None = None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -231,42 +241,96 @@ def _apply_source_edits(source_text: str, edits: list[tuple[int, int, str, int]]
     return candidate
 
 
+def _editable_instruction_items(bytecode: Any) -> list[Any]:
+    if bytecode is None or not hasattr(bytecode, "instructions"):
+        return []
+    try:
+        return list(bytecode)
+    except Exception:
+        return []
+
+
+def _resolve_code310_arg(opname: str, arg: int, code_object: Any) -> Any:
+    consts = getattr(code_object, "co_consts", ())
+    names = getattr(code_object, "co_names", ())
+    varnames = getattr(code_object, "co_varnames", ())
+    freevars = getattr(code_object, "co_freevars", ())
+    cellvars = getattr(code_object, "co_cellvars", ())
+    cell_names = tuple(cellvars) + tuple(freevars)
+    if opname == "LOAD_CONST" and arg < len(consts):
+        return consts[arg]
+    if opname in {
+        "STORE_NAME",
+        "LOAD_NAME",
+        "DELETE_NAME",
+        "LOAD_GLOBAL",
+        "STORE_GLOBAL",
+        "DELETE_GLOBAL",
+        "LOAD_ATTR",
+        "STORE_ATTR",
+        "DELETE_ATTR",
+        "LOAD_METHOD",
+        "IMPORT_NAME",
+        "IMPORT_FROM",
+    } and arg < len(names):
+        return names[arg]
+    if opname in {"LOAD_FAST", "STORE_FAST", "DELETE_FAST"} and arg < len(varnames):
+        return varnames[arg]
+    if opname in {"LOAD_CLOSURE", "LOAD_DEREF", "STORE_DEREF", "DELETE_DEREF"} and arg < len(cell_names):
+        return cell_names[arg]
+    return arg
+
+
+def _decode_code310_instruction_records(code_object: Any) -> list[dict]:
+    code = getattr(code_object, "co_code", None)
+    if code is None:
+        return []
+    try:
+        from xdis.opcodes import opcode_310
+    except Exception:
+        return []
+
+    records = []
+    extended_arg = 0
+    for offset in range(0, len(code), 2):
+        op = code[offset]
+        raw_arg = code[offset + 1] if offset + 1 < len(code) else 0
+        arg = raw_arg | extended_arg
+        try:
+            opname = opcode_310.opname[op]
+        except Exception:
+            opname = f"<{op}>"
+        argval = _resolve_code310_arg(opname, arg, code_object)
+        records.append(
+            {
+                "index": len(records),
+                "offset": offset,
+                "starts_line": None,
+                "opname": opname,
+                "argrepr": "" if argval is None else str(argval),
+                "argval": argval,
+            }
+        )
+        if opname == "EXTENDED_ARG":
+            extended_arg = arg << 8
+        else:
+            extended_arg = 0
+    return records
+
+
 def _module_instruction_stream(code_object: Any) -> list[dict]:
     if code_object is None:
         return []
-    try:
-        raw_instructions = list(dis.get_instructions(code_object))
+    raw_instructions = _editable_instruction_items(code_object)
+    if raw_instructions:
         return [
-            {"opname": ins.opname, "argval": ins.argval}
+            {"opname": getattr(ins, "opname", ""), "argval": getattr(ins, "argval", None)}
             for ins in raw_instructions
         ]
-    except (AttributeError, TypeError):
-        from xdis.opcodes import opcode_310
-
-        instructions = []
-        extended_arg = 0
-        code = getattr(code_object, "co_code", b"")
-        consts = getattr(code_object, "co_consts", ())
-        names = getattr(code_object, "co_names", ())
-        for index in range(0, len(code), 2):
-            op = code[index]
-            arg = code[index + 1] | extended_arg if index + 1 < len(code) else extended_arg
-            opname = opcode_310.opname[op]
-            if opname == "EXTENDED_ARG":
-                extended_arg = arg << 8
-                continue
-            extended_arg = 0
-            argval = arg
-            if opname == "LOAD_CONST" and arg < len(consts):
-                argval = consts[arg]
-            elif opname == "STORE_NAME" and arg < len(names):
-                argval = names[arg]
-            elif opname == "IMPORT_NAME" and arg < len(names):
-                argval = names[arg]
-            elif opname == "IMPORT_FROM" and arg < len(names):
-                argval = names[arg]
-            instructions.append({"opname": opname, "argval": argval})
-        return instructions
+    return [
+        {"opname": record["opname"], "argval": record["argval"]}
+        for record in _decode_code310_instruction_records(code_object)
+    ]
 
 
 def _is_safe_literal(value: Any) -> bool:
@@ -687,16 +751,398 @@ def normalize_semantic_replacement_indentation(
 ) -> str:
     """Align a semantic repair fragment to the mapped destination span."""
     base_indent = " " * int(target_row["source_col_offset"])
-    if original_fragment is not None:
-        for line in original_fragment.splitlines():
-            if line.strip():
-                base_indent = line[: len(line) - len(line.lstrip())]
-                break
     normalized = textwrap.dedent(replacement_text.strip("\n"))
-    return "\n".join(
-        base_indent + line if line.strip() else ""
-        for line in normalized.splitlines()
+    lines = normalized.splitlines()
+    if not lines:
+        return ""
+
+    def _is_suite_header(line: str) -> bool:
+        stripped = line.lstrip()
+        if not stripped.endswith(":"):
+            return False
+        head = stripped[:-1].strip()
+        return (
+            head.startswith("async def ")
+            or head.startswith("def ")
+            or head.startswith("class ")
+            or head.startswith("if ")
+            or head.startswith("elif ")
+            or head.startswith("for ")
+            or head.startswith("while ")
+            or head.startswith("try")
+            or head.startswith("except ")
+            or head.startswith("finally")
+            or head.startswith("with ")
+            or head.startswith("match ")
+            or head.startswith("case ")
+            or head == "else"
+        )
+
+    def _is_branch_header(line: str) -> bool:
+        stripped = line.lstrip()
+        head = stripped.split(None, 1)[0].rstrip(":") if stripped else ""
+        return head in {"elif", "else", "except", "finally", "case"}
+
+    def _is_parseable_fragment(text: str) -> bool:
+        try:
+            ast.parse(text)
+            return True
+        except SyntaxError:
+            return False
+
+    def _normalize_body_lines(*, strict_body_indent: bool) -> str:
+        if not _is_suite_header(lines[0]):
+            return "\n".join(
+                base_indent + line if line.strip() else ""
+                for line in lines
+            )
+
+        adjusted: list[str] = [lines[0]]
+        for line in lines[1:]:
+            if not line.strip():
+                adjusted.append("")
+            elif _is_branch_header(line):
+                adjusted.append(line.lstrip())
+            elif strict_body_indent:
+                adjusted.append(f"    {line.lstrip()}")
+            else:
+                adjusted.append(line if line.startswith((" ", "\t")) else f"    {line.lstrip()}")
+        return "\n".join(adjusted)
+
+    candidate = _normalize_body_lines(strict_body_indent=False)
+    if _is_parseable_fragment(candidate):
+        return candidate
+
+    if _is_suite_header(lines[0]):
+        fallback = _normalize_body_lines(strict_body_indent=True)
+        if _is_parseable_fragment(fallback):
+            return fallback
+
+    return candidate
+
+
+def _unique_replacement_candidates(candidates: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        unique.append(candidate)
+    return unique
+
+
+def _source_span_replacement_candidates(
+    replacement_text: str,
+    source_col_offset: int,
+    original_fragment: str | None = None,
+) -> list[tuple[str, str]]:
+    """Generate candidate fragments for insertion at an exact source span.
+
+    The first replacement line is inserted after the existing source prefix up to
+    source_col_offset. Continuation lines must therefore carry file-level
+    indentation, not just indentation relative to the first replacement line.
+    """
+    base_indent = " " * int(source_col_offset)
+    stripped = replacement_text.strip("\n")
+    dedented = textwrap.dedent(stripped)
+    fragment_normalized = normalize_semantic_replacement_indentation(
+        replacement_text,
+        {"source_col_offset": source_col_offset},
+        original_fragment,
     )
+
+    def _span_relative(text: str) -> str:
+        lines = text.splitlines()
+        if not lines:
+            return ""
+        adjusted = [lines[0].lstrip()]
+        adjusted.extend(lines[1:])
+        return "\n".join(adjusted)
+
+    def _with_absolute_continuations(text: str) -> str:
+        lines = _span_relative(text).splitlines()
+        if not lines:
+            return ""
+        adjusted = [lines[0]]
+        for line in lines[1:]:
+            adjusted.append(base_indent + line if line.strip() else "")
+        return "\n".join(adjusted)
+
+    named_candidates = [
+        ("raw", stripped),
+        ("dedented", dedented),
+        ("fragment_normalized", fragment_normalized),
+        ("span_relative_raw", _span_relative(stripped)),
+        ("span_relative_dedented", _span_relative(dedented)),
+        ("span_relative_fragment_normalized", _span_relative(fragment_normalized)),
+        ("absolute_continuations_raw", _with_absolute_continuations(stripped)),
+        ("absolute_continuations_dedented", _with_absolute_continuations(dedented)),
+        ("absolute_continuations_fragment_normalized", _with_absolute_continuations(fragment_normalized)),
+    ]
+    seen: set[str] = set()
+    unique: list[tuple[str, str]] = []
+    for kind, candidate in named_candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        unique.append((kind, candidate))
+    return unique
+
+
+def _candidate_row_from_slice(
+    source_text: str,
+    start_index: int,
+    end_index: int,
+    source_col_offset: int,
+) -> dict:
+    line_offsets = [0]
+    for line in source_text.splitlines(keepends=True):
+        line_offsets.append(line_offsets[-1] + len(line))
+
+    def _line_col(index: int) -> tuple[int, int]:
+        line_no = max(1, len(line_offsets) - 1)
+        for offset_index in range(1, len(line_offsets)):
+            if line_offsets[offset_index] > index:
+                line_no = offset_index
+                break
+        return line_no, index - line_offsets[line_no - 1]
+
+    start_line, start_col = _line_col(start_index)
+    end_line, end_col = _line_col(end_index)
+    return {
+        "source_lineno": start_line,
+        "source_col_offset": int(source_col_offset),
+        "source_end_lineno": end_line,
+        "source_end_col_offset": end_col,
+        "_span_start_index": start_index,
+        "_span_end_index": end_index,
+        "_span_original_col_offset": start_col,
+    }
+
+
+def _row_with_indices(source_text: str, target_row: dict) -> tuple[dict, int, int]:
+    row = dict(target_row)
+    start_index, end_index = _span_to_indices(
+        source_text,
+        int(row["source_lineno"]),
+        int(row["source_col_offset"]),
+        int(row["source_end_lineno"]),
+        int(row["source_end_col_offset"]),
+    )
+    row["_span_start_index"] = start_index
+    row["_span_end_index"] = end_index
+    return row, start_index, end_index
+
+
+def _decorated_node_start(node: ast.AST) -> tuple[int, int]:
+    decorators = getattr(node, "decorator_list", None) or []
+    if decorators:
+        first = decorators[0]
+        return int(getattr(first, "lineno")), int(getattr(first, "col_offset"))
+    return int(getattr(node, "lineno")), int(getattr(node, "col_offset"))
+
+
+def _node_contains_row(node: ast.AST, target_row: dict) -> bool:
+    lineno = getattr(node, "lineno", None)
+    end_lineno = getattr(node, "end_lineno", None)
+    if lineno is None or end_lineno is None:
+        return False
+    start_line = int(target_row["source_lineno"])
+    end_line = int(target_row["source_end_lineno"])
+    node_start_line, _ = _decorated_node_start(node)
+    return node_start_line <= start_line and end_line <= int(end_lineno)
+
+
+def _ast_expanded_replacement_rows(source_text: str, target_row: dict) -> list[dict]:
+    """Return mapped row plus enclosing AST definition rows that may be safer."""
+    rows: list[dict] = []
+    base_row, _, _ = _row_with_indices(source_text, target_row)
+    rows.append(base_row)
+    source_kind = str(target_row.get("source_kind") or "")
+    if source_kind and source_kind not in {"function", "async_function", "class"}:
+        return rows
+    try:
+        tree = ast.parse(source_text)
+    except SyntaxError:
+        return rows
+
+    allowed = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    nodes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, allowed)
+        and _node_contains_row(node, target_row)
+        and getattr(node, "end_lineno", None) is not None
+        and getattr(node, "end_col_offset", None) is not None
+    ]
+    if source_kind == "class":
+        nodes = [node for node in nodes if isinstance(node, ast.ClassDef)]
+    elif source_kind == "function":
+        nodes = [node for node in nodes if isinstance(node, ast.FunctionDef)]
+    elif source_kind == "async_function":
+        nodes = [node for node in nodes if isinstance(node, ast.AsyncFunctionDef)]
+    if not nodes:
+        return rows
+
+    def _span_size(node: ast.AST) -> tuple[int, int]:
+        start_line, start_col = _decorated_node_start(node)
+        return (int(getattr(node, "end_lineno")) - start_line, int(getattr(node, "end_col_offset")) - start_col)
+
+    node = min(nodes, key=_span_size)
+    start_line, start_col = _decorated_node_start(node)
+    expanded_row = dict(target_row)
+    expanded_row.update(
+        {
+            "source_lineno": start_line,
+            "source_col_offset": start_col,
+            "source_end_lineno": int(getattr(node, "end_lineno")),
+            "source_end_col_offset": int(getattr(node, "end_col_offset")),
+        }
+    )
+    expanded_row, _, _ = _row_with_indices(source_text, expanded_row)
+    if (
+        expanded_row["_span_start_index"],
+        expanded_row["_span_end_index"],
+    ) != (
+        base_row["_span_start_index"],
+        base_row["_span_end_index"],
+    ):
+        rows.append(expanded_row)
+    return rows
+
+
+def choose_best_reattachment(
+    source_text: str,
+    target_row: dict,
+    replacement_text: str,
+    original_fragment: str | None = None,
+) -> ReattachmentCandidate:
+    """Select a syntax-valid full-source splice candidate for a mapped row."""
+    best_failed: ReattachmentCandidate | None = None
+    best_parsed: tuple[tuple[int, int, int, int], ReattachmentCandidate] | None = None
+    replacement_head = textwrap.dedent(replacement_text.strip("\n")).lstrip()
+    replacement_is_definition = replacement_head.startswith(("def ", "async def ", "class ", "@"))
+
+    def _continuation_escape_penalty(candidate: str, base_indent: str) -> int:
+        lines = candidate.splitlines()
+        if len(lines) <= 1:
+            return 0
+        return sum(
+            1
+            for line in lines[1:]
+            if line.strip() and not line.startswith(base_indent)
+        )
+
+    for row_index, row in enumerate(_ast_expanded_replacement_rows(source_text, target_row)):
+        start_index = int(row["_span_start_index"])
+        end_index = int(row["_span_end_index"])
+        base_indent = " " * int(row["source_col_offset"])
+        for kind, candidate in _source_span_replacement_candidates(
+            replacement_text,
+            int(row["source_col_offset"]),
+            original_fragment,
+        ):
+            updated_text = source_text[:start_index] + candidate + source_text[end_index:]
+            candidate_kind = f"{'mapped' if row_index == 0 else 'ast_expanded'}:{kind}"
+            try:
+                ast.parse(updated_text)
+                parsed = ReattachmentCandidate(
+                    kind=candidate_kind,
+                    replacement_text=candidate,
+                    updated_source=updated_text,
+                    target_row=row,
+                    parse_ok=True,
+                )
+                row_preference = int(
+                    (replacement_is_definition and row_index == 0)
+                    or (not replacement_is_definition and row_index > 0)
+                )
+                escape_penalty = _continuation_escape_penalty(candidate, base_indent)
+                candidate_preference = 0 if kind.startswith("absolute_continuations") else 1
+                score = (row_preference, escape_penalty, candidate_preference, row_index)
+                if best_parsed is None or score < best_parsed[0]:
+                    best_parsed = (score, parsed)
+            except SyntaxError as exc:
+                best_failed = ReattachmentCandidate(
+                    kind=candidate_kind,
+                    replacement_text=candidate,
+                    updated_source=updated_text,
+                    target_row=row,
+                    parse_ok=False,
+                    parse_error=str(exc),
+                )
+    if best_parsed is not None:
+        return best_parsed[1]
+    if best_failed is not None:
+        return best_failed
+    row, start_index, end_index = _row_with_indices(source_text, target_row)
+    updated_text = source_text[:start_index] + source_text[end_index:]
+    return ReattachmentCandidate(
+        kind="empty",
+        replacement_text="",
+        updated_source=updated_text,
+        target_row=row,
+        parse_ok=False,
+        parse_error="no replacement candidates generated",
+    )
+
+
+def choose_best_reattachment_for_source_slice(
+    source_text: str,
+    start_index: int,
+    end_index: int,
+    source_col_offset: int,
+    replacement_text: str,
+    original_fragment: str | None = None,
+) -> ReattachmentCandidate:
+    target_row = _candidate_row_from_slice(source_text, start_index, end_index, source_col_offset)
+    return choose_best_reattachment(
+        source_text,
+        target_row,
+        replacement_text,
+        original_fragment,
+    )
+
+
+def normalize_semantic_replacement_for_source_slice(
+    source_text: str,
+    start_index: int,
+    end_index: int,
+    source_col_offset: int,
+    replacement_text: str,
+    original_fragment: str | None = None,
+) -> str:
+    """Choose the first indentation candidate that parses in the full source."""
+    candidates = _source_span_replacement_candidates(
+        replacement_text,
+        source_col_offset,
+        original_fragment,
+    )
+    for _, candidate in candidates:
+        updated_text = source_text[:start_index] + candidate + source_text[end_index:]
+        try:
+            ast.parse(updated_text)
+            return candidate
+        except SyntaxError:
+            continue
+    return candidates[-1][1] if candidates else ""
+
+
+def normalize_semantic_replacement_for_source(
+    source_text: str,
+    target_row: dict,
+    replacement_text: str,
+    original_fragment: str | None = None,
+) -> str:
+    """Normalize a mapped replacement by validating the whole reattached file."""
+    candidate = choose_best_reattachment(
+        source_text,
+        target_row,
+        replacement_text,
+        original_fragment,
+    )
+    return candidate.replacement_text
 
 
 def normalize_semantic_insertion_indentation(replacement_text: str, base_indent: str) -> str:
@@ -983,6 +1429,24 @@ def index_bytecodes_by_qualname(pyc_path: Path) -> dict[str, Any]:
     return {bc.name: bc for bc in bytecode_root.iter_bytecodes()}
 
 
+def _validate_reattached_code_object_structure(
+    *,
+    previous_pyc: Path,
+    candidate_pyc: Path,
+    qualname: str,
+) -> tuple[bool, str]:
+    previous_names = set(index_code_objects_by_qualname(previous_pyc))
+    candidate_names = set(index_code_objects_by_qualname(candidate_pyc))
+    if qualname not in candidate_names:
+        return False, f"reattached target qualname disappeared: {qualname}"
+    removed_siblings = sorted(previous_names - candidate_names - {qualname})
+    if removed_siblings:
+        preview = ", ".join(removed_siblings[:5])
+        suffix = "" if len(removed_siblings) <= 5 else f", ... ({len(removed_siblings)} total)"
+        return False, f"reattachment removed unrelated code objects: {preview}{suffix}"
+    return True, "reattached code object structure preserved"
+
+
 def _pylingual_result_name(result: Any) -> str:
     name_a = getattr(getattr(result, "bc_a", None), "name", None)
     name_b = getattr(getattr(result, "bc_b", None), "name", None)
@@ -1144,10 +1608,12 @@ def _truncated_repr(value: Any, limit: int = 160) -> str:
 
 
 def _instruction_records(code_object: Any) -> list[dict]:
-    try:
-        instructions = list(code_object) if hasattr(code_object, "instructions") else list(dis.get_instructions(code_object))
-    except Exception:
-        return []
+    instructions = _editable_instruction_items(code_object)
+    if not instructions:
+        decoded_records = _decode_code310_instruction_records(code_object)
+        for record in decoded_records:
+            record["argval"] = _truncated_repr(record.get("argval"))
+        return decoded_records
     records = []
     for index, inst in enumerate(instructions):
         records.append(
@@ -1175,6 +1641,23 @@ def _instruction_window(records: list[dict], start: int, end: int, radius: int) 
     return records[lo:hi]
 
 
+def _bounded_instruction_window(
+    records: list[dict],
+    start: int,
+    end: int,
+    radius: int,
+    *,
+    max_records: int = 40,
+) -> list[dict]:
+    window = _instruction_window(records, start, end, radius)
+    if len(window) <= max_records:
+        return window
+    focus_start = max(0, start - max(0, start - window[0]["index"]))
+    prefix = max_records // 2
+    suffix = max_records - prefix
+    return window[:prefix] + window[-suffix:]
+
+
 def _format_instruction_window(records: list[dict], focus_offsets: set[int]) -> str:
     lines = []
     for record in records:
@@ -1186,6 +1669,26 @@ def _format_instruction_window(records: list[dict], focus_offsets: set[int]) -> 
             line += f" {record['argval']}"
         lines.append(line)
     return "\n".join(lines) if lines else "<instruction window unavailable>"
+
+
+def _largest_non_equal_opcode(
+    gt_records: list[dict],
+    derived_records: list[dict],
+) -> tuple[str, int, int, int, int]:
+    sm = __import__("difflib").SequenceMatcher(
+        a=[_instruction_alignment_signature(record) for record in gt_records],
+        b=[_instruction_alignment_signature(record) for record in derived_records],
+    )
+    opcodes = [opcode for opcode in sm.get_opcodes() if opcode[0] != "equal"]
+    if not opcodes:
+        return ("equal", 0, min(1, len(gt_records)), 0, min(1, len(derived_records)))
+    return max(
+        opcodes,
+        key=lambda opcode: (
+            max(opcode[2] - opcode[1], opcode[4] - opcode[3]),
+            (opcode[2] - opcode[1]) + (opcode[4] - opcode[3]),
+        ),
+    )
 
 
 def _localized_instruction_context(
@@ -1205,8 +1708,13 @@ def _localized_instruction_context(
             "derived_instruction_window": "<instruction window unavailable>",
         }
 
+    sm = __import__("difflib").SequenceMatcher(
+        a=[_instruction_alignment_signature(record) for record in gt_records],
+        b=[_instruction_alignment_signature(record) for record in derived_records],
+    )
     if failed_offset is None:
-        derived_index = 0
+        alignment_tag, gt_start, gt_end, derived_start, derived_end = _largest_non_equal_opcode(gt_records, derived_records)
+        derived_index = derived_start
     else:
         exact = [record["index"] for record in derived_records if record["offset"] == failed_offset]
         if exact:
@@ -1216,29 +1724,24 @@ def _localized_instruction_context(
                 range(len(derived_records)),
                 key=lambda idx: abs(int(derived_records[idx]["offset"]) - int(failed_offset)),
             )
+        gt_start = max(0, min(derived_index, len(gt_records) - 1))
+        gt_end = gt_start + 1
+        derived_start = derived_index
+        derived_end = derived_index + 1
+        alignment_tag = "nearest_index"
+        for tag, a1, a2, b1, b2 in sm.get_opcodes():
+            if b1 <= derived_index < max(b2, b1 + 1):
+                alignment_tag = tag
+                derived_start, derived_end = b1, b2
+                if tag == "equal" and b2 > b1:
+                    gt_start = a1 + (derived_index - b1)
+                    gt_end = gt_start + 1
+                else:
+                    gt_start, gt_end = a1, a2
+                break
 
-    gt_start = max(0, min(derived_index, len(gt_records) - 1))
-    gt_end = gt_start + 1
-    derived_start = derived_index
-    derived_end = derived_index + 1
-    alignment_tag = "nearest_index"
-    sm = __import__("difflib").SequenceMatcher(
-        a=[_instruction_alignment_signature(record) for record in gt_records],
-        b=[_instruction_alignment_signature(record) for record in derived_records],
-    )
-    for tag, a1, a2, b1, b2 in sm.get_opcodes():
-        if b1 <= derived_index < max(b2, b1 + 1):
-            alignment_tag = tag
-            derived_start, derived_end = b1, b2
-            if tag == "equal" and b2 > b1:
-                gt_start = a1 + (derived_index - b1)
-                gt_end = gt_start + 1
-            else:
-                gt_start, gt_end = a1, a2
-            break
-
-    derived_window = _instruction_window(derived_records, derived_start, derived_end, radius)
-    gt_window = _instruction_window(gt_records, gt_start, gt_end, radius)
+    derived_window = _bounded_instruction_window(derived_records, derived_start, derived_end, radius)
+    gt_window = _bounded_instruction_window(gt_records, gt_start, gt_end, radius)
     focus_offsets = {int(failed_offset)} if failed_offset is not None else set()
     return {
         "failed_offset": failed_offset,
@@ -1294,8 +1797,13 @@ def _instruction_diff_context(
             "instruction_diff": "<instruction diff unavailable>",
         }
 
+    sm = __import__("difflib").SequenceMatcher(
+        a=[_instruction_alignment_signature(record) for record in gt_records],
+        b=[_instruction_alignment_signature(record) for record in derived_records],
+    )
     if failed_offset is None:
-        derived_index = 0
+        alignment_tag, gt_start, gt_end, derived_start, derived_end = _largest_non_equal_opcode(gt_records, derived_records)
+        derived_index = derived_start
     else:
         exact = [record["index"] for record in derived_records if record["offset"] == failed_offset]
         if exact:
@@ -1305,29 +1813,24 @@ def _instruction_diff_context(
                 range(len(derived_records)),
                 key=lambda idx: abs(int(derived_records[idx]["offset"]) - int(failed_offset)),
             )
+        gt_start = max(0, min(derived_index, len(gt_records) - 1))
+        gt_end = gt_start + 1
+        derived_start = derived_index
+        derived_end = derived_index + 1
+        alignment_tag = "nearest_index"
+        for tag, a1, a2, b1, b2 in sm.get_opcodes():
+            if b1 <= derived_index < max(b2, b1 + 1):
+                alignment_tag = tag
+                derived_start, derived_end = b1, b2
+                if tag == "equal" and b2 > b1:
+                    gt_start = a1 + (derived_index - b1)
+                    gt_end = gt_start + 1
+                else:
+                    gt_start, gt_end = a1, a2
+                break
 
-    gt_start = max(0, min(derived_index, len(gt_records) - 1))
-    gt_end = gt_start + 1
-    derived_start = derived_index
-    derived_end = derived_index + 1
-    alignment_tag = "nearest_index"
-    sm = __import__("difflib").SequenceMatcher(
-        a=[_instruction_alignment_signature(record) for record in gt_records],
-        b=[_instruction_alignment_signature(record) for record in derived_records],
-    )
-    for tag, a1, a2, b1, b2 in sm.get_opcodes():
-        if b1 <= derived_index < max(b2, b1 + 1):
-            alignment_tag = tag
-            derived_start, derived_end = b1, b2
-            if tag == "equal" and b2 > b1:
-                gt_start = a1 + (derived_index - b1)
-                gt_end = gt_start + 1
-            else:
-                gt_start, gt_end = a1, a2
-            break
-
-    gt_window = _instruction_window(gt_records, gt_start, gt_end, radius)
-    derived_window = _instruction_window(derived_records, derived_start, derived_end, radius)
+    gt_window = _bounded_instruction_window(gt_records, gt_start, gt_end, radius)
+    derived_window = _bounded_instruction_window(derived_records, derived_start, derived_end, radius)
     focus_offsets = {int(failed_offset)} if failed_offset is not None else set()
     diff_lines: list[str] = []
     max_len = max(len(gt_window), len(derived_window))
@@ -1353,10 +1856,18 @@ def _instruction_diff_context(
             diff_lines.append(f"{marker} gt: {_format_instruction_record(gt_record)}")
             diff_lines.append(f"{marker} derived: {_format_instruction_record(derived_record)}")
 
+    summary = (
+        f"summary: alignment={alignment_tag}; "
+        f"gt_range=[{gt_start}:{gt_end}]; derived_range=[{derived_start}:{derived_end}]; "
+        f"failed_offset={failed_offset}"
+    )
+    if len(diff_lines) > 40:
+        diff_lines = diff_lines[:20] + ["  ... <instruction diff truncated> ..."] + diff_lines[-20:]
+
     return {
         "failed_offset": failed_offset,
         "alignment_tag": alignment_tag,
-        "instruction_diff": "\n".join(diff_lines) if diff_lines else "<instruction diff unavailable>",
+        "instruction_diff": "\n".join([summary, *diff_lines]) if diff_lines else "<instruction diff unavailable>",
     }
 
 
@@ -1498,12 +2009,16 @@ def _apply_module_statement_candidate(
     current_text = _load_text(current_source)
     node, start_index, end_index = _find_top_level_statement_for_line(current_text, line_number)
     extracted_before = current_text[start_index:end_index]
-    replacement_text = normalize_semantic_replacement_indentation(
+    reattachment_candidate = choose_best_reattachment_for_source_slice(
+        current_text,
+        start_index,
+        end_index,
+        int(getattr(node, "col_offset", 0)),
         candidate_text,
-        {"source_col_offset": int(getattr(node, "col_offset", 0))},
         extracted_before,
     )
-    updated_text = current_text[:start_index] + replacement_text + current_text[end_index:]
+    replacement_text = reattachment_candidate.replacement_text
+    updated_text = reattachment_candidate.updated_source
 
     fragment_path = fragments_dir / f"{step_index:02d}_module_line_{line_number}.pyfrag"
     fragment_path.write_text(replacement_text, encoding="utf-8")
@@ -1542,6 +2057,9 @@ def _apply_module_statement_candidate(
         "output_pyc": str(next_pyc),
         "extracted_before": extracted_before,
         "replacement_text": replacement_text,
+        "reattachment_candidate_kind": reattachment_candidate.kind,
+        "reattachment_parse_ok": reattachment_candidate.parse_ok,
+        "reattachment_parse_error": reattachment_candidate.parse_error,
         "target_score_before": target_score_before,
         "target_score_after": target_score_after,
         "summary": step_summary,
@@ -1731,8 +2249,8 @@ def repair_mismatching_code_objects(
                     )
                     replacement_text = fragment_fixer(
                         qualname,
-                        gt_code_object,
-                        derived_code_object,
+                        gt_bytecode,
+                        derived_bytecode,
                         extracted_before,
                         repair_context,
                     )
@@ -1804,16 +2322,19 @@ def repair_mismatching_code_objects(
             current_text = _load_text(current_source)
             extracted_before = extract_source_segment(current_text, target_row)
             current_code_objects = index_code_objects_by_qualname(current_pyc)
+            current_bytecodes = index_bytecodes_by_qualname(current_pyc)
             gt_code_object = gt_code_objects.get(qualname)
             derived_code_object = current_code_objects.get(qualname)
+            gt_bytecode = gt_bytecodes.get(qualname)
+            derived_bytecode = current_bytecodes.get(qualname)
             if gt_code_object is None:
                 raise ReattachError(f"No ground-truth code object found for qualname: {qualname}")
             if derived_code_object is None:
                 raise ReattachError(f"No derived code object found for qualname: {qualname}")
             repair_context = _build_target_repair_context(
                 qualname=qualname,
-                gt_code_object=gt_code_object,
-                derived_code_object=derived_code_object,
+                gt_code_object=gt_bytecode,
+                derived_code_object=derived_bytecode,
                 verification=current_pylingual_verification,
                 rejected_attempts=[],
             )
@@ -1832,24 +2353,31 @@ def repair_mismatching_code_objects(
                 )
                 replacement_text = fragment_fixer(
                     qualname,
-                    gt_code_object,
-                    derived_code_object,
+                    gt_bytecode,
+                    derived_bytecode,
                     extracted_before,
                     repair_context,
                 )
-            replacement_text = normalize_semantic_replacement_indentation(
-                replacement_text,
+            reattachment_candidate = choose_best_reattachment(
+                current_text,
                 target_row,
+                replacement_text,
                 extracted_before,
             )
+            replacement_text = reattachment_candidate.replacement_text
             fragment_path = fragments_dir / f"{step_index:02d}_{qualname.replace('<', '').replace('>', '').replace('.', '_')}.pyfrag"
             fragment_path.write_text(replacement_text, encoding="utf-8")
-            updated_text = replace_source_segment(current_text, target_row, replacement_text)
+            updated_text = reattachment_candidate.updated_source
 
             next_source = output_dir / f"step{step_index}_{derived_source.stem}.py"
             next_source.write_text(updated_text, encoding="utf-8")
             next_pyc = pyc_dir / f"{next_source.stem}.cpython-310.pyc"
             compile_source_to_pyc(next_source, next_pyc)
+            structure_ok, structure_reason = _validate_reattached_code_object_structure(
+                previous_pyc=current_pyc,
+                candidate_pyc=next_pyc,
+                qualname=qualname,
+            )
 
             step_rows = compare_code_object_distances(gt_pyc, next_pyc)
             step_summary = summarize_results(step_rows)
@@ -1868,6 +2396,9 @@ def repair_mismatching_code_objects(
             if not reject_non_improving_candidates:
                 accepted = True
                 acceptance_reason = "candidate retained without acceptance filtering"
+            if not structure_ok:
+                accepted = False
+                acceptance_reason = structure_reason
             _store_semantic_step(
                 steps,
                 {
@@ -1881,6 +2412,11 @@ def repair_mismatching_code_objects(
                     "derived_code_object_name": getattr(derived_code_object, "co_name", None),
                     "extracted_before": extracted_before,
                     "replacement_text": replacement_text,
+                    "reattachment_candidate_kind": reattachment_candidate.kind,
+                    "reattachment_parse_ok": reattachment_candidate.parse_ok,
+                    "reattachment_parse_error": reattachment_candidate.parse_error,
+                    "reattachment_structure_ok": structure_ok,
+                    "reattachment_structure_reason": structure_reason,
                     "target_score_before": target_score_before,
                     "target_score_after": target_score_after,
                     "summary": step_summary,
@@ -2076,7 +2612,9 @@ def repair_mismatching_code_objects(
             target_score_before = _score_snapshot(_find_distance_row(step_before_rows, qualname))
             current_text = _load_text(current_source)
             current_code_objects = index_code_objects_by_qualname(current_pyc)
+            current_bytecodes = index_bytecodes_by_qualname(current_pyc)
             gt_code_object = gt_code_objects.get(qualname)
+            gt_bytecode = gt_bytecodes.get(qualname)
             if gt_code_object is None:
                 raise ReattachError(f"No ground-truth code object found for missing qualname: {qualname}")
 
@@ -2109,8 +2647,8 @@ def repair_mismatching_code_objects(
             else:
                 repair_context = _build_target_repair_context(
                     qualname=qualname,
-                    gt_code_object=gt_code_object,
-                    derived_code_object=current_code_objects.get(qualname),
+                    gt_code_object=gt_bytecode,
+                    derived_code_object=current_bytecodes.get(qualname),
                     verification=current_pylingual_verification,
                     rejected_attempts=[],
                 )
@@ -2124,8 +2662,8 @@ def repair_mismatching_code_objects(
                 )
                 replacement_text = fragment_fixer(
                     qualname,
-                    gt_code_object,
-                    current_code_objects.get(qualname),
+                    gt_bytecode,
+                    current_bytecodes.get(qualname),
                     insertion_context,
                     repair_context,
                 )

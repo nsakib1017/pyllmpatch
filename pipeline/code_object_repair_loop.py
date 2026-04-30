@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import argparse
 import csv
-import dis
 import json
+import re
+import sys
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -22,6 +23,11 @@ from utils.reattach_source_code_object import (
     repair_mismatching_code_objects,
 )
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PYLINGUAL_ROOT = REPO_ROOT / "pylingual"
+if str(PYLINGUAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(PYLINGUAL_ROOT))
+
 SEMANTIC_REPAIR_SYSTEM_PROMPT = """You are a Python bytecode-aware semantic repair specialist.
 
 You will receive:
@@ -33,36 +39,284 @@ You will receive:
 Edit only the provided source fragment. Preserve the same public names, function/class boundary, decorators, parameters, and return shape unless the bytecode evidence clearly requires a small change. Make the minimal source changes that best align the derived code object with the ground-truth code object. Keep relative indentation valid. Return only the repaired Python source fragment, with no markdown fences and no explanation.
 """
 
+INDENTATION_CONTRACT = """Indentation contract:
+- Preserve the first line's relative indentation exactly as shown.
+- If the fragment starts with `def`, `async def`, or `class`, do not dedent or reindent that header.
+- Only adjust indentation inside the fragment when needed to make the repaired Python valid.
+- Return a complete replacement for the provided fragment, not only the changed lines.
+- Do not include source line-number prefixes such as `12|` in the returned fragment."""
 
-def _format_code_object_for_prompt(code_object: Any) -> str:
+BYTECODE_PROMPT_WINDOW_RADIUS = 12
+BYTECODE_PROMPT_MAX_LINES_PER_SIDE = 30
+BYTECODE_PROMPT_FULL_LISTING_MAX_INSTRUCTIONS = 80
+
+
+def _safe_instruction_argrepr(opname: str, arg: int | None, code_object: Any) -> str:
+    if arg is None:
+        return ""
+    consts = getattr(code_object, "co_consts", ())
+    names = getattr(code_object, "co_names", ())
+    varnames = getattr(code_object, "co_varnames", ())
+    freevars = getattr(code_object, "co_freevars", ())
+    cellvars = getattr(code_object, "co_cellvars", ())
+    closure_vars = tuple(cellvars) + tuple(freevars)
+    if opname in {"LOAD_CONST"} and 0 <= arg < len(consts):
+        value = consts[arg]
+        if hasattr(value, "co_name"):
+            return f"{arg} (<code object {getattr(value, 'co_name', None)}>)"
+        return f"{arg} ({value!r})"
+    if opname in {
+        "LOAD_NAME",
+        "STORE_NAME",
+        "DELETE_NAME",
+        "LOAD_GLOBAL",
+        "STORE_GLOBAL",
+        "DELETE_GLOBAL",
+        "LOAD_ATTR",
+        "STORE_ATTR",
+        "DELETE_ATTR",
+        "LOAD_METHOD",
+        "IMPORT_NAME",
+        "IMPORT_FROM",
+    } and 0 <= arg < len(names):
+        return f"{arg} ({names[arg]})"
+    if opname in {"LOAD_FAST", "STORE_FAST", "DELETE_FAST"} and 0 <= arg < len(varnames):
+        return f"{arg} ({varnames[arg]})"
+    if opname in {"LOAD_DEREF", "STORE_DEREF", "DELETE_DEREF", "LOAD_CLASSDEREF"} and 0 <= arg < len(closure_vars):
+        return f"{arg} ({closure_vars[arg]})"
+    return str(arg)
+
+
+def _format_editable_bytecode_instructions(bytecode: Any) -> str:
+    try:
+        instructions = list(bytecode)
+    except Exception as exc:
+        return f"<editable bytecode instruction listing unavailable: {type(exc).__name__}: {exc}>"
+    lines = []
+    for index, inst in enumerate(instructions):
+        opcode = getattr(inst, "opcode", None)
+        optype = getattr(inst, "optype", None)
+        starts_line = getattr(inst, "starts_line", None)
+        is_jump_target = getattr(inst, "is_jump_target", False)
+        has_extended_arg = getattr(inst, "has_extended_arg", False)
+        markers = []
+        if is_jump_target:
+            markers.append("target")
+        if has_extended_arg:
+            markers.append("extended")
+        try:
+            if getattr(inst, "is_jump", False):
+                target = getattr(inst, "target", None)
+                target_offset = getattr(target, "offset", None)
+                markers.append(f"jump->{target_offset}")
+        except Exception:
+            markers.append("jump")
+        marker_text = f" [{' '.join(markers)}]" if markers else ""
+        try:
+            dis_view = inst.get_dis_view()
+        except Exception:
+            dis_view = repr(inst)
+        line = f"{index:4} line={starts_line} {dis_view}"
+        if opcode is not None:
+            line += f" opcode={opcode}"
+        if optype:
+            line += f" optype={optype}"
+        line += marker_text
+        lines.append(line)
+    return "\n".join(lines) if lines else "<editable bytecode instruction listing unavailable: empty>"
+
+
+def _editable_bytecode_instruction_lines(bytecode: Any) -> list[str]:
+    listing = _format_editable_bytecode_instructions(bytecode)
+    if listing.startswith("<editable bytecode instruction listing unavailable:"):
+        return []
+    return listing.splitlines()
+
+
+def _format_editable_bytecode_window(
+    bytecode: Any,
+    *,
+    failed_offset: int | None = None,
+    radius: int = BYTECODE_PROMPT_WINDOW_RADIUS,
+    max_lines: int = BYTECODE_PROMPT_MAX_LINES_PER_SIDE,
+) -> str:
+    try:
+        instructions = list(bytecode)
+    except Exception as exc:
+        return f"<editable bytecode instruction window unavailable: {type(exc).__name__}: {exc}>"
+    if not instructions:
+        return "<editable bytecode instruction window unavailable: empty>"
+
+    if failed_offset is None:
+        focus_index = 0
+    else:
+        exact = [
+            index
+            for index, inst in enumerate(instructions)
+            if getattr(inst, "offset", None) == failed_offset
+        ]
+        if exact:
+            focus_index = exact[0]
+        else:
+            focus_index = min(
+                range(len(instructions)),
+                key=lambda index: abs(int(getattr(instructions[index], "offset", 0)) - int(failed_offset)),
+            )
+    start = max(0, focus_index - radius)
+    end = min(len(instructions), focus_index + radius + 1)
+    if end - start > max_lines:
+        overflow = end - start - max_lines
+        trim_left = overflow // 2
+        trim_right = overflow - trim_left
+        start += trim_left
+        end -= trim_right
+    window_bytecode = type(
+        "EditableBytecodeWindow",
+        (),
+        {"__iter__": lambda self: iter(instructions[start:end])},
+    )()
+    lines = _format_editable_bytecode_instructions(window_bytecode).splitlines()
+    header = f"<EditableBytecode instruction window: focus_index={focus_index}, rows={start}:{end}, total={len(instructions)}>"
+    return "\n".join([header, *lines])
+
+
+def _code_object_from_prompt_object(code_object_or_bytecode: Any) -> Any:
+    return getattr(code_object_or_bytecode, "codeobj", code_object_or_bytecode)
+
+
+CODE_OBJECT_PROMPT_FIELDS = [
+    "co_name",
+    "co_qualname",
+    "co_argcount",
+    "co_posonlyargcount",
+    "co_kwonlyargcount",
+    "co_flags",
+    "co_varnames",
+    "co_names",
+    "co_freevars",
+    "co_cellvars",
+    "co_consts",
+]
+
+
+def _code_object_prompt_values(code_object: Any) -> dict[str, Any]:
+    if code_object is None:
+        return {}
+    code_object = _code_object_from_prompt_object(code_object)
+    return {field: getattr(code_object, field, None if field != "co_consts" else ()) for field in CODE_OBJECT_PROMPT_FIELDS}
+
+
+def _format_code_object_metadata_for_prompt(code_object: Any) -> str:
     if code_object is None:
         return "<missing>"
+    values = _code_object_prompt_values(code_object)
+    return "\n".join(f"{field}: {values[field]}" for field in CODE_OBJECT_PROMPT_FIELDS)
 
-    fields = [
-        f"co_name: {getattr(code_object, 'co_name', None)}",
-        f"co_qualname: {getattr(code_object, 'co_qualname', None)}",
-        f"co_argcount: {getattr(code_object, 'co_argcount', None)}",
-        f"co_posonlyargcount: {getattr(code_object, 'co_posonlyargcount', None)}",
-        f"co_kwonlyargcount: {getattr(code_object, 'co_kwonlyargcount', None)}",
-        f"co_nlocals: {getattr(code_object, 'co_nlocals', None)}",
-        f"co_stacksize: {getattr(code_object, 'co_stacksize', None)}",
-        f"co_flags: {getattr(code_object, 'co_flags', None)}",
-        f"co_varnames: {getattr(code_object, 'co_varnames', ())}",
-        f"co_names: {getattr(code_object, 'co_names', ())}",
-        f"co_freevars: {getattr(code_object, 'co_freevars', ())}",
-        f"co_cellvars: {getattr(code_object, 'co_cellvars', ())}",
-        f"co_consts: {getattr(code_object, 'co_consts', ())}",
-    ]
-    try:
-        disassembly = dis.Bytecode(code_object).dis()
-    except Exception as exc:
-        disassembly = f"<disassembly unavailable: {type(exc).__name__}: {exc}>"
-    return "\n".join(fields) + "\n\nDisassembly:\n" + disassembly
+
+def _format_line_numbered_source_fragment(source: str, *, start_line: int = 1) -> str:
+    lines = source.splitlines()
+    if not lines:
+        return ""
+    end_line = start_line + len(lines) - 1
+    width = max(3, len(str(end_line)))
+    return "\n".join(f"{line_no:0{width}d}| {line}" for line_no, line in enumerate(lines, start_line))
+
+
+def strip_prompt_line_numbers(text: str) -> str:
+    """Remove copied `NNN|` source-display prefixes from an LLM response."""
+    lines = text.splitlines()
+    if not lines:
+        return text
+    nonblank = [line for line in lines if line.strip()]
+    if not nonblank:
+        return text
+    prefix_pattern = re.compile(r"^\s*\d+\|\s?")
+    if not all(prefix_pattern.match(line) for line in nonblank):
+        return text
+    stripped = [prefix_pattern.sub("", line, count=1) if line.strip() else "" for line in lines]
+    return "\n".join(stripped)
+
+
+def _format_code_object_for_prompt(code_object: Any, bytecode: Any | None = None) -> str:
+    """Legacy formatter: metadata plus EditableBytecode listing when available."""
+    if code_object is None:
+        return "<missing>"
+    if bytecode is None and hasattr(code_object, "codeobj"):
+        bytecode = code_object
+    fields = _format_code_object_metadata_for_prompt(code_object)
+    if bytecode is not None:
+        disassembly = "<using EditableBytecode instruction listing>\n" + _format_editable_bytecode_instructions(bytecode)
+    else:
+        disassembly = "<instruction listing unavailable: EditableBytecode required for Python 3.10 prompt rendering>"
+    return fields + "\n\nDisassembly:\n" + disassembly
+
+
+def _format_pair_metadata_for_prompt(gt_code_object: Any, derived_code_object: Any) -> str:
+    if gt_code_object is None and derived_code_object is None:
+        return "Ground-truth: <missing>\nDerived: <missing>"
+    if gt_code_object is None:
+        return "Ground-truth: <missing>\n\nDerived metadata:\n" + _format_code_object_metadata_for_prompt(derived_code_object)
+    if derived_code_object is None:
+        return "Ground-truth metadata:\n" + _format_code_object_metadata_for_prompt(gt_code_object) + "\n\nDerived: <missing>"
+
+    gt_values = _code_object_prompt_values(gt_code_object)
+    derived_values = _code_object_prompt_values(derived_code_object)
+    same_fields = [field for field in CODE_OBJECT_PROMPT_FIELDS if gt_values.get(field) == derived_values.get(field)]
+    different_fields = [field for field in CODE_OBJECT_PROMPT_FIELDS if gt_values.get(field) != derived_values.get(field)]
+    lines = []
+    if same_fields:
+        lines.append("Identical fields: " + ", ".join(same_fields))
+        lines.extend(f"{field}: {gt_values[field]}" for field in same_fields)
+    if different_fields:
+        lines.append("\nDifferent fields:")
+        for field in different_fields:
+            lines.append(f"gt.{field}: {gt_values.get(field)}")
+            lines.append(f"derived.{field}: {derived_values.get(field)}")
+    return "\n".join(lines)
+
+
+def _instruction_diff_available(repair_context: dict | None) -> bool:
+    if not repair_context:
+        return False
+    diff = str(repair_context.get("instruction_diff") or "")
+    return bool(diff.strip()) and "unavailable" not in diff.lower()
+
+
+def _format_bytecode_evidence_for_prompt(
+    *,
+    gt_bytecode: Any | None,
+    derived_bytecode: Any | None,
+    repair_context: dict | None,
+) -> str:
+    if gt_bytecode is None and derived_bytecode is None:
+        return ""
+    failed_offset = None if not repair_context else repair_context.get("failed_offset")
+    failed_offset = None if failed_offset is None else int(failed_offset)
+    diff_available = _instruction_diff_available(repair_context)
+    if diff_available:
+        return ""
+    blocks = ["Bytecode evidence fallback:"]
+    for label, bytecode in (("Ground-truth", gt_bytecode), ("Derived", derived_bytecode)):
+        if bytecode is None:
+            blocks.append(f"{label}: <missing>")
+            continue
+        try:
+            instruction_count = len(list(bytecode))
+        except Exception:
+            instruction_count = 0
+        if 0 < instruction_count <= BYTECODE_PROMPT_FULL_LISTING_MAX_INSTRUCTIONS:
+            blocks.append(f"{label} full instruction listing ({instruction_count} instructions):")
+            blocks.append(_format_editable_bytecode_instructions(bytecode))
+        else:
+            blocks.append(f"{label} localized instruction window:")
+            blocks.append(_format_editable_bytecode_window(bytecode, failed_offset=failed_offset))
+    return "\n".join(blocks)
 
 
 def _format_code_object_summary_for_prompt(code_object: Any) -> str:
     if code_object is None:
         return "<missing>"
+    code_object = _code_object_from_prompt_object(code_object)
     fields = [
         f"co_name: {getattr(code_object, 'co_name', None)}",
         f"co_qualname: {getattr(code_object, 'co_qualname', None)}",
@@ -81,9 +335,9 @@ def _format_code_object_summary_for_prompt(code_object: Any) -> str:
 def _format_module_code_object_for_prompt(code_object: Any) -> str:
     if code_object is None:
         return "<missing>"
+    code_object = _code_object_from_prompt_object(code_object)
     fields = [
         f"co_name: {getattr(code_object, 'co_name', None)}",
-        f"co_firstlineno: {getattr(code_object, 'co_firstlineno', None)}",
         f"co_flags: {getattr(code_object, 'co_flags', None)}",
     ]
     return "\n".join(fields)
@@ -105,7 +359,7 @@ def _format_repair_context(repair_context: dict | None, *, module_mode: bool = F
             for item in rejected_attempts
         )
     failed = repair_context.get("pylingual_failed_result") or {}
-    return f"""Localized repair context:
+    return f"""Failure context:
 - target_kind: {repair_context.get("target_kind")}
 - qualname: {repair_context.get("qualname")}
 - localized_line_number: {repair_context.get("localized_line_number")}
@@ -130,39 +384,52 @@ def build_semantic_repair_messages(
     derived_code_object: Any,
     derived_source_fragment: str,
     repair_context: dict | None = None,
+    gt_bytecode: Any | None = None,
+    derived_bytecode: Any | None = None,
 ) -> list[dict]:
     if qualname == "<module>":
         task_text = "Edit only the localized top-level module source statement. Preserve valid Python syntax and make the smallest source change that best aligns the module bytecode with the ground-truth module bytecode."
-        gt_code_object_text = _format_module_code_object_for_prompt(gt_code_object)
-        derived_code_object_text = _format_module_code_object_for_prompt(derived_code_object)
         source_label = "Current derived top-level module statement"
     elif derived_code_object is None:
         task_text = "The target code object is missing from the derived bytecode. Synthesize only the missing Python source fragment that should be inserted into the derived source."
-        gt_code_object_text = _format_code_object_for_prompt(gt_code_object)
-        derived_code_object_text = _format_code_object_for_prompt(derived_code_object)
         source_label = "Derived insertion context"
     else:
         task_text = "Edit only the current derived source fragment."
-        gt_code_object_text = _format_code_object_for_prompt(gt_code_object)
-        derived_code_object_text = _format_code_object_for_prompt(derived_code_object)
         source_label = "Current derived source fragment"
+    metadata_text = (
+        _format_pair_metadata_for_prompt(gt_code_object, derived_code_object)
+        if qualname != "<module>"
+        else "Ground-truth module metadata:\n"
+        + _format_module_code_object_for_prompt(gt_code_object)
+        + "\n\nDerived module metadata:\n"
+        + _format_module_code_object_for_prompt(derived_code_object)
+    )
+    bytecode_evidence = _format_bytecode_evidence_for_prompt(
+        gt_bytecode=gt_bytecode,
+        derived_bytecode=derived_bytecode,
+        repair_context=repair_context,
+    )
+    bytecode_section = f"\n\n{bytecode_evidence}" if bytecode_evidence else ""
+    source_start_line = 1
+    if repair_context and repair_context.get("source_lineno") is not None:
+        source_start_line = int(repair_context["source_lineno"])
+    numbered_fragment = _format_line_numbered_source_fragment(derived_source_fragment, start_line=source_start_line)
 
     user_prompt = f"""Task: {task_text}
 
 Target qualname: {qualname}
 
-Ground-truth code object:
-{gt_code_object_text}
-
-Current derived code object:
-{derived_code_object_text}
-
-{_format_repair_context(repair_context, module_mode=qualname == "<module>")}
+{INDENTATION_CONTRACT}
 
 {source_label}:
 ```python
-{derived_source_fragment}
+{numbered_fragment}
 ```
+
+{_format_repair_context(repair_context, module_mode=qualname == "<module>")}
+
+Code object metadata:
+{metadata_text}{bytecode_section}
 
 Return only the repaired source fragment."""
     return [
@@ -247,12 +514,14 @@ class LLMFragmentFixer(FragmentFixer):
         response = make_llm_call_from_config(messages, self.llm_config)
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         response_text = strip_code_fences(response)
-        content = response_text.strip()
+        cleaned_response_text = strip_prompt_line_numbers(response_text)
+        content = cleaned_response_text.strip()
         prompt_record.update(
             {
                 "latency_ms": elapsed_ms,
                 "usage": None if response is None else str(response.get("usage")),
                 "response_text": response_text,
+                "line_number_stripped_text": cleaned_response_text,
                 "returned_text": content if content else derived_source_fragment,
             }
         )

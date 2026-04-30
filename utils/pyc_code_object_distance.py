@@ -34,9 +34,9 @@ MISSING_CODE_OBJECT_BASE_PENALTY = 4
 
 def _load_bytecode_dependencies():
     import xdis.opcodes
-    from xdis.load import load_module
     from pylingual.control_flow_reconstruction.cfg import CFG
     from pylingual.editable_bytecode import EditableBytecode, Inst
+    from pylingual.editable_bytecode.PYCFile import PYCFile
     from pylingual.editable_bytecode.bytecode_patches import (
         fix_indirect_jump,
         fix_unreachable,
@@ -49,10 +49,10 @@ def _load_bytecode_dependencies():
 
     return {
         "xdis_opcodes": xdis.opcodes,
-        "load_module": load_module,
         "CFG": CFG,
         "EditableBytecode": EditableBytecode,
         "Inst": Inst,
+        "PYCFile": PYCFile,
         "bytecode_to_control_flow_graph": bytecode_to_control_flow_graph,
         "is_control_flow_equivalent": is_control_flow_equivalent,
         "matching_iter": matching_iter,
@@ -95,15 +95,7 @@ def validate_input(path: Path) -> Path:
 
 def load_editable_bytecode_from_pyc(path: Path):
     deps = _load_bytecode_dependencies()
-    source_tuple = deps["load_module"](str(path))
-    if len(source_tuple) < 4:
-        raise ValueError(f"Unexpected xdis load result with {len(source_tuple)} fields")
-
-    version = source_tuple[0]
-    code = source_tuple[3]
-    opcode = getattr(deps["xdis_opcodes"], f"opcode_{version[0]}{version[1]}")
-
-    bytecode = deps["EditableBytecode"](code, opcode, version)
+    bytecode = deps["PYCFile"](path)
     bytecode.apply_patches(deps["patches"])
     return bytecode
 
