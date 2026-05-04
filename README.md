@@ -97,12 +97,14 @@ Run semantic repair over `semantic_error` rows in the configured dataset:
 
 ```bash
 python main.py semantic-repair --dataset-mode --limit 10
+python main.py semantic-repair --dataset-mode --row-range 10:20
 ```
 
 Optional semantic repair flags:
 
 ```bash
 --dataset-path /path/to/dataset.csv
+--row-range 10:20
 --file-hash <hash>
 --skip-pylingual-verification
 --skip-step-verification

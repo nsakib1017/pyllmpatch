@@ -98,6 +98,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional limit for dataset mode",
     )
     repair_loop.add_argument(
+        "--row-range",
+        "--range",
+        dest="row_range",
+        type=str,
+        default=None,
+        help="Optional dataset-mode row range after filters, before --limit. Uses zero-based START:END slicing, e.g. 10:20, 10:, :20, or 10.",
+    )
+    repair_loop.add_argument(
         "--file-hash",
         type=str,
         default=None,
@@ -138,6 +146,7 @@ def main() -> None:
                 limit=args.limit,
                 file_hash=args.file_hash,
                 source=args.source,
+                row_range=args.row_range,
                 verify_with_pylingual=not args.skip_pylingual_verification,
                 verify_each_step_with_pylingual=not args.skip_step_verification,
                 reject_non_improving_candidates=not args.keep_non_improving,

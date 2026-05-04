@@ -1507,6 +1507,41 @@ def select_missing_expression_child_parent_targets(distance_rows: list[dict]) ->
     return sorted(set(parents), key=lambda name: (_qualname_depth(name), name))
 
 
+def select_missing_expression_child_parent_records(distance_rows: list[dict]) -> list[dict[str, Any]]:
+    available_names = {
+        name
+        for row in distance_rows
+        for name in (row.get("gt_name"), row.get("derived_name"))
+        if name
+    }
+    records = []
+    for row in distance_rows:
+        if row.get("status") != "missing":
+            continue
+        child = row.get("gt_name")
+        parent = _expression_child_parent_qualname(child)
+        if not parent or parent not in available_names or parent == "<module>":
+            continue
+        parent_row = _find_distance_row(distance_rows, parent)
+        records.append(
+            {
+                "child_qualname": child,
+                "child_kind": _expression_child_kind(child),
+                "parent_qualname": parent,
+                "parent_score": _score_snapshot(parent_row),
+                "child_score": _score_snapshot(row),
+            }
+        )
+    return sorted(
+        records,
+        key=lambda item: (
+            _qualname_depth(str(item.get("parent_qualname"))),
+            str(item.get("parent_qualname")),
+            str(item.get("child_qualname")),
+        ),
+    )
+
+
 def _expression_child_kind(qualname: str | None) -> str | None:
     if not qualname:
         return None
@@ -2686,6 +2721,7 @@ def repair_mismatching_code_objects(
     all_extra_targets = list(initial_extra_targets)
     step_index = 0
     unsupported_missing_targets: set[str] = set()
+    skipped_expression_child_targets: set[str] = set()
     unsupported_extra_targets: set[str] = set()
     unsupported_module_body_repair = False
     module_rejected_attempts: list[dict] = []
@@ -2705,12 +2741,39 @@ def repair_mismatching_code_objects(
             if target_attempt_counts.get(qualname, 0) < max_iterations
             and _pylingual_target_is_equal(current_pylingual_verification, qualname) is not True
         ]
-        expression_child_parent_targets = [
-            qualname
-            for qualname in select_missing_expression_child_parent_targets(iteration_rows)
-            if target_attempt_counts.get(qualname, 0) < max_iterations
-            and _pylingual_target_is_equal(current_pylingual_verification, qualname) is not True
-        ]
+        expression_child_parent_targets = []
+        skipped_expression_child_records = []
+        seen_expression_child_parents: set[str] = set()
+        for record in select_missing_expression_child_parent_records(iteration_rows):
+            child_qualname = str(record.get("child_qualname"))
+            if child_qualname in skipped_expression_child_targets:
+                continue
+            qualname = str(record["parent_qualname"])
+            parent_score = record.get("parent_score") or {}
+            parent_distance = parent_score.get("combined_distance")
+            parent_pylingual_equal = _pylingual_target_is_equal(current_pylingual_verification, qualname)
+            parent_pylingual_failed = parent_pylingual_equal is False
+            parent_distance_nonzero = _optional_int(parent_distance, default=0) > 0
+            if (
+                target_attempt_counts.get(qualname, 0) < max_iterations
+                and parent_pylingual_equal is not True
+                and (parent_distance_nonzero or parent_pylingual_failed)
+            ):
+                if qualname not in seen_expression_child_parents:
+                    expression_child_parent_targets.append(qualname)
+                    seen_expression_child_parents.add(qualname)
+                continue
+            skipped_expression_child_records.append(
+                {
+                    **record,
+                    "parent_pylingual_equal": parent_pylingual_equal,
+                    "skip_reason": (
+                        "parent distance is zero and parent is not explicitly PyLingual-failed"
+                        if not parent_distance_nonzero and not parent_pylingual_failed
+                        else "parent already exhausted or PyLingual-accepted"
+                    ),
+                }
+            )
         iteration_targets = sorted(
             set(iteration_targets + expression_child_parent_targets),
             key=lambda name: (_qualname_depth(name), name),
@@ -2739,6 +2802,31 @@ def repair_mismatching_code_objects(
         all_extra_targets.extend(
             qualname for qualname in iteration_extra_targets if qualname not in all_extra_targets
         )
+        if skipped_expression_child_records:
+            for record in skipped_expression_child_records:
+                child_qualname = str(record.get("child_qualname"))
+                skipped_expression_child_targets.add(child_qualname)
+                step_index += 1
+                _store_semantic_step(
+                    steps,
+                    {
+                        "step": step_index,
+                        "iteration": iteration,
+                        "qualname": child_qualname,
+                        "repair_operation": "skip_missing_expression_child",
+                        "parent_qualname": record.get("parent_qualname"),
+                        "child_kind": record.get("child_kind"),
+                        "target_score_before": record.get("child_score"),
+                        "parent_score_before": record.get("parent_score"),
+                        "parent_pylingual_equal": record.get("parent_pylingual_equal"),
+                        "target_score_after": None,
+                        "accepted": False,
+                        "acceptance_reason": record.get("skip_reason"),
+                    },
+                    log_file=log_file,
+                    run_id=run_id,
+                    file_hash=file_hash,
+                )
         if not iteration_targets and not iteration_missing_targets and not iteration_extra_targets:
             break
         accepted_this_iteration = 0

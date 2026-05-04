@@ -12,6 +12,10 @@ from typing import Any
 
 import pandas as pd
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from pipeline.config import BASE_DATASET_PATH, build_run_paths, current_run_timestamp, now_iso
 from pipeline.logging_utils import append_log
 from utils.file_helpers import fetch_pyllmpatch_repair_paths, fetch_pyllmpatch_source_path, strip_code_fences
@@ -23,7 +27,6 @@ from utils.reattach_source_code_object import (
     repair_mismatching_code_objects,
 )
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
 PYLINGUAL_ROOT = REPO_ROOT / "pylingual"
 if str(PYLINGUAL_ROOT) not in sys.path:
     sys.path.insert(0, str(PYLINGUAL_ROOT))
@@ -793,6 +796,7 @@ def _filter_semantic_dataset_rows(
     *,
     source: str | None = None,
     file_hash: str | None = None,
+    row_range: str | None = None,
     limit: int | None = None,
 ) -> pd.DataFrame:
     semantic_df = df[df["error_type"] == "semantic_error"].copy()
@@ -800,9 +804,39 @@ def _filter_semantic_dataset_rows(
         semantic_df = semantic_df[semantic_df["source"].astype(str).str.lower() == str(source).lower()]
     if file_hash is not None:
         semantic_df = semantic_df[semantic_df["file_hash"].astype(str) == str(file_hash)]
+    if row_range is not None:
+        semantic_df = semantic_df.iloc[_parse_row_range(row_range)]
     if limit is not None:
         semantic_df = semantic_df.head(limit)
     return semantic_df
+
+
+def _parse_row_range(row_range: str) -> slice:
+    value = str(row_range).strip()
+    if not value:
+        raise ValueError("--row-range cannot be empty")
+
+    def parse_bound(raw: str) -> int | None:
+        raw = raw.strip()
+        if raw == "":
+            return None
+        bound = int(raw)
+        if bound < 0:
+            raise ValueError("--row-range only accepts non-negative indexes")
+        return bound
+
+    if ":" not in value:
+        index = parse_bound(value)
+        if index is None:
+            raise ValueError("--row-range must be an index or START:END")
+        return slice(index, index + 1)
+
+    start_raw, end_raw = value.split(":", 1)
+    start = parse_bound(start_raw)
+    end = parse_bound(end_raw)
+    if start is not None and end is not None and start > end:
+        raise ValueError("--row-range START must be <= END")
+    return slice(start, end)
 
 
 def run_dataset_repair_loop(
@@ -813,6 +847,7 @@ def run_dataset_repair_loop(
     limit: int | None = None,
     file_hash: str | None = None,
     source: str | None = None,
+    row_range: str | None = None,
     verify_with_pylingual: bool = True,
     verify_each_step_with_pylingual: bool = True,
     reject_non_improving_candidates: bool = True,
@@ -832,7 +867,7 @@ def run_dataset_repair_loop(
     results_csv = log_base / f"semantic_repair_results_{dataset_path.stem}.csv"
 
     df = pd.read_csv(dataset_path)
-    semantic_df = _filter_semantic_dataset_rows(df, source=source, file_hash=file_hash, limit=limit)
+    semantic_df = _filter_semantic_dataset_rows(df, source=source, file_hash=file_hash, row_range=row_range, limit=limit)
 
     processed = 0
     repaired = 0
@@ -1005,6 +1040,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional limit for dataset-mode rows",
     )
     parser.add_argument(
+        "--row-range",
+        "--range",
+        dest="row_range",
+        type=str,
+        default=None,
+        help="Optional dataset-mode row range after filters, before --limit. Uses zero-based START:END slicing, e.g. 10:20, 10:, :20, or 10.",
+    )
+    parser.add_argument(
         "--file-hash",
         type=str,
         default=None,
@@ -1035,6 +1078,7 @@ def main() -> int:
             limit=args.limit,
             file_hash=args.file_hash,
             source=args.source,
+            row_range=args.row_range,
             verify_with_pylingual=not args.skip_pylingual_verification,
             verify_each_step_with_pylingual=not args.skip_step_verification,
             reject_non_improving_candidates=not args.keep_non_improving,
