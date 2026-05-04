@@ -20,7 +20,7 @@ if str(REPO_ROOT) not in sys.path:
 if str(PYLINGUAL_ROOT) not in sys.path:
     sys.path.insert(0, str(PYLINGUAL_ROOT))
 
-from pipeline.config import now_iso
+from pipeline.config import ACCEPTED_CODE_OBJECT_PATH, ACCEPTED_CODE_OBJECT_TELEMETRY_PATH, now_iso
 from pipeline.logging_utils import append_log
 from utils.generate_bytecode import CompileError, compile_version
 from utils.map_source_code_objects import MappingError, map_source_to_pyc
@@ -2170,16 +2170,18 @@ def _json_safe(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False, default=str))
 
 
-def _accepted_code_object_dataset_path(log_file: Path | None) -> Path | None:
-    if log_file is None:
-        return None
-    return log_file.expanduser().resolve().parent / "semantic_repair_accepted_code_objects.jsonl"
+def _semantic_repair_code_object_log_path(log_file: Path | None) -> Path:
+    del log_file
+    path = ACCEPTED_CODE_OBJECT_PATH.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
-def _accepted_case_telemetry_path(log_file: Path | None) -> Path | None:
-    if log_file is None:
-        return None
-    return log_file.expanduser().resolve().parent / "semantic_repair_accepted_case_telemetry.jsonl"
+def _semantic_repair_telemetry_log_path(log_file: Path | None) -> Path:
+    del log_file
+    path = ACCEPTED_CODE_OBJECT_TELEMETRY_PATH.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def _leading_indent_width(text: str | None) -> int | None:
@@ -2453,9 +2455,7 @@ def _accepted_code_object_dataset_record(
 def _append_accepted_code_object_dataset(log_file: Path | None, run_id: str | None, file_hash: str | None, step_record: dict[str, Any]) -> None:
     if not step_record.get("accepted"):
         return
-    path = _accepted_code_object_dataset_path(log_file)
-    if path is None:
-        return
+    path = _semantic_repair_code_object_log_path(log_file)
     append_log(
         path,
         _accepted_code_object_dataset_record(
@@ -2469,9 +2469,7 @@ def _append_accepted_code_object_dataset(log_file: Path | None, run_id: str | No
 def _append_accepted_case_telemetry(log_file: Path | None, run_id: str | None, file_hash: str | None, step_record: dict[str, Any]) -> None:
     if not step_record.get("accepted"):
         return
-    path = _accepted_case_telemetry_path(log_file)
-    if path is None:
-        return
+    path = _semantic_repair_telemetry_log_path(log_file)
     append_log(
         path,
         _accepted_case_telemetry_record(
