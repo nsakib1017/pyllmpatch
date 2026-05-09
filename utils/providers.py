@@ -47,8 +47,8 @@ OPEN_LLM_MODELS =  [
         'provider': 'Alibaba',
         'name': 'qwen2.5-coder-32b',
         'token_for_completion': 32768,
-        'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/merged_model_qwen2.5_coder_32b_instruct_15_epochs",
-        'tokenizer_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/tokenizer_snapshots/qwen2.5-coder-32b",
+        'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth__Qwen2.5-Coder-32B-Instruct-bnb-4bit/run_1778168589/checkpoint-400",
+        'tokenizer_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth__Qwen2.5-Coder-32B-Instruct-bnb-4bit/run_1778168589/checkpoint-400",
     },
     {
         'provider': 'IBM',
