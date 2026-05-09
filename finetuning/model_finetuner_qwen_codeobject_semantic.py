@@ -325,11 +325,31 @@ def main() -> None:
     trainer_stats = trainer.train()
     pprint(trainer_stats)
 
+    trainer.save_model(str(output_dir))
+    tokenizer.save_pretrained(output_dir)
+    print("Final adapter saved to:", output_dir)
+
     if args.merge:
         merged_dir.mkdir(parents=True, exist_ok=True)
-        model = model.merge_and_unload()
-        model.save_pretrained(merged_dir)
-        tokenizer.save_pretrained(merged_dir)
+        try:
+            if hasattr(model, "save_pretrained_merged"):
+                model.save_pretrained_merged(
+                    str(merged_dir),
+                    tokenizer,
+                    save_method="merged_16bit",
+                )
+            else:
+                model = model.merge_and_unload()
+                model.save_pretrained(merged_dir)
+                tokenizer.save_pretrained(merged_dir)
+        except NotImplementedError as exc:
+            raise RuntimeError(
+                "The adapter was saved successfully, but saving the merged model failed. "
+                "This can happen when merging a LoRA adapter into a 4-bit/bnb Qwen model "
+                "with the current Transformers weight-conversion path. Re-run with "
+                "`--no-merge` to keep only the adapter, or load the saved adapter into a "
+                "non-quantized base model and merge from that."
+            ) from exc
         print("Merged model saved to:", merged_dir)
 
     print("Adapter/checkpoint output saved to:", output_dir)
