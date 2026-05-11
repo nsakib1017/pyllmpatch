@@ -7,6 +7,7 @@ import re
 import sys
 import time
 from abc import ABC, abstractmethod
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from pipeline.config import BASE_DATASET_PATH, build_run_paths, current_run_timestamp, now_iso
+from pipeline.config import (
+    ACCEPTED_CODE_OBJECT_TELEMETRY_PATH,
+    BASE_DATASET_PATH,
+    build_run_paths,
+    current_run_timestamp,
+    now_iso,
+)
 from pipeline.logging_utils import append_log
 from utils.file_helpers import fetch_pyllmpatch_repair_paths, fetch_pyllmpatch_source_path, strip_code_fences
 from utils.providers import find_llm_config, make_llm_call_from_config
@@ -413,6 +420,7 @@ def _prompt_feature_flags(user_prompt: str, repair_context: dict | None) -> dict
         "rejected_attempt_feedback": bool(repair_context and repair_context.get("rejected_attempts")),
         "gt_instruction_window": bool(repair_context and repair_context.get("gt_instruction_window")),
         "derived_instruction_window": bool(repair_context and repair_context.get("derived_instruction_window")),
+        "telemetry_guidance": "Guidance from prior accepted repairs:" in user_prompt,
     }
 
 
@@ -420,6 +428,157 @@ def _public_repair_context(repair_context: dict | None) -> dict | None:
     if repair_context is None:
         return None
     return {key: value for key, value in repair_context.items() if not str(key).startswith("_")}
+
+
+def _nested_get(record: dict, path: tuple[str, ...]) -> Any:
+    value: Any = record
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def _top_values(values: list[Any], *, limit: int = 3) -> list[str]:
+    counts = Counter(str(value) for value in values if value not in (None, "", []))
+    return [value for value, _ in counts.most_common(limit)]
+
+
+def _top_list_values(records: list[dict], path: tuple[str, ...], *, limit: int = 5) -> list[str]:
+    counts: Counter[str] = Counter()
+    for record in records:
+        values = _nested_get(record, path)
+        if isinstance(values, list):
+            counts.update(str(value) for value in values if value not in (None, ""))
+    return [value for value, _ in counts.most_common(limit)]
+
+
+def _semantic_repair_operation_for_prompt(qualname: str, derived_code_object: Any | None) -> str:
+    if qualname == "<module>":
+        return "repair_module_statement"
+    if derived_code_object is None:
+        return "insert_missing"
+    return "repair_source_fragment"
+
+
+def _telemetry_prompt_variant(record: dict) -> str | None:
+    prompt_record = record.get("prompt") or {}
+    return prompt_record.get("prompt_variant") or _nested_get(prompt_record, ("prompt_reconstruction_inputs", "prompt_variant"))
+
+
+def _telemetry_similarity(current_case: dict, past_case: dict) -> int:
+    score = 0
+    if current_case.get("prompt_variant") == _telemetry_prompt_variant(past_case):
+        score += 4
+    if current_case.get("repair_operation") == past_case.get("repair_operation"):
+        score += 5
+    if current_case.get("target_kind") == past_case.get("target_kind"):
+        score += 3
+    if current_case.get("alignment_tag") == _nested_get(past_case, ("repair_context_summary", "alignment_tag")):
+        score += 2
+    if current_case.get("qualname") == past_case.get("qualname"):
+        score += 1
+    if past_case.get("accepted"):
+        score += 1
+    return score
+
+
+def _format_semantic_repair_guidance(current_case: dict, similar_cases: list[dict]) -> str:
+    if not similar_cases:
+        return ""
+
+    repair_ops = _top_values([case.get("repair_operation") for case in similar_cases])
+    target_kinds = _top_values([case.get("target_kind") for case in similar_cases])
+    acceptance_reasons = _top_values([case.get("acceptance_reason") for case in similar_cases], limit=2)
+    candidate_kinds = _top_values([_nested_get(case, ("reattachment", "candidate_kind")) for case in similar_cases])
+    parse_transitions = _top_values([_nested_get(case, ("feature_delta", "parse_transition")) for case in similar_cases])
+    names_added = _top_list_values(similar_cases, ("feature_delta", "names_added"))
+    names_removed = _top_list_values(similar_cases, ("feature_delta", "names_removed"))
+    statements_added = _top_list_values(similar_cases, ("feature_delta", "statement_types_added"))
+    statements_removed = _top_list_values(similar_cases, ("feature_delta", "statement_types_removed"))
+    control_flow_added = _top_list_values(similar_cases, ("feature_delta", "control_flow_added"))
+    control_flow_removed = _top_list_values(similar_cases, ("feature_delta", "control_flow_removed"))
+    distance_deltas = [
+        _nested_get(case, ("semantic_delta", "combined_distance_delta"))
+        for case in similar_cases
+        if isinstance(_nested_get(case, ("semantic_delta", "combined_distance_delta")), int)
+    ]
+
+    lines = [
+        "Guidance from prior accepted repairs:",
+        f"- Matched accepted telemetry cases: {len(similar_cases)} for prompt variant {current_case.get('prompt_variant')}.",
+    ]
+    if repair_ops:
+        lines.append(f"- Similar repair operations: {', '.join(repair_ops)}.")
+    if target_kinds:
+        lines.append(f"- Similar target kinds: {', '.join(target_kinds)}.")
+    if acceptance_reasons:
+        lines.append(f"- Common acceptance reasons: {'; '.join(acceptance_reasons)}.")
+    if candidate_kinds:
+        lines.append(f"- Successful reattachment kinds: {', '.join(candidate_kinds)}.")
+    if parse_transitions:
+        lines.append(f"- Parse transitions seen: {', '.join(parse_transitions)}.")
+    if distance_deltas:
+        best_delta = min(distance_deltas)
+        median_delta = sorted(distance_deltas)[len(distance_deltas) // 2]
+        lines.append(f"- Combined semantic distance deltas ranged down to {best_delta}; median matched delta was {median_delta}.")
+    if names_added:
+        lines.append(f"- Names often added: {', '.join(names_added)}.")
+    if names_removed:
+        lines.append(f"- Names often removed: {', '.join(names_removed)}.")
+    if statements_added:
+        lines.append(f"- Statement types often added: {', '.join(statements_added)}.")
+    if statements_removed:
+        lines.append(f"- Statement types often removed: {', '.join(statements_removed)}.")
+    if control_flow_added:
+        lines.append(f"- Control-flow nodes often added: {', '.join(control_flow_added)}.")
+    if control_flow_removed:
+        lines.append(f"- Control-flow nodes often removed: {', '.join(control_flow_removed)}.")
+
+    operation = current_case.get("repair_operation")
+    if operation == "insert_missing":
+        lines.append("- For this missing-target variant, synthesize only the missing fragment that fits the provided insertion context.")
+    elif operation == "repair_module_statement":
+        lines.append("- For this module-statement variant, keep the edit localized to the shown top-level statement.")
+    else:
+        lines.append("- For this source-fragment variant, prefer the smallest local edit that improves bytecode alignment.")
+    lines.append("- Treat telemetry as a weak prior; source, metadata, and bytecode evidence take precedence.")
+    return "\n".join(lines)
+
+
+def generate_semantic_repair_guidance(
+    *,
+    qualname: str,
+    derived_code_object: Any | None,
+    repair_context: dict | None,
+    telemetry_records: list[dict] | None,
+    prompt_variant: str = SEMANTIC_PROMPT_VARIANT,
+    max_cases: int = 3,
+) -> str:
+    """Generate compact prompt guidance from accepted telemetry matching this semantic repair variant."""
+    if not telemetry_records:
+        return ""
+    current_case = {
+        "prompt_variant": prompt_variant,
+        "repair_operation": _semantic_repair_operation_for_prompt(qualname, derived_code_object),
+        "target_kind": None if not repair_context else repair_context.get("target_kind"),
+        "alignment_tag": None if not repair_context else repair_context.get("alignment_tag"),
+        "qualname": qualname,
+    }
+    ranked: list[tuple[int, dict]] = []
+    for record in telemetry_records:
+        if not isinstance(record, dict) or not record.get("accepted"):
+            continue
+        record_variant = _telemetry_prompt_variant(record)
+        if record_variant and record_variant != prompt_variant:
+            continue
+        if record.get("repair_operation") != current_case["repair_operation"]:
+            continue
+        score = _telemetry_similarity(current_case, record)
+        if score > 0:
+            ranked.append((score, record))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return _format_semantic_repair_guidance(current_case, [record for _, record in ranked[:max_cases]])
 
 
 def build_semantic_repair_prompt_payload(
@@ -431,6 +590,7 @@ def build_semantic_repair_prompt_payload(
     repair_context: dict | None = None,
     gt_bytecode: Any | None = None,
     derived_bytecode: Any | None = None,
+    telemetry_guidance: str | None = None,
 ) -> dict:
     if qualname == "<module>":
         task_text = "Edit only the localized top-level module source statement. Preserve valid Python syntax and make the smallest source change that best aligns the module bytecode with the ground-truth module bytecode."
@@ -486,6 +646,7 @@ def build_semantic_repair_prompt_payload(
             "derived_code_object_metadata": _code_object_prompt_values(derived_code_object),
         },
         "bytecode_evidence_fallback": bytecode_evidence or None,
+        "telemetry_guidance": telemetry_guidance or None,
         "return_contract": "Return only the repaired source fragment.",
     }
 
@@ -499,6 +660,7 @@ def build_semantic_repair_messages(
     repair_context: dict | None = None,
     gt_bytecode: Any | None = None,
     derived_bytecode: Any | None = None,
+    telemetry_guidance: str | None = None,
 ) -> list[dict]:
     payload = build_semantic_repair_prompt_payload(
         qualname=qualname,
@@ -508,12 +670,15 @@ def build_semantic_repair_messages(
         repair_context=repair_context,
         gt_bytecode=gt_bytecode,
         derived_bytecode=derived_bytecode,
+        telemetry_guidance=telemetry_guidance,
     )
     task_text = payload["task_text"]
     source_label = payload["source_label"]
     metadata_text = payload["metadata_context"]["metadata_text"]
     bytecode_evidence = payload["bytecode_evidence_fallback"]
     bytecode_section = f"\n\n{bytecode_evidence}" if bytecode_evidence else ""
+    telemetry_guidance = payload["telemetry_guidance"]
+    telemetry_section = f"\n\n{telemetry_guidance}" if telemetry_guidance else ""
     numbered_fragment = payload["line_numbered_source_fragment"]
 
     user_prompt = f"""Task: {task_text}
@@ -530,7 +695,7 @@ Target qualname: {qualname}
 {_format_repair_context(repair_context, module_mode=qualname == "<module>")}
 
 Code object metadata:
-{metadata_text}{bytecode_section}
+{metadata_text}{bytecode_section}{telemetry_section}
 
 Return only the repaired source fragment."""
     return [
@@ -576,12 +741,38 @@ class OracleFragmentFixer(FragmentFixer):
         return extract_source_segment(self.gt_source_text, row)
 
 
+def _load_semantic_repair_telemetry_records(path: Path = ACCEPTED_CODE_OBJECT_TELEMETRY_PATH) -> list[dict]:
+    records: list[dict] = []
+    try:
+        telemetry_path = path.expanduser().resolve()
+    except Exception:
+        return records
+    if not telemetry_path.exists():
+        return records
+    try:
+        with telemetry_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    records.append(record)
+    except OSError:
+        return []
+    return records
+
+
 class LLMFragmentFixer(FragmentFixer):
     def __init__(self, *, provider: str = "Google", model: str = "gemini-2.5-flash-lite"):
         self.llm_config = find_llm_config(provider, model)
         self.calls: list[dict] = []
         self.prompt_output_dir: Path | None = None
         self._prompt_call_index = 0
+        self.telemetry_records = _load_semantic_repair_telemetry_records()
 
     def set_prompt_output_dir(self, prompt_output_dir: Path | None) -> None:
         self.prompt_output_dir = None if prompt_output_dir is None else prompt_output_dir.expanduser().resolve()
@@ -596,12 +787,19 @@ class LLMFragmentFixer(FragmentFixer):
         derived_source_fragment: str,
         repair_context: dict | None = None,
     ) -> str:
+        telemetry_guidance = generate_semantic_repair_guidance(
+            qualname=qualname,
+            derived_code_object=derived_code_object,
+            repair_context=repair_context,
+            telemetry_records=self.telemetry_records,
+        )
         prompt_reconstruction_inputs = build_semantic_repair_prompt_payload(
             qualname=qualname,
             gt_code_object=gt_code_object,
             derived_code_object=derived_code_object,
             derived_source_fragment=derived_source_fragment,
             repair_context=repair_context,
+            telemetry_guidance=telemetry_guidance,
         )
         messages = build_semantic_repair_messages(
             qualname=qualname,
@@ -609,6 +807,7 @@ class LLMFragmentFixer(FragmentFixer):
             derived_code_object=derived_code_object,
             derived_source_fragment=derived_source_fragment,
             repair_context=repair_context,
+            telemetry_guidance=telemetry_guidance,
         )
         prompt_record = {
             "provider": self.llm_config["provider"],
