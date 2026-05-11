@@ -38,7 +38,7 @@ def load_model_once(
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_path,
-        max_seq_length=max_seq_length,
+        max_seq_length=8192,
         dtype=None,
         load_in_4bit=LOAD_IN_4BIT if "LOAD_IN_4BIT" in globals() else True,
         device_map=device_map,

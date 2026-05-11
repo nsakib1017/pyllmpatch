@@ -42,7 +42,7 @@ def call_llm_with_message(*, messages, model_path, max_tokens, tokenizer_path=No
     )
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
-    gen_max_new_tokens = min(int(max_tokens), 8192)
+    gen_max_new_tokens = min(int(max_tokens), 2048)
 
     with torch.inference_mode():
         outputs = model.generate(

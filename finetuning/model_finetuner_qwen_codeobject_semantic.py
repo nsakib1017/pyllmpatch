@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 DEFAULT_MODEL_NAME = "unsloth/Qwen3-Coder-30B-A3B-Instruct"
 DEFAULT_DATASET_PATH = "dataset/accepted_codeobject_mining_raw.jsonl"
-DEFAULT_MAX_SEQ_LENGTH = 32768
+DEFAULT_MAX_SEQ_LENGTH = 8192
 DEFAULT_VALIDATION_RATIO = 0.2
 DEFAULT_RANDOM_SEED = 42
 
