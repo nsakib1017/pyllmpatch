@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import json
 import re
 import sys
 import time
 from abc import ABC, abstractmethod
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,7 @@ INDENTATION_CONTRACT = """Indentation contract:
 BYTECODE_PROMPT_WINDOW_RADIUS = 12
 BYTECODE_PROMPT_MAX_LINES_PER_SIDE = 30
 BYTECODE_PROMPT_FULL_LISTING_MAX_INSTRUCTIONS = 80
+SEMANTIC_ACTION_PATTERN_INDEX_PATH = REPO_ROOT / "results" / "semantic_repair_action_patterns" / "semantic_repair_action_patterns.jsonl"
 
 
 def _safe_instruction_argrepr(opname: str, arg: int | None, code_object: Any) -> str:
@@ -402,6 +404,7 @@ def _prompt_feature_flags(user_prompt: str, repair_context: dict | None) -> dict
         "gt_instruction_window": bool(repair_context and repair_context.get("gt_instruction_window")),
         "derived_instruction_window": bool(repair_context and repair_context.get("derived_instruction_window")),
         "telemetry_guidance": "Action guidance from prior accepted repairs:" in user_prompt,
+        "action_pattern_guidance": "Relevant prior repair patterns:" in user_prompt,
     }
 
 
@@ -559,6 +562,425 @@ def generate_semantic_repair_guidance(
     return _format_semantic_repair_guidance(current_case, [record for _, record in ranked[:max_cases]])
 
 
+def _load_semantic_action_patterns(path: Path = SEMANTIC_ACTION_PATTERN_INDEX_PATH) -> list[dict]:
+    try:
+        pattern_path = path.expanduser().resolve()
+    except Exception:
+        return []
+    if not pattern_path.exists():
+        return []
+    records: list[dict] = []
+    try:
+        with pattern_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    records.append(record)
+    except OSError:
+        return []
+    return records
+
+
+def _alignment_category_from_context(repair_context: dict | None, repair_operation: str) -> str:
+    if repair_operation == "insert_missing":
+        return "insert"
+    if repair_operation == "repair_module_statement":
+        return "module_statement"
+    tag = str((repair_context or {}).get("alignment_tag") or "").lower()
+    if "insert" in tag:
+        return "insert"
+    if "delete" in tag:
+        return "delete"
+    if "replace" in tag:
+        return "replace"
+    return tag or "unknown"
+
+
+def _metadata_delta_signature(gt_code_object: Any, derived_code_object: Any) -> dict[str, bool]:
+    gt = _code_object_prompt_values(gt_code_object)
+    derived = _code_object_prompt_values(derived_code_object)
+    gt_names = {str(value) for value in gt.get("co_names") or []}
+    derived_names = {str(value) for value in derived.get("co_names") or []}
+    gt_varnames = {str(value) for value in gt.get("co_varnames") or []}
+    derived_varnames = {str(value) for value in derived.get("co_varnames") or []}
+    gt_consts = {repr(value) for value in gt.get("co_consts") or []}
+    derived_consts = {repr(value) for value in derived.get("co_consts") or []}
+    return {
+        "gt_only_names": bool(gt_names - derived_names),
+        "derived_only_names": bool(derived_names - gt_names),
+        "gt_only_consts": bool(gt_consts - derived_consts),
+        "derived_only_consts": bool(derived_consts - gt_consts),
+        "gt_only_varnames": bool(gt_varnames - derived_varnames),
+        "derived_only_varnames": bool(derived_varnames - gt_varnames),
+        "arg_shape_changed": any(
+            gt.get(field) != derived.get(field)
+            for field in ("co_argcount", "co_posonlyargcount", "co_kwonlyargcount")
+        ),
+    }
+
+
+def _instruction_delta_signature(repair_context: dict | None) -> dict[str, bool]:
+    if not repair_context:
+        text = ""
+    else:
+        text = "\n".join(
+            str(value or "")
+            for value in (
+                repair_context.get("instruction_diff"),
+                repair_context.get("gt_instruction_window"),
+                repair_context.get("derived_instruction_window"),
+            )
+        ).upper()
+    return {
+        "instruction_has_call_or_attr": any(token in text for token in ("LOAD_METHOD", "CALL", "LOAD_ATTR", "STORE_ATTR")),
+        "instruction_has_jump": "JUMP" in text or "FOR_ITER" in text,
+        "instruction_has_return": "RETURN_VALUE" in text,
+        "instruction_has_load_const": "LOAD_CONST" in text,
+        "instruction_has_store": "STORE_" in text,
+        "instruction_has_import": "IMPORT_" in text,
+        "instruction_has_compare": "COMPARE_OP" in text or "IS_OP" in text or "CONTAINS_OP" in text,
+        "instruction_has_binary_op": "BINARY_" in text or "BINARY_OP" in text,
+        "instruction_has_subscript": "SUBSCR" in text,
+        "instruction_has_kw_names": "KW_NAMES" in text or "CALL_KW" in text,
+        "instruction_has_build_collection": any(token in text for token in ("BUILD_LIST", "BUILD_TUPLE", "BUILD_MAP", "BUILD_SET")),
+    }
+
+
+def _expr_kind_for_prompt(node: ast.AST | None) -> str:
+    if node is None:
+        return "None"
+    if isinstance(node, ast.Call):
+        return "Call"
+    if isinstance(node, ast.Attribute):
+        return "Attribute"
+    if isinstance(node, ast.Name):
+        return "Name"
+    if isinstance(node, ast.Constant):
+        return "Constant"
+    if isinstance(node, ast.Compare):
+        return "Compare"
+    if isinstance(node, ast.BoolOp):
+        return "BoolOp"
+    if isinstance(node, ast.BinOp):
+        return "BinOp"
+    if isinstance(node, ast.UnaryOp):
+        return "UnaryOp"
+    if isinstance(node, ast.Subscript):
+        return "Subscript"
+    if isinstance(node, ast.IfExp):
+        return "IfExp"
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+        return type(node).__name__
+    if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+        return "Comprehension"
+    if isinstance(node, ast.Await):
+        return "Await"
+    if isinstance(node, ast.Lambda):
+        return "Lambda"
+    return type(node).__name__
+
+
+def _source_shape_signature(fragment: str) -> dict[str, Any]:
+    text = fragment or ""
+    parsed = None
+    for candidate in (text, _dedent_like_python_for_prompt(text)):
+        try:
+            parsed = ast.parse(candidate)
+            break
+        except SyntaxError:
+            continue
+    if parsed is None:
+        return {
+            "source_statement_types": set(),
+            "has_control_flow": False,
+            "has_return": False,
+            "has_assignment": False,
+            "has_call_or_attribute": False,
+            "has_compare": False,
+            "has_boolop": False,
+            "has_subscript": False,
+            "return_value_kinds": set(),
+            "assign_value_kinds": set(),
+            "expr_value_kinds": set(),
+            "call_func_kinds": set(),
+            "call_arg_count": 0,
+            "call_keyword_count": 0,
+        }
+    statement_types = {type(node).__name__ for node in parsed.body}
+    nodes = list(ast.walk(parsed))
+    return_value_kinds: set[str] = set()
+    assign_value_kinds: set[str] = set()
+    expr_value_kinds: set[str] = set()
+    call_func_kinds: set[str] = set()
+    call_arg_count = 0
+    call_keyword_count = 0
+    for node in nodes:
+        if isinstance(node, ast.Return) and node.value is not None:
+            return_value_kinds.add(_expr_kind_for_prompt(node.value))
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            value = getattr(node, "value", None)
+            if value is not None:
+                assign_value_kinds.add(_expr_kind_for_prompt(value))
+        elif isinstance(node, ast.Expr):
+            expr_value_kinds.add(_expr_kind_for_prompt(node.value))
+        elif isinstance(node, ast.Call):
+            call_func_kinds.add(_expr_kind_for_prompt(node.func))
+            call_arg_count += len(node.args)
+            call_keyword_count += len(node.keywords)
+    return {
+        "source_statement_types": statement_types,
+        "has_control_flow": any(isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try, ast.Match)) for node in nodes),
+        "has_return": any(isinstance(node, ast.Return) for node in nodes),
+        "has_assignment": any(isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)) for node in nodes),
+        "has_call_or_attribute": any(isinstance(node, (ast.Call, ast.Attribute)) for node in nodes),
+        "has_compare": any(isinstance(node, ast.Compare) for node in nodes),
+        "has_boolop": any(isinstance(node, ast.BoolOp) for node in nodes),
+        "has_subscript": any(isinstance(node, ast.Subscript) for node in nodes),
+        "return_value_kinds": return_value_kinds,
+        "assign_value_kinds": assign_value_kinds,
+        "expr_value_kinds": expr_value_kinds,
+        "call_func_kinds": call_func_kinds,
+        "call_arg_count": call_arg_count,
+        "call_keyword_count": call_keyword_count,
+    }
+
+
+def _dedent_like_python_for_prompt(text: str) -> str:
+    lines = text.splitlines()
+    indents = [len(line) - len(line.lstrip(" ")) for line in lines if line.strip()]
+    if not indents:
+        return text
+    margin = min(indents)
+    return "\n".join(line[margin:] if len(line) >= margin else line for line in lines)
+
+
+def _current_action_pattern_signature(
+    *,
+    qualname: str,
+    gt_code_object: Any,
+    derived_code_object: Any,
+    derived_source_fragment: str,
+    repair_context: dict | None,
+) -> dict[str, Any]:
+    repair_operation = _semantic_repair_operation_for_prompt(qualname, derived_code_object)
+    signature = {
+        "repair_operation": repair_operation,
+        "target_kind": None if not repair_context else repair_context.get("target_kind"),
+        "alignment_category": _alignment_category_from_context(repair_context, repair_operation),
+    }
+    signature.update(_metadata_delta_signature(gt_code_object, derived_code_object))
+    signature.update(_instruction_delta_signature(repair_context))
+    signature.update(_source_shape_signature(derived_source_fragment))
+    return signature
+
+
+def _pattern_bool(record: dict, key: str) -> bool:
+    value = record.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value > 0
+    return bool(value)
+
+
+def _score_action_pattern(current: dict[str, Any], pattern: dict[str, Any]) -> int | None:
+    if pattern.get("repair_operation") != current.get("repair_operation"):
+        return None
+    target_kind = pattern.get("target_kind")
+    if target_kind and current.get("target_kind") and target_kind != current.get("target_kind"):
+        return None
+    pattern_alignment = pattern.get("alignment_category")
+    current_alignment = current.get("alignment_category")
+    if pattern_alignment not in (None, "", "unknown") and current_alignment not in (None, "", "unknown") and pattern_alignment != current_alignment:
+        return None
+
+    score = 6
+    if target_kind and target_kind == current.get("target_kind"):
+        score += 2
+    if pattern_alignment and pattern_alignment == current_alignment:
+        score += 2
+
+    metadata_pairs = [
+        ("gt_only_names", "gt_only_names_count"),
+        ("derived_only_names", "derived_only_names_count"),
+        ("gt_only_consts", "gt_only_consts_count"),
+        ("derived_only_consts", "derived_only_consts_count"),
+        ("gt_only_varnames", "gt_only_varnames_count"),
+        ("derived_only_varnames", "derived_only_varnames_count"),
+        ("arg_shape_changed", "arg_shape_changed"),
+    ]
+    for current_key, pattern_key in metadata_pairs:
+        current_value = bool(current.get(current_key))
+        pattern_value = _pattern_bool(pattern, pattern_key)
+        if current_value and pattern_value:
+            score += 3
+        elif current_value != pattern_value:
+            score -= 1
+
+    instruction_keys = [
+        "instruction_has_call_or_attr",
+        "instruction_has_jump",
+        "instruction_has_return",
+        "instruction_has_load_const",
+        "instruction_has_store",
+        "instruction_has_import",
+        "instruction_has_compare",
+        "instruction_has_binary_op",
+        "instruction_has_subscript",
+        "instruction_has_kw_names",
+        "instruction_has_build_collection",
+    ]
+    for key in instruction_keys:
+        current_value = bool(current.get(key))
+        pattern_value = _pattern_bool(pattern, key)
+        if current_value and pattern_value:
+            score += 3
+        elif pattern_value and not current_value:
+            score -= 1
+
+    source_evidence_pairs = [
+        ("has_return", "source_has_return_before"),
+        ("has_assignment", "source_has_assignment_before"),
+        ("has_call_or_attribute", "source_has_call_or_attribute_before"),
+        ("has_compare", "source_has_compare_before"),
+        ("has_boolop", "source_has_boolop_before"),
+        ("has_subscript", "source_has_subscript_before"),
+    ]
+    for current_key, pattern_key in source_evidence_pairs:
+        current_value = bool(current.get(current_key))
+        pattern_value = _pattern_bool(pattern, pattern_key)
+        if current_value and pattern_value:
+            score += 3
+        elif pattern_value and not current_value:
+            score -= 2
+
+    source_types = set(current.get("source_statement_types") or set())
+    pattern_types = set(str(pattern.get("source_shape_before") or "").split(",")) - {""}
+    if source_types and pattern_types:
+        overlap = source_types & pattern_types
+        if overlap:
+            score += min(3, len(overlap))
+        else:
+            score -= 2
+
+    for current_key, pattern_key in (
+        ("return_value_kinds", "return_value_kinds_before"),
+        ("assign_value_kinds", "assign_value_kinds_before"),
+        ("expr_value_kinds", "expr_value_kinds_before"),
+        ("call_func_kinds", "call_func_kinds_before"),
+    ):
+        current_values = set(current.get(current_key) or set())
+        pattern_values = set(str(pattern.get(pattern_key) or "").split(",")) - {""}
+        if current_values and pattern_values:
+            if current_values & pattern_values:
+                score += min(3, len(current_values & pattern_values))
+            else:
+                score -= 1
+
+    pattern_call_arg_delta = int(pattern.get("call_arg_count_delta") or 0)
+    pattern_call_kw_delta = int(pattern.get("call_keyword_count_delta") or 0)
+    if pattern_call_arg_delta or pattern_call_kw_delta:
+        if current.get("call_arg_count") or current.get("call_keyword_count") or current.get("instruction_has_kw_names"):
+            score += 2
+        else:
+            score -= 3
+
+    action_type = str(pattern.get("action_type") or "")
+    if action_type == "add_missing_control_flow" and not current.get("instruction_has_jump"):
+        score -= 5
+    if action_type == "remove_extra_control_flow" and not current.get("instruction_has_jump"):
+        score -= 5
+    if action_type == "restore_missing_expression_reference" and not (current.get("gt_only_names") or current.get("instruction_has_call_or_attr")):
+        score -= 4
+    if action_type == "remove_extra_expression_reference" and not current.get("derived_only_names"):
+        score -= 4
+    if action_type == "adjust_return_expression" and not (current.get("has_return") or current.get("instruction_has_return")):
+        score -= 3
+    if action_type.startswith("adjust_return_") and not (current.get("has_return") or current.get("instruction_has_return")):
+        score -= 3
+    if action_type in {"adjust_call_or_attribute_expression", "adjust_call_arguments", "adjust_method_vs_attribute_access", "adjust_attribute_access"} and not (
+        current.get("has_call_or_attribute") or current.get("instruction_has_call_or_attr")
+    ):
+        score -= 3
+    if action_type == "adjust_call_arguments" and not (current.get("call_arg_count") or current.get("call_keyword_count") or current.get("instruction_has_kw_names")):
+        score -= 4
+    if action_type == "adjust_comparison_expression" and not (current.get("has_compare") or current.get("instruction_has_compare")):
+        score -= 3
+    if action_type == "adjust_boolean_expression" and not (current.get("has_boolop") or current.get("instruction_has_jump")):
+        score -= 3
+    if action_type == "adjust_arithmetic_or_unary_expression" and not current.get("instruction_has_binary_op"):
+        score -= 2
+    if action_type == "adjust_subscript_or_index_expression" and not (current.get("has_subscript") or current.get("instruction_has_subscript")):
+        score -= 3
+    return score
+
+
+def _rank_action_patterns_by_action_type(
+    current: dict[str, Any],
+    action_patterns: list[dict],
+    *,
+    min_score: int,
+) -> list[tuple[int, int, dict]]:
+    by_action_type: dict[str, list[tuple[int, dict]]] = defaultdict(list)
+    for pattern in action_patterns:
+        score = _score_action_pattern(current, pattern)
+        if score is None or score < min_score:
+            continue
+        action_type = str(pattern.get("action_type") or "")
+        if not action_type:
+            continue
+        by_action_type[action_type].append((score, pattern))
+
+    ranked: list[tuple[int, int, dict]] = []
+    for matches in by_action_type.values():
+        matches.sort(key=lambda item: item[0], reverse=True)
+        best_score, best_pattern = matches[0]
+        consensus_bonus = sum(max(0, score - min_score) for score, _ in matches[:5]) // 5
+        ranked.append((best_score + consensus_bonus, best_score, best_pattern))
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return ranked
+
+
+def generate_action_pattern_guidance(
+    *,
+    qualname: str,
+    gt_code_object: Any,
+    derived_code_object: Any,
+    derived_source_fragment: str,
+    repair_context: dict | None,
+    action_patterns: list[dict] | None,
+    max_patterns: int = 3,
+    min_score: int = 12,
+) -> str:
+    if not action_patterns:
+        return ""
+    current = _current_action_pattern_signature(
+        qualname=qualname,
+        gt_code_object=gt_code_object,
+        derived_code_object=derived_code_object,
+        derived_source_fragment=derived_source_fragment,
+        repair_context=repair_context,
+    )
+    selected = [pattern for _, _, pattern in _rank_action_patterns_by_action_type(current, action_patterns, min_score=min_score)[:max_patterns]]
+    if not selected:
+        return ""
+
+    lines = ["Relevant prior repair patterns:"]
+    for index, pattern in enumerate(selected, start=1):
+        guidance = pattern.get("action_summary_prompt") or pattern.get("action_agnostic") or pattern.get("prompt_snippet_agnostic")
+        situation = pattern.get("situation_agnostic")
+        lines.append(f"{index}. Situation: {situation}")
+        lines.append(f"   Action that reduced drift: {guidance}")
+    lines.append("Use these only if they explain the current metadata and instruction diff.")
+    return "\n".join(lines)
+
+
 def _format_variant_constraint(repair_operation: str) -> str:
     if repair_operation == "insert_missing":
         return "\n".join(
@@ -707,6 +1129,7 @@ def build_semantic_repair_prompt_payload(
     gt_bytecode: Any | None = None,
     derived_bytecode: Any | None = None,
     telemetry_guidance: str | None = None,
+    action_pattern_guidance: str | None = None,
 ) -> dict:
     if qualname == "<module>":
         task_text = "Edit only the localized top-level module source statement. Preserve valid Python syntax and make the smallest source change that best aligns the module bytecode with the ground-truth module bytecode."
@@ -770,6 +1193,7 @@ def build_semantic_repair_prompt_payload(
         "bytecode_evidence_fallback": bytecode_evidence or None,
         "semantic_summaries": semantic_summaries or None,
         "telemetry_guidance": telemetry_guidance or None,
+        "action_pattern_guidance": action_pattern_guidance or None,
         "return_contract": "Return only the repaired source fragment.",
     }
 
@@ -784,6 +1208,7 @@ def build_semantic_repair_messages(
     gt_bytecode: Any | None = None,
     derived_bytecode: Any | None = None,
     telemetry_guidance: str | None = None,
+    action_pattern_guidance: str | None = None,
 ) -> list[dict]:
     payload = build_semantic_repair_prompt_payload(
         qualname=qualname,
@@ -794,6 +1219,7 @@ def build_semantic_repair_messages(
         gt_bytecode=gt_bytecode,
         derived_bytecode=derived_bytecode,
         telemetry_guidance=telemetry_guidance,
+        action_pattern_guidance=action_pattern_guidance,
     )
     task_text = payload["task_text"]
     source_label = payload["source_label"]
@@ -804,6 +1230,8 @@ def build_semantic_repair_messages(
     summary_section = semantic_summaries or ""
     telemetry_guidance = payload["telemetry_guidance"]
     telemetry_section = f"\n\n{telemetry_guidance}" if telemetry_guidance else ""
+    action_pattern_guidance = payload["action_pattern_guidance"]
+    action_pattern_section = f"\n\n{action_pattern_guidance}" if action_pattern_guidance else ""
     numbered_fragment = payload["line_numbered_source_fragment"]
     repair_context_section = _format_repair_context(repair_context, module_mode=qualname == "<module>")
 
@@ -823,7 +1251,7 @@ Target qualname: {qualname}
 {repair_context_section}
 
 Code object metadata:
-{metadata_text}{bytecode_section}{telemetry_section}
+{metadata_text}{bytecode_section}{action_pattern_section}{telemetry_section}
 
 Return only the repaired source fragment."""
     return [
@@ -901,6 +1329,7 @@ class LLMFragmentFixer(FragmentFixer):
         self.prompt_output_dir: Path | None = None
         self._prompt_call_index = 0
         self.telemetry_records = _load_semantic_repair_telemetry_records()
+        self.action_patterns = _load_semantic_action_patterns()
 
     def set_prompt_output_dir(self, prompt_output_dir: Path | None) -> None:
         self.prompt_output_dir = None if prompt_output_dir is None else prompt_output_dir.expanduser().resolve()
@@ -921,6 +1350,16 @@ class LLMFragmentFixer(FragmentFixer):
             repair_context=repair_context,
             telemetry_records=self.telemetry_records,
         )
+        action_pattern_guidance = generate_action_pattern_guidance(
+            qualname=qualname,
+            gt_code_object=gt_code_object,
+            derived_code_object=derived_code_object,
+            derived_source_fragment=derived_source_fragment,
+            repair_context=repair_context,
+            action_patterns=self.action_patterns,
+        )
+        if action_pattern_guidance:
+            telemetry_guidance = ""
         prompt_reconstruction_inputs = build_semantic_repair_prompt_payload(
             qualname=qualname,
             gt_code_object=gt_code_object,
@@ -928,6 +1367,7 @@ class LLMFragmentFixer(FragmentFixer):
             derived_source_fragment=derived_source_fragment,
             repair_context=repair_context,
             telemetry_guidance=telemetry_guidance,
+            action_pattern_guidance=action_pattern_guidance,
         )
         messages = build_semantic_repair_messages(
             qualname=qualname,
@@ -936,6 +1376,7 @@ class LLMFragmentFixer(FragmentFixer):
             derived_source_fragment=derived_source_fragment,
             repair_context=repair_context,
             telemetry_guidance=telemetry_guidance,
+            action_pattern_guidance=action_pattern_guidance,
         )
         prompt_record = {
             "provider": self.llm_config["provider"],
