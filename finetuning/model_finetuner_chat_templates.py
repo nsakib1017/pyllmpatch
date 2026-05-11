@@ -74,12 +74,16 @@ USER_PROMPT_TEMPLATE = (
 )
 
 def load_model_and_tokenizer():
+    hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+    auth_kwargs = {"token": hf_token} if hf_token else {}
+
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=MODEL_NAME,
         max_seq_length=MAX_SEQ_LENGTH,
         dtype=DTYPE,
         load_in_4bit=LOAD_IN_4BIT,
         device_map={"": "cuda:0"},
+        **auth_kwargs,
     )
 
     tokenizer = get_chat_template(tokenizer, chat_template="phi-4")

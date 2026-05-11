@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import os
 import warnings
 
+from dotenv import load_dotenv
 from finetuning.model_finetuner_chat_templates import LOAD_IN_4BIT
 from unsloth import FastLanguageModel
 from transformers import AutoTokenizer
 
 _MODEL_CACHE: dict[tuple[str, str | None], tuple[object, object]] = {}
+
+load_dotenv()
 
 warnings.filterwarnings(
     "ignore",
@@ -35,6 +39,8 @@ def load_model_once(
         return _MODEL_CACHE[cache_key]
 
     max_seq_length = min(max(int(max_tokens) + 4096, 12288), 32768)
+    hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+    auth_kwargs = {"token": hf_token} if hf_token else {}
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_path,
@@ -42,10 +48,11 @@ def load_model_once(
         dtype=None,
         load_in_4bit=LOAD_IN_4BIT if "LOAD_IN_4BIT" in globals() else True,
         device_map=device_map,
+        **auth_kwargs,
     )
 
     if tokenizer_path:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=False)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=False, **auth_kwargs)
 
     if getattr(tokenizer, "pad_token_id", None) is None:
         tokenizer.pad_token = tokenizer.eos_token

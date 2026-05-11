@@ -137,12 +137,16 @@ def split_samples(
 def load_model_and_tokenizer(args: argparse.Namespace):
     from unsloth import FastLanguageModel
 
+    hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+    auth_kwargs = {"token": hf_token} if hf_token else {}
+
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.model_name,
         max_seq_length=args.max_seq_length,
         dtype=None,
         load_in_4bit=args.load_in_4bit,
         device_map=args.device_map,
+        **auth_kwargs,
     )
 
     model = FastLanguageModel.get_peft_model(
