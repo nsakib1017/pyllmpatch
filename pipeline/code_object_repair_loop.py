@@ -377,36 +377,16 @@ def _format_module_code_object_for_prompt(code_object: Any) -> str:
 
 
 def _format_repair_context(repair_context: dict | None, *, module_mode: bool = False) -> str:
+    del module_mode
     if not repair_context:
         return ""
-    rejected_attempts = repair_context.get("rejected_attempts") or []
-    if module_mode and rejected_attempts:
-        rejected_attempts = rejected_attempts[-1:]
-    rejected_text = "<none>"
-    if rejected_attempts:
-        rejected_text = "\n\n".join(
-            (
-                f"Attempt {item.get('attempt')} rejected: {item.get('acceptance_reason')}\n"
-                f"Replacement:\n```python\n{item.get('replacement_text', '')}\n```"
-            )
-            for item in rejected_attempts
-        )
-    failed = repair_context.get("pylingual_failed_result") or {}
-    return f"""Failure context:
-- target_kind: {repair_context.get("target_kind")}
-- qualname: {repair_context.get("qualname")}
-- localized_line_number: {repair_context.get("localized_line_number")}
-- failed_offset: {repair_context.get("failed_offset")}
-- alignment_tag: {repair_context.get("alignment_tag")}
-- pylingual_message: {failed.get("message")}
-
-Instruction diff:
+    instruction_diff = str(repair_context.get("instruction_diff") or "").strip()
+    if not instruction_diff:
+        instruction_diff = "<unavailable>"
+    return f"""Instruction diff:
 ```text
-{repair_context.get("instruction_diff", "<unavailable>")}
+{instruction_diff}
 ```
-
-Previous rejected attempts:
-{rejected_text}
 """
 
 
@@ -415,12 +395,13 @@ def _prompt_feature_flags(user_prompt: str, repair_context: dict | None) -> dict
         "indentation_contract": "Indentation contract:" in user_prompt,
         "line_numbered_source": bool(re.search(r"(?m)^\d{3,}\| ", user_prompt)),
         "compact_metadata": "Identical fields:" in user_prompt or "co_firstlineno:" not in user_prompt,
+        "semantic_repair_summaries": "Current repair guidance:" in user_prompt,
         "localized_instruction_diff": _instruction_diff_available(repair_context),
         "bytecode_evidence_fallback": "Bytecode evidence fallback:" in user_prompt,
         "rejected_attempt_feedback": bool(repair_context and repair_context.get("rejected_attempts")),
         "gt_instruction_window": bool(repair_context and repair_context.get("gt_instruction_window")),
         "derived_instruction_window": bool(repair_context and repair_context.get("derived_instruction_window")),
-        "telemetry_guidance": "Guidance from prior accepted repairs:" in user_prompt,
+        "telemetry_guidance": "Action guidance from prior accepted repairs:" in user_prompt,
     }
 
 
@@ -487,63 +468,60 @@ def _format_semantic_repair_guidance(current_case: dict, similar_cases: list[dic
     if not similar_cases:
         return ""
 
-    repair_ops = _top_values([case.get("repair_operation") for case in similar_cases])
-    target_kinds = _top_values([case.get("target_kind") for case in similar_cases])
-    acceptance_reasons = _top_values([case.get("acceptance_reason") for case in similar_cases], limit=2)
-    candidate_kinds = _top_values([_nested_get(case, ("reattachment", "candidate_kind")) for case in similar_cases])
-    parse_transitions = _top_values([_nested_get(case, ("feature_delta", "parse_transition")) for case in similar_cases])
     names_added = _top_list_values(similar_cases, ("feature_delta", "names_added"))
     names_removed = _top_list_values(similar_cases, ("feature_delta", "names_removed"))
     statements_added = _top_list_values(similar_cases, ("feature_delta", "statement_types_added"))
     statements_removed = _top_list_values(similar_cases, ("feature_delta", "statement_types_removed"))
     control_flow_added = _top_list_values(similar_cases, ("feature_delta", "control_flow_added"))
     control_flow_removed = _top_list_values(similar_cases, ("feature_delta", "control_flow_removed"))
-    distance_deltas = [
-        _nested_get(case, ("semantic_delta", "combined_distance_delta"))
-        for case in similar_cases
-        if isinstance(_nested_get(case, ("semantic_delta", "combined_distance_delta")), int)
-    ]
 
-    lines = [
-        "Guidance from prior accepted repairs:",
-        f"- Matched accepted telemetry cases: {len(similar_cases)} for prompt variant {current_case.get('prompt_variant')}.",
-    ]
-    if repair_ops:
-        lines.append(f"- Similar repair operations: {', '.join(repair_ops)}.")
-    if target_kinds:
-        lines.append(f"- Similar target kinds: {', '.join(target_kinds)}.")
-    if acceptance_reasons:
-        lines.append(f"- Common acceptance reasons: {'; '.join(acceptance_reasons)}.")
-    if candidate_kinds:
-        lines.append(f"- Successful reattachment kinds: {', '.join(candidate_kinds)}.")
-    if parse_transitions:
-        lines.append(f"- Parse transitions seen: {', '.join(parse_transitions)}.")
-    if distance_deltas:
-        best_delta = min(distance_deltas)
-        median_delta = sorted(distance_deltas)[len(distance_deltas) // 2]
-        lines.append(f"- Combined semantic distance deltas ranged down to {best_delta}; median matched delta was {median_delta}.")
+    action_lines: list[str] = []
     if names_added:
-        lines.append(f"- Names often added: {', '.join(names_added)}.")
+        action_lines.append(
+            f"- Prior accepted edits restored missing references to: {', '.join(names_added)}. "
+            "If these names appear in the ground-truth metadata or instruction diff, add the smallest expression-level use that accounts for them."
+        )
     if names_removed:
-        lines.append(f"- Names often removed: {', '.join(names_removed)}.")
+        action_lines.append(
+            f"- Prior accepted edits removed or replaced extra references to: {', '.join(names_removed)}. "
+            "If these names appear only in the derived side, remove the local use instead of restructuring the fragment."
+        )
     if statements_added:
-        lines.append(f"- Statement types often added: {', '.join(statements_added)}.")
+        action_lines.append(
+            f"- Prior accepted edits added these statement forms: {', '.join(statements_added)}. "
+            "Only add the same form when the current bytecode shows the corresponding missing branch, loop, definition, or return."
+        )
     if statements_removed:
-        lines.append(f"- Statement types often removed: {', '.join(statements_removed)}.")
+        action_lines.append(
+            f"- Prior accepted edits removed these statement forms: {', '.join(statements_removed)}. "
+            "If the derived bytecode has extra structure, simplify that local statement rather than adding new code."
+        )
     if control_flow_added:
-        lines.append(f"- Control-flow nodes often added: {', '.join(control_flow_added)}.")
+        action_lines.append(
+            f"- Prior accepted edits introduced control flow: {', '.join(control_flow_added)}. "
+            "Use this only when the ground-truth instruction window has jumps or blocks missing from the derived fragment."
+        )
     if control_flow_removed:
-        lines.append(f"- Control-flow nodes often removed: {', '.join(control_flow_removed)}.")
+        action_lines.append(
+            f"- Prior accepted edits removed control flow: {', '.join(control_flow_removed)}. "
+            "Use this only when the derived instruction window has extra jumps or blocks."
+        )
 
     operation = current_case.get("repair_operation")
     if operation == "insert_missing":
-        lines.append("- For this missing-target variant, synthesize only the missing fragment that fits the provided insertion context.")
+        action_lines.append("- Return only the missing fragment; do not repeat the parent context around the insertion point.")
     elif operation == "repair_module_statement":
-        lines.append("- For this module-statement variant, keep the edit localized to the shown top-level statement.")
-    else:
-        lines.append("- For this source-fragment variant, prefer the smallest local edit that improves bytecode alignment.")
-    lines.append("- Treat telemetry as a weak prior; source, metadata, and bytecode evidence take precedence.")
-    return "\n".join(lines)
+        action_lines.append("- Keep the edit inside the shown top-level statement; do not rewrite neighboring module code.")
+
+    if not action_lines:
+        return ""
+    return "\n".join(
+        [
+            "Action guidance from prior accepted repairs:",
+            *action_lines,
+            "- Apply these actions only when they explain the current source, metadata, and bytecode mismatch.",
+        ]
+    )
 
 
 def generate_semantic_repair_guidance(
@@ -581,6 +559,144 @@ def generate_semantic_repair_guidance(
     return _format_semantic_repair_guidance(current_case, [record for _, record in ranked[:max_cases]])
 
 
+def _format_variant_constraint(repair_operation: str) -> str:
+    if repair_operation == "insert_missing":
+        return "\n".join(
+            [
+                "Variant constraint:",
+                "- Return only the missing source fragment to insert.",
+                "- Do not repeat the surrounding parent context.",
+            ]
+        )
+    if repair_operation == "repair_module_statement":
+        return "\n".join(
+            [
+                "Variant constraint:",
+                "- Repair only the shown top-level module statement.",
+                "- Do not rewrite neighboring imports, functions, classes, or unrelated module code.",
+            ]
+        )
+    return "\n".join(
+        [
+            "Variant constraint:",
+            "- Edit only the existing source fragment.",
+            "- Preserve function/class boundaries unless the current bytecode evidence requires a small local change.",
+        ]
+    )
+
+
+def _format_target_context_summary(repair_context: dict | None) -> str:
+    if not repair_context:
+        return ""
+    fields = [
+        ("target_kind", repair_context.get("target_kind")),
+        ("localized_line_number", repair_context.get("localized_line_number")),
+        ("failed_offset", repair_context.get("failed_offset")),
+        ("alignment_tag", repair_context.get("alignment_tag")),
+    ]
+    lines = [f"- {name}: {value}" for name, value in fields if value is not None]
+    failed = repair_context.get("pylingual_failed_result") or {}
+    if failed.get("message"):
+        lines.append(f"- pylingual_message: {failed.get('message')}")
+    if not lines:
+        return ""
+    return "\n".join(["Target context:", *lines])
+
+
+def _format_current_mismatch_summary(repair_context: dict | None) -> str:
+    if not repair_context:
+        return ""
+    lines = ["Mismatch focus:"]
+    if _instruction_diff_available(repair_context):
+        lines.append("- Use the first differing instruction block as the main source-edit target.")
+    elif repair_context.get("gt_instruction_window") or repair_context.get("derived_instruction_window"):
+        lines.append("- Instruction windows are available; compare missing or extra names, constants, jumps, and calls before editing.")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _limited_list(values: list[str], *, limit: int = 8) -> list[str]:
+    return values[:limit]
+
+
+def _format_code_shape_summary(*, gt_code_object: Any, derived_code_object: Any) -> str:
+    gt = _code_object_prompt_values(gt_code_object)
+    derived = _code_object_prompt_values(derived_code_object)
+    if not gt and not derived:
+        return ""
+
+    lines = ["Code shape summary:"]
+    for field in ("co_argcount", "co_posonlyargcount", "co_kwonlyargcount", "co_flags"):
+        if gt.get(field) != derived.get(field):
+            lines.append(f"- {field}: ground-truth={gt.get(field)!r} derived={derived.get(field)!r}")
+
+    gt_names = {str(name) for name in gt.get("co_names") or []}
+    derived_names = {str(name) for name in derived.get("co_names") or []}
+    gt_varnames = {str(name) for name in gt.get("co_varnames") or []}
+    derived_varnames = {str(name) for name in derived.get("co_varnames") or []}
+    gt_consts = {repr(value) for value in gt.get("co_consts") or []}
+    derived_consts = {repr(value) for value in derived.get("co_consts") or []}
+
+    names_gt_only = sorted(gt_names - derived_names)
+    names_derived_only = sorted(derived_names - gt_names)
+    varnames_gt_only = sorted(gt_varnames - derived_varnames)
+    varnames_derived_only = sorted(derived_varnames - gt_varnames)
+    consts_gt_only = sorted(gt_consts - derived_consts)
+    consts_derived_only = sorted(derived_consts - gt_consts)
+
+    if names_gt_only:
+        lines.append(f"- names only in ground-truth metadata: {names_gt_only[:8]}")
+    if names_derived_only:
+        lines.append(f"- names only in derived metadata: {names_derived_only[:8]}")
+    if varnames_gt_only:
+        lines.append(f"- local variables only in ground-truth metadata: {varnames_gt_only[:8]}")
+    if varnames_derived_only:
+        lines.append(f"- local variables only in derived metadata: {varnames_derived_only[:8]}")
+    if consts_gt_only:
+        lines.append(f"- constants only in ground-truth metadata: {_limited_list(consts_gt_only)}")
+    if consts_derived_only:
+        lines.append(f"- constants only in derived metadata: {_limited_list(consts_derived_only)}")
+
+    if len(lines) == 1:
+        return ""
+    lines.append("- Prefer edits that account for ground-truth-only names/constants and remove derived-only artifacts when bytecode agrees.")
+    return "\n".join(lines)
+
+
+def _format_rejected_attempt_summary(repair_context: dict | None) -> str:
+    rejected_attempts = [] if not repair_context else repair_context.get("rejected_attempts") or []
+    reasons = [
+        str(item.get("acceptance_reason"))
+        for item in rejected_attempts[-3:]
+        if isinstance(item, dict) and item.get("acceptance_reason")
+    ]
+    if not reasons:
+        return ""
+    lines = ["Avoid patterns rejected for this target:"]
+    lines.extend(f"- {reason}" for reason in reasons)
+    return "\n".join(lines)
+
+
+def build_semantic_prompt_summaries(
+    *,
+    qualname: str,
+    gt_code_object: Any,
+    derived_code_object: Any,
+    repair_context: dict | None,
+) -> str:
+    repair_operation = _semantic_repair_operation_for_prompt(qualname, derived_code_object)
+    sections = [
+        _format_variant_constraint(repair_operation),
+        _format_target_context_summary(repair_context),
+        _format_current_mismatch_summary(repair_context),
+        _format_code_shape_summary(gt_code_object=gt_code_object, derived_code_object=derived_code_object),
+        _format_rejected_attempt_summary(repair_context),
+    ]
+    content = "\n\n".join(section for section in sections if section)
+    if not content:
+        return ""
+    return "Current repair guidance:\n" + content
+
+
 def build_semantic_repair_prompt_payload(
     *,
     qualname: str,
@@ -612,6 +728,12 @@ def build_semantic_repair_prompt_payload(
     bytecode_evidence = _format_bytecode_evidence_for_prompt(
         gt_bytecode=gt_bytecode,
         derived_bytecode=derived_bytecode,
+        repair_context=repair_context,
+    )
+    semantic_summaries = build_semantic_prompt_summaries(
+        qualname=qualname,
+        gt_code_object=gt_code_object,
+        derived_code_object=derived_code_object,
         repair_context=repair_context,
     )
     source_start_line = 1
@@ -646,6 +768,7 @@ def build_semantic_repair_prompt_payload(
             "derived_code_object_metadata": _code_object_prompt_values(derived_code_object),
         },
         "bytecode_evidence_fallback": bytecode_evidence or None,
+        "semantic_summaries": semantic_summaries or None,
         "telemetry_guidance": telemetry_guidance or None,
         "return_contract": "Return only the repaired source fragment.",
     }
@@ -677,9 +800,12 @@ def build_semantic_repair_messages(
     metadata_text = payload["metadata_context"]["metadata_text"]
     bytecode_evidence = payload["bytecode_evidence_fallback"]
     bytecode_section = f"\n\n{bytecode_evidence}" if bytecode_evidence else ""
+    semantic_summaries = payload["semantic_summaries"]
+    summary_section = semantic_summaries or ""
     telemetry_guidance = payload["telemetry_guidance"]
     telemetry_section = f"\n\n{telemetry_guidance}" if telemetry_guidance else ""
     numbered_fragment = payload["line_numbered_source_fragment"]
+    repair_context_section = _format_repair_context(repair_context, module_mode=qualname == "<module>")
 
     user_prompt = f"""Task: {task_text}
 
@@ -692,7 +818,9 @@ Target qualname: {qualname}
 {numbered_fragment}
 ```
 
-{_format_repair_context(repair_context, module_mode=qualname == "<module>")}
+{summary_section}
+
+{repair_context_section}
 
 Code object metadata:
 {metadata_text}{bytecode_section}{telemetry_section}
