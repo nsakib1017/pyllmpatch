@@ -2132,6 +2132,7 @@ def _compact_rejected_attempts_for_prompt(rejected_attempts: list[dict], *, limi
                 "target_score_before": attempt.get("target_score_before"),
                 "target_score_after": attempt.get("target_score_after"),
                 "replacement_hash": attempt.get("replacement_hash"),
+                "replacement_structural_hash": attempt.get("replacement_structural_hash"),
                 "replacement_fingerprint": attempt.get("replacement_fingerprint"),
                 "replacement_delta": attempt.get("replacement_delta"),
             }
@@ -2146,6 +2147,18 @@ def _replacement_hash(text: str | None) -> str | None:
     return hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()
 
 
+def _replacement_structural_hash(text: str | None) -> str | None:
+    if text is None:
+        return None
+    source = textwrap.dedent(str(text).strip("\n"))
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    normalized = ast.dump(tree, include_attributes=False)
+    return hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()
+
+
 def _normalize_fragment_candidates(raw_candidates: Any) -> list[dict[str, Any]]:
     if isinstance(raw_candidates, list):
         items = raw_candidates
@@ -2154,6 +2167,7 @@ def _normalize_fragment_candidates(raw_candidates: Any) -> list[dict[str, Any]]:
 
     candidates: list[dict[str, Any]] = []
     seen_hashes: set[str] = set()
+    seen_structural_hashes: set[str] = set()
     for index, item in enumerate(items):
         metadata: dict[str, Any] = {"candidate_index": index}
         if isinstance(item, dict):
@@ -2165,12 +2179,19 @@ def _normalize_fragment_candidates(raw_candidates: Any) -> list[dict[str, Any]]:
             continue
         text = str(text)
         candidate_hash = _replacement_hash(text)
-        if candidate_hash and candidate_hash in seen_hashes:
+        candidate_structural_hash = _replacement_structural_hash(text)
+        if (
+            (candidate_hash and candidate_hash in seen_hashes)
+            or (candidate_structural_hash and candidate_structural_hash in seen_structural_hashes)
+        ):
             continue
         if candidate_hash:
             seen_hashes.add(candidate_hash)
+        if candidate_structural_hash:
+            seen_structural_hashes.add(candidate_structural_hash)
         metadata["text"] = text
         metadata["replacement_hash"] = candidate_hash
+        metadata["replacement_structural_hash"] = candidate_structural_hash
         candidates.append(metadata)
     return candidates
 
@@ -2208,6 +2229,7 @@ def _compact_candidate_result(result: dict[str, Any]) -> dict[str, Any]:
         "reattachment_structure_ok": result.get("reattachment_structure_ok"),
         "reattachment_structure_reason": result.get("reattachment_structure_reason"),
         "replacement_hash": result.get("replacement_hash"),
+        "replacement_structural_hash": result.get("replacement_structural_hash"),
         "selected_action_types": result.get("selected_action_types"),
         "prompt_path": result.get("prompt_path"),
     }
@@ -2245,6 +2267,7 @@ def _remember_rejected_attempt(
             "target_score_before": target_score_before,
             "target_score_after": target_score_after,
             "replacement_hash": _replacement_hash(replacement_text),
+            "replacement_structural_hash": _replacement_structural_hash(replacement_text),
             "replacement_fingerprint": _fragment_feature_snapshot(replacement_text),
             "replacement_delta": _replacement_delta_for_attempt(source_text_before, replacement_text),
         }
@@ -3088,6 +3111,7 @@ def repair_mismatching_code_objects(
                                 "target_score_before": step.get("target_score_before"),
                                 "target_score_after": step.get("target_score_after"),
                                 "replacement_hash": _replacement_hash(replacement_text),
+                                "replacement_structural_hash": _replacement_structural_hash(replacement_text),
                                 "replacement_fingerprint": _fragment_feature_snapshot(replacement_text),
                                 "replacement_delta": _replacement_delta_for_attempt(extracted_before, replacement_text),
                             }
@@ -3178,6 +3202,7 @@ def repair_mismatching_code_objects(
                     "prompt_path": candidate_input.get("prompt_path"),
                     "prompt_record": candidate_input.get("prompt_record"),
                     "replacement_hash": candidate_input.get("replacement_hash"),
+                    "replacement_structural_hash": candidate_input.get("replacement_structural_hash"),
                     "accepted": False,
                 }
                 try:
@@ -3224,6 +3249,8 @@ def repair_mismatching_code_objects(
                             "accepted": candidate_accepted,
                             "acceptance_reason": candidate_acceptance_reason,
                             "replacement_text": candidate_replacement_text,
+                            "replacement_hash": _replacement_hash(candidate_replacement_text),
+                            "replacement_structural_hash": _replacement_structural_hash(candidate_replacement_text),
                             "updated_text": candidate_updated_text,
                             "output_source": candidate_source,
                             "output_pyc": candidate_pyc,
@@ -3244,6 +3271,8 @@ def repair_mismatching_code_objects(
                             "acceptance_reason": f"candidate could not be evaluated: {type(exc).__name__}: {exc}",
                             "compile_error": f"{type(exc).__name__}: {exc}",
                             "replacement_text": candidate_text,
+                            "replacement_hash": _replacement_hash(candidate_text),
+                            "replacement_structural_hash": _replacement_structural_hash(candidate_text),
                         }
                     )
                 candidate_results.append(candidate_result)

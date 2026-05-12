@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import textwrap
 import time
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
@@ -412,6 +413,7 @@ def _prompt_feature_flags(user_prompt: str, repair_context: dict | None) -> dict
         "compact_metadata": "Identical fields:" in user_prompt or "co_firstlineno:" not in user_prompt,
         "semantic_repair_summaries": "Current repair guidance:" in user_prompt,
         "localized_instruction_diff": _instruction_diff_available(repair_context),
+        "jump_target_diagnosis": "Jump target diagnosis:" in user_prompt,
         "bytecode_evidence_fallback": "Bytecode evidence fallback:" in user_prompt,
         "rejected_attempt_feedback": bool(repair_context and repair_context.get("rejected_attempts")),
         "duplicate_retry_feedback": "Duplicate retry constraint:" in user_prompt,
@@ -1096,6 +1098,44 @@ def _format_current_mismatch_summary(repair_context: dict | None) -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
+def _jump_target_mismatch(repair_context: dict | None) -> dict[str, Any] | None:
+    if not repair_context:
+        return None
+    instruction_diff = str(repair_context.get("instruction_diff") or "")
+    gt_match = re.search(r"=>\s*gt:.*?\b(?P<op>[A-Z_]*JUMP[A-Z_]*)\b.*?\bto\s+(?P<target>\d+)", instruction_diff)
+    derived_match = re.search(r"=>\s*derived:.*?\b(?P<op>[A-Z_]*JUMP[A-Z_]*)\b.*?\bto\s+(?P<target>\d+)", instruction_diff)
+    if not gt_match or not derived_match:
+        return None
+    if gt_match.group("op") != derived_match.group("op"):
+        return None
+    gt_target = int(gt_match.group("target"))
+    derived_target = int(derived_match.group("target"))
+    if gt_target == derived_target:
+        return None
+    return {
+        "opname": gt_match.group("op"),
+        "gt_target": gt_target,
+        "derived_target": derived_target,
+        "direction": "later" if derived_target > gt_target else "earlier",
+    }
+
+
+def _format_jump_target_diagnosis(repair_context: dict | None) -> str:
+    mismatch = _jump_target_mismatch(repair_context)
+    if not mismatch:
+        return ""
+    lines = [
+        "Jump target diagnosis:",
+        f"- {mismatch['opname']} target differs: ground-truth jumps to {mismatch['gt_target']}, derived jumps to {mismatch['derived_target']}.",
+    ]
+    if mismatch["direction"] == "later":
+        lines.append("- The derived branch/loop body is too large; move one existing statement out of the current block or remove an unsupported nested statement.")
+    else:
+        lines.append("- The derived branch/loop body is too small; move one existing statement into the current block or restore a missing nested statement.")
+    lines.append("- Prefer block-placement changes over call, argument, receiver, or indentation-only edits.")
+    return "\n".join(lines)
+
+
 def _limited_list(values: list[str], *, limit: int = 8) -> list[str]:
     return values[:limit]
 
@@ -1189,6 +1229,7 @@ def _format_duplicate_retry_summary(repair_context: dict | None) -> str:
         "Duplicate retry constraint:",
         f"- The immediately previous generated candidate duplicated a {source_label}.",
         "- Do not return that same replacement again; choose a different local edit shape.",
+        "- Whitespace-only or indentation-only variants of the same AST repair still count as duplicates.",
     ]
     duplicate_excerpt = _truncate_rejected_replacement_excerpt(repair_context.get("_duplicate_rejected_output_excerpt"))
     if duplicate_excerpt:
@@ -1220,11 +1261,18 @@ def _format_prior_candidate_outputs_summary(repair_context: dict | None) -> str:
         "Candidate diversity:",
         "- Do not return any prior candidate below.",
         "- Produce a structurally different repair while still following the bytecode and metadata evidence.",
+        "- Whitespace-only or indentation-only variants of prior candidates do not count as different repairs.",
     ]
     for index, candidate in enumerate(prior_candidates, start=1):
         strategy = str(candidate.get("strategy") or "unknown")
         candidate_hash = str(candidate.get("replacement_hash") or "")
-        hash_suffix = f", hash={candidate_hash[:12]}" if candidate_hash else ""
+        structural_hash = str(candidate.get("replacement_structural_hash") or "")
+        if structural_hash:
+            hash_suffix = f", ast={structural_hash[:12]}"
+        elif candidate_hash:
+            hash_suffix = f", hash={candidate_hash[:12]}"
+        else:
+            hash_suffix = ""
         excerpt = _truncate_rejected_replacement_excerpt(candidate.get("text"), max_chars=700)
         if not excerpt:
             continue
@@ -1242,14 +1290,31 @@ def _replacement_hash(text: str | None) -> str | None:
     return hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()
 
 
+def _replacement_structural_hash(text: str | None) -> str | None:
+    if text is None:
+        return None
+    source = textwrap.dedent(str(text).strip("\n"))
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    normalized = ast.dump(tree, include_attributes=False)
+    return hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()
+
+
 def _candidate_repeats_rejected_attempt(candidate: str, repair_context: dict | None) -> bool:
     if not repair_context:
         return False
     candidate_hash = _replacement_hash(candidate)
-    if not candidate_hash:
+    candidate_structural_hash = _replacement_structural_hash(candidate)
+    if not candidate_hash and not candidate_structural_hash:
         return False
     for attempt in repair_context.get("rejected_attempts") or []:
-        if isinstance(attempt, dict) and attempt.get("replacement_hash") == candidate_hash:
+        if not isinstance(attempt, dict):
+            continue
+        if candidate_hash and attempt.get("replacement_hash") == candidate_hash:
+            return True
+        if candidate_structural_hash and attempt.get("replacement_structural_hash") == candidate_structural_hash:
             return True
     return False
 
@@ -1317,6 +1382,7 @@ def build_semantic_prompt_summaries(
         _format_variant_constraint(repair_operation),
         _format_target_context_summary(repair_context),
         _format_current_mismatch_summary(repair_context),
+        _format_jump_target_diagnosis(repair_context),
         _format_code_shape_summary(gt_code_object=gt_code_object, derived_code_object=derived_code_object),
         _format_rejected_attempt_summary(repair_context),
         _format_duplicate_retry_summary(repair_context),
@@ -1576,7 +1642,32 @@ SEMANTIC_CANDIDATE_STRATEGIES = [
 
 
 def _candidate_strategy_specs(count: int, repair_context: dict | None) -> list[tuple[str, str]]:
-    del repair_context
+    mismatch = _jump_target_mismatch(repair_context)
+    if mismatch:
+        if mismatch["direction"] == "later":
+            block_prompt = (
+                "The visible mismatch is a jump target that lands too late. Shrink the current branch/loop body by moving one existing statement out of it; do not change calls, arguments, receivers, or indentation only."
+            )
+        else:
+            block_prompt = (
+                "The visible mismatch is a jump target that lands too early. Expand the current branch/loop body by moving one existing statement into it; do not change calls, arguments, receivers, or indentation only."
+            )
+        strategies = [
+            ("jump_target_block_boundary", block_prompt),
+            (
+                "control_flow_residual",
+                "Change only block membership, loop/if/else placement, break/continue placement, or statement indentation that changes AST block structure; preserve expression text.",
+            ),
+            (
+                "conservative_minimal_delta",
+                "Make the smallest AST-structural edit that changes the jump target. Whitespace-only indentation changes do not count as a distinct repair.",
+            ),
+            (
+                "metadata_literal_name_residual",
+                "Only if block placement cannot explain the jump target, change the smallest literal/name reference shown by metadata.",
+            ),
+        ]
+        return strategies[: max(1, min(count, len(strategies)))]
     return SEMANTIC_CANDIDATE_STRATEGIES[: max(1, min(count, len(SEMANTIC_CANDIDATE_STRATEGIES)))]
 
 
@@ -1676,11 +1767,17 @@ class LLMFragmentFixer(FragmentFixer):
             content = cleaned_response_text.strip()
             candidate = content if content else derived_source_fragment
             candidate_hash = _replacement_hash(candidate)
+            candidate_structural_hash = _replacement_structural_hash(candidate)
             duplicate_rejected_candidate = _candidate_repeats_rejected_attempt(candidate, repair_context)
             same_round_seen_hashes = set()
+            same_round_seen_structural_hashes = set()
             if repair_context is not None:
                 same_round_seen_hashes = set(repair_context.get("_same_round_seen_hashes") or [])
-            duplicate_same_round_candidate = bool(candidate_hash and candidate_hash in same_round_seen_hashes)
+                same_round_seen_structural_hashes = set(repair_context.get("_same_round_seen_structural_hashes") or [])
+            duplicate_same_round_candidate = bool(
+                (candidate_hash and candidate_hash in same_round_seen_hashes)
+                or (candidate_structural_hash and candidate_structural_hash in same_round_seen_structural_hashes)
+            )
             prompt_record.update(
                 {
                     "latency_ms": elapsed_ms,
@@ -1689,6 +1786,7 @@ class LLMFragmentFixer(FragmentFixer):
                     "line_number_stripped_text": cleaned_response_text,
                     "returned_text": candidate,
                     "replacement_hash": candidate_hash,
+                    "replacement_structural_hash": candidate_structural_hash,
                     "duplicate_rejected_candidate": duplicate_rejected_candidate,
                     "duplicate_same_round_candidate": duplicate_same_round_candidate,
                 }
@@ -1736,6 +1834,7 @@ class LLMFragmentFixer(FragmentFixer):
         candidates: list[dict[str, Any]] = []
         prior_candidate_outputs: list[dict[str, Any]] = []
         seen_hashes: set[str] = set()
+        seen_structural_hashes: set[str] = set()
         for candidate_index, (strategy_name, strategy_prompt) in enumerate(strategies):
             candidate_context = dict(repair_context or {})
             candidate_context.pop("_llm_prompt_record", None)
@@ -1747,6 +1846,8 @@ class LLMFragmentFixer(FragmentFixer):
                 candidate_context["_prior_candidate_outputs"] = prior_candidate_outputs[-2:]
             if seen_hashes:
                 candidate_context["_same_round_seen_hashes"] = set(seen_hashes)
+            if seen_structural_hashes:
+                candidate_context["_same_round_seen_structural_hashes"] = set(seen_structural_hashes)
             if strategy_name != "retrieval_guided":
                 candidate_context["_suppress_action_pattern_guidance"] = True
             text = self.generate_candidate(
@@ -1757,14 +1858,21 @@ class LLMFragmentFixer(FragmentFixer):
                 repair_context=candidate_context,
             )
             candidate_hash = _replacement_hash(text)
-            if candidate_hash and candidate_hash in seen_hashes:
+            candidate_structural_hash = _replacement_structural_hash(text)
+            if (
+                (candidate_hash and candidate_hash in seen_hashes)
+                or (candidate_structural_hash and candidate_structural_hash in seen_structural_hashes)
+            ):
                 continue
             if candidate_hash:
                 seen_hashes.add(candidate_hash)
+            if candidate_structural_hash:
+                seen_structural_hashes.add(candidate_structural_hash)
             prior_candidate_outputs.append(
                 {
                     "strategy": strategy_name,
                     "replacement_hash": candidate_hash,
+                    "replacement_structural_hash": candidate_structural_hash,
                     "text": text,
                 }
             )
@@ -1775,6 +1883,7 @@ class LLMFragmentFixer(FragmentFixer):
                     "strategy": strategy_name,
                     "text": text,
                     "replacement_hash": candidate_hash,
+                    "replacement_structural_hash": candidate_structural_hash,
                     "selected_action_types": candidate_context.get("_selected_action_pattern_types") or [],
                     "prompt_path": prompt_record.get("prompt_path") if isinstance(prompt_record, dict) else None,
                     "prompt_record": prompt_record if isinstance(prompt_record, dict) else None,
