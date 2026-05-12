@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import inspect
 import json
 import os
 import random
@@ -17,7 +18,7 @@ from dotenv import load_dotenv
 
 DEFAULT_MODEL_NAME = "unsloth/Qwen3-Coder-30B-A3B-Instruct"
 DEFAULT_DATASET_PATH = "dataset/accepted_codeobject_mining_prompt_refresh.jsonl"
-DEFAULT_MAX_SEQ_LENGTH = 32768
+DEFAULT_MAX_SEQ_LENGTH = 16384
 DEFAULT_VALIDATION_RATIO = 0.05
 DEFAULT_RANDOM_SEED = 42
 DEFAULT_RESPONSE_TEMPLATE = ""
@@ -239,6 +240,51 @@ def create_completion_data_collator(tokenizer: Any, args: argparse.Namespace) ->
     )
 
 
+def create_training_arguments(training_arguments_cls: Any, args: argparse.Namespace, output_dir: Path, *, bf16_supported: bool) -> Any:
+    kwargs = {
+        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "warmup_steps": args.warmup_steps,
+        "warmup_ratio": args.warmup_ratio,
+        "num_train_epochs": args.num_train_epochs,
+        "eval_strategy": "steps",
+        "eval_steps": args.eval_steps,
+        "save_strategy": "steps",
+        "save_steps": args.save_steps,
+        "learning_rate": args.learning_rate,
+        "fp16": not bf16_supported,
+        "bf16": bf16_supported,
+        "optim": args.optim,
+        "weight_decay": args.weight_decay,
+        "max_grad_norm": args.max_grad_norm,
+        "lr_scheduler_type": args.lr_scheduler_type,
+        "seed": args.seed,
+        "output_dir": str(output_dir),
+        "logging_strategy": "steps",
+        "logging_steps": args.logging_steps,
+        "logging_first_step": True,
+        "load_best_model_at_end": True,
+        "metric_for_best_model": "eval_loss",
+        "greater_is_better": False,
+        "save_total_limit": args.save_total_limit,
+        "report_to": args.report_to,
+        "group_by_length": args.group_by_length,
+    }
+
+    supported = set(inspect.signature(training_arguments_cls.__init__).parameters)
+    if "eval_strategy" not in supported and "evaluation_strategy" in supported:
+        kwargs["evaluation_strategy"] = kwargs.pop("eval_strategy")
+    filtered = {key: value for key, value in kwargs.items() if key in supported}
+    dropped = sorted(set(kwargs) - set(filtered))
+    if dropped:
+        warnings.warn(
+            f"TrainingArguments does not support these options in this environment; dropping: {', '.join(dropped)}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return training_arguments_cls(**filtered)
+
+
 def create_trainer(
     *,
     model: Any,
@@ -253,6 +299,7 @@ def create_trainer(
     from transformers import EarlyStoppingCallback, TrainingArguments
     from trl import SFTTrainer
     from unsloth import is_bfloat16_supported
+    bf16_supported = is_bfloat16_supported()
 
     trainer_kwargs = {
         "model": model,
@@ -273,34 +320,11 @@ def create_trainer(
                 early_stopping_threshold=1e-3,
             )
         ],
-        "args": TrainingArguments(
-            per_device_train_batch_size=args.per_device_train_batch_size,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            warmup_steps=args.warmup_steps,
-            warmup_ratio=args.warmup_ratio,
-            num_train_epochs=args.num_train_epochs,
-            eval_strategy="steps",
-            eval_steps=args.eval_steps,
-            save_strategy="steps",
-            save_steps=args.save_steps,
-            learning_rate=args.learning_rate,
-            fp16=not is_bfloat16_supported(),
-            bf16=is_bfloat16_supported(),
-            optim=args.optim,
-            weight_decay=args.weight_decay,
-            max_grad_norm=args.max_grad_norm,
-            lr_scheduler_type=args.lr_scheduler_type,
-            seed=args.seed,
-            output_dir=str(output_dir),
-            logging_strategy="steps",
-            logging_steps=args.logging_steps,
-            logging_first_step=True,
-            load_best_model_at_end=True,
-            metric_for_best_model="eval_loss",
-            greater_is_better=False,
-            save_total_limit=args.save_total_limit,
-            report_to=args.report_to,
-            group_by_length=args.group_by_length,
+        "args": create_training_arguments(
+            TrainingArguments,
+            args,
+            output_dir,
+            bf16_supported=bf16_supported,
         ),
     }
     data_collator = create_completion_data_collator(tokenizer, args)
@@ -330,7 +354,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-sample-chars",
         type=int,
-        default=int(os.getenv("MAX_SAMPLE_CHARS_FOR_FINETUNING", DEFAULT_MAX_SEQ_LENGTH * 5)),
+        default=int(os.getenv("MAX_SAMPLE_CHARS_FOR_FINETUNING", DEFAULT_MAX_SEQ_LENGTH * 4)),
         help="Drop extreme prompt+answer examples by character count before tokenization; 0 disables this heuristic.",
     )
 
@@ -350,14 +374,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-scheduler-type", default="cosine")
     parser.add_argument("--optim", default="adamw_8bit")
     parser.add_argument("--report-to", default="none")
-    parser.add_argument("--dataset-num-proc", type=int, default=2)
+    parser.add_argument("--dataset-num-proc", type=int, default=1)
     parser.add_argument("--packing", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--group-by-length", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--assistant-only-loss", action=argparse.BooleanOptionalAction, default=env_bool("ASSISTANT_ONLY_LOSS_FOR_FINETUNING", False))
     parser.add_argument("--response-template", default=env_text("RESPONSE_TEMPLATE_FOR_FINETUNING", DEFAULT_RESPONSE_TEMPLATE))
     parser.add_argument("--enable-thinking-template", action=argparse.BooleanOptionalAction, default=env_bool("ENABLE_THINKING_TEMPLATE_FOR_FINETUNING", False))
-    parser.add_argument("--lora-r", type=int, default=32)
-    parser.add_argument("--lora-alpha", type=int, default=64)
+    parser.add_argument("--lora-r", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.0)
     parser.add_argument("--use-rslora", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--merge", action=argparse.BooleanOptionalAction, default=True)
