@@ -921,11 +921,35 @@ def _score_action_pattern(current: dict[str, Any], pattern: dict[str, Any]) -> i
     return score
 
 
+def _rejected_action_type_penalties(repair_context: dict | None) -> dict[str, int]:
+    if not repair_context:
+        return {}
+    rejected_attempts = repair_context.get("rejected_attempts") or []
+    penalties: dict[str, int] = {}
+    for reverse_index, attempt in enumerate(reversed(rejected_attempts[-3:])):
+        if not isinstance(attempt, dict):
+            continue
+        selected_action_types = [
+            str(action_type)
+            for action_type in (attempt.get("selected_action_types") or [])
+            if action_type
+        ]
+        if not selected_action_types:
+            continue
+        top_penalty = 8 if reverse_index == 0 else 4
+        secondary_penalty = 4 if reverse_index == 0 else 2
+        for index, action_type in enumerate(selected_action_types[:3]):
+            penalty = top_penalty if index == 0 else secondary_penalty
+            penalties[action_type] = max(penalties.get(action_type, 0), penalty)
+    return penalties
+
+
 def _rank_action_patterns_by_action_type(
     current: dict[str, Any],
     action_patterns: list[dict],
     *,
     min_score: int,
+    action_type_penalties: dict[str, int] | None = None,
 ) -> list[tuple[int, int, dict]]:
     by_action_type: dict[str, list[tuple[int, dict]]] = defaultdict(list)
     for pattern in action_patterns:
@@ -941,8 +965,10 @@ def _rank_action_patterns_by_action_type(
     for matches in by_action_type.values():
         matches.sort(key=lambda item: item[0], reverse=True)
         best_score, best_pattern = matches[0]
+        action_type = str(best_pattern.get("action_type") or "")
         consensus_bonus = sum(max(0, score - min_score) for score, _ in matches[:5]) // 5
-        ranked.append((best_score + consensus_bonus, best_score, best_pattern))
+        penalty = 0 if action_type_penalties is None else int(action_type_penalties.get(action_type, 0))
+        ranked.append((best_score + consensus_bonus - penalty, best_score, best_pattern))
     ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
     return ranked
 
@@ -967,7 +993,23 @@ def generate_action_pattern_guidance(
         derived_source_fragment=derived_source_fragment,
         repair_context=repair_context,
     )
-    selected = [pattern for _, _, pattern in _rank_action_patterns_by_action_type(current, action_patterns, min_score=min_score)[:max_patterns]]
+    action_type_penalties = _rejected_action_type_penalties(repair_context)
+    selected = [
+        pattern
+        for _, _, pattern in _rank_action_patterns_by_action_type(
+            current,
+            action_patterns,
+            min_score=min_score,
+            action_type_penalties=action_type_penalties,
+        )[:max_patterns]
+    ]
+    if repair_context is not None:
+        repair_context["_selected_action_pattern_types"] = [
+            str(pattern.get("action_type") or "")
+            for pattern in selected
+            if pattern.get("action_type")
+        ]
+        repair_context["_rejected_action_type_penalties"] = action_type_penalties
     if not selected:
         return ""
 
@@ -1017,6 +1059,9 @@ def _format_target_context_summary(repair_context: dict | None) -> str:
         ("alignment_tag", repair_context.get("alignment_tag")),
     ]
     lines = [f"- {name}: {value}" for name, value in fields if value is not None]
+    retry_count = int(repair_context.get("retry_count_for_target") or 0)
+    if retry_count:
+        lines.append(f"- retry_count_for_target: {retry_count}")
     failed = repair_context.get("pylingual_failed_result") or {}
     if failed.get("message"):
         lines.append(f"- pylingual_message: {failed.get('message')}")
@@ -1086,15 +1131,27 @@ def _format_code_shape_summary(*, gt_code_object: Any, derived_code_object: Any)
 
 def _format_rejected_attempt_summary(repair_context: dict | None) -> str:
     rejected_attempts = [] if not repair_context else repair_context.get("rejected_attempts") or []
-    reasons = [
-        str(item.get("acceptance_reason"))
-        for item in rejected_attempts[-3:]
-        if isinstance(item, dict) and item.get("acceptance_reason")
-    ]
-    if not reasons:
+    rejected_attempts = [item for item in rejected_attempts[-3:] if isinstance(item, dict)]
+    if not rejected_attempts:
         return ""
-    lines = ["Avoid patterns rejected for this target:"]
-    lines.extend(f"- {reason}" for reason in reasons)
+    last_attempt = rejected_attempts[-1]
+    last_reason = last_attempt.get("acceptance_reason")
+    last_action_types = [str(value) for value in (last_attempt.get("selected_action_types") or []) if value]
+    previous_action_types: list[str] = []
+    for attempt in rejected_attempts[:-1]:
+        for action_type in attempt.get("selected_action_types") or []:
+            action_type = str(action_type)
+            if action_type and action_type not in previous_action_types:
+                previous_action_types.append(action_type)
+
+    lines = ["Retry feedback:"]
+    if last_reason:
+        lines.append(f"- last rejection reason: {last_reason}")
+    if last_action_types:
+        lines.append(f"- last rejected action guidance: {', '.join(last_action_types[:3])}")
+    if previous_action_types:
+        lines.append(f"- earlier rejected action guidance: {', '.join(previous_action_types[:3])}")
+    lines.append("- Prefer a different minimal edit unless the current bytecode evidence strongly supports the rejected action.")
     return "\n".join(lines)
 
 

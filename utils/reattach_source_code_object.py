@@ -2105,6 +2105,63 @@ def _instruction_diff_context(
     }
 
 
+def _selected_action_types_from_repair_context(repair_context: dict | None) -> list[str]:
+    if not isinstance(repair_context, dict):
+        return []
+    return [
+        str(action_type)
+        for action_type in (repair_context.get("_selected_action_pattern_types") or [])
+        if action_type
+    ][:3]
+
+
+def _compact_rejected_attempts_for_prompt(rejected_attempts: list[dict], *, limit: int = 3) -> list[dict]:
+    compact: list[dict] = []
+    for attempt in rejected_attempts[-limit:]:
+        if not isinstance(attempt, dict):
+            continue
+        compact.append(
+            {
+                "attempt": attempt.get("attempt"),
+                "acceptance_reason": attempt.get("acceptance_reason"),
+                "selected_action_types": [
+                    str(action_type)
+                    for action_type in (attempt.get("selected_action_types") or [])
+                    if action_type
+                ][:3],
+                "target_score_before": attempt.get("target_score_before"),
+                "target_score_after": attempt.get("target_score_after"),
+                "replacement_fingerprint": attempt.get("replacement_fingerprint"),
+            }
+        )
+    return compact
+
+
+def _remember_rejected_attempt(
+    rejected_attempts_by_qualname: dict[str, list[dict]],
+    qualname: str,
+    *,
+    attempt: int,
+    replacement_text: str | None,
+    acceptance_reason: str | None,
+    target_score_before: dict | None,
+    target_score_after: dict | None,
+    repair_context: dict | None,
+) -> None:
+    attempts = rejected_attempts_by_qualname.setdefault(qualname, [])
+    attempts.append(
+        {
+            "attempt": attempt,
+            "acceptance_reason": acceptance_reason,
+            "selected_action_types": _selected_action_types_from_repair_context(repair_context),
+            "target_score_before": target_score_before,
+            "target_score_after": target_score_after,
+            "replacement_fingerprint": _fragment_feature_snapshot(replacement_text),
+        }
+    )
+    del attempts[:-5]
+
+
 def _build_target_repair_context(
     *,
     qualname: str,
@@ -2118,11 +2175,14 @@ def _build_target_repair_context(
     failed_offset = None if failed_result is None else failed_result.get("failed_offset")
     if line_number is None and failed_result is not None:
         line_number = failed_result.get("failed_line_number")
+    base_radius = 2 if qualname != "<module>" else 3
+    retry_count = len(rejected_attempts or [])
+    radius = min(base_radius + retry_count, 5 if qualname != "<module>" else 6)
     instruction_context = _instruction_diff_context(
         gt_code_object,
         derived_code_object,
         None if failed_offset is None else int(failed_offset),
-        radius=2 if qualname != "<module>" else 3,
+        radius=radius,
     )
     return {
         "target_kind": "module_statement" if qualname == "<module>" else "code_object_fragment",
@@ -2130,6 +2190,7 @@ def _build_target_repair_context(
         "localized_line_number": line_number,
         "failed_offset": instruction_context.get("failed_offset"),
         "alignment_tag": instruction_context.get("alignment_tag"),
+        "retry_count_for_target": retry_count,
         "pylingual_failed_result": failed_result,
         "instruction_diff": instruction_context.get("instruction_diff"),
         "gt_instruction_range": instruction_context.get("gt_instruction_range"),
@@ -2140,7 +2201,7 @@ def _build_target_repair_context(
         "bytecode_window_max_records": instruction_context.get("bytecode_window_max_records"),
         "bytecode_window_truncated": instruction_context.get("bytecode_window_truncated"),
         "instruction_renderer_version": instruction_context.get("instruction_renderer_version"),
-        "rejected_attempts": rejected_attempts[-1:],
+        "rejected_attempts": _compact_rejected_attempts_for_prompt(rejected_attempts),
     }
 
 
@@ -2723,6 +2784,7 @@ def repair_mismatching_code_objects(
     unsupported_extra_targets: set[str] = set()
     unsupported_module_body_repair = False
     module_rejected_attempts: list[dict] = []
+    rejected_attempts_by_qualname: dict[str, list[dict]] = {}
 
     preprocessing_rows = compare_code_object_distances(gt_pyc, current_pyc)
     if _module_needs_repair(preprocessing_rows) and "<module>" not in all_repair_targets:
@@ -2932,8 +2994,10 @@ def repair_mismatching_code_objects(
                                 "localized_line_number": line_number,
                                 "replacement_text": replacement_text,
                                 "acceptance_reason": step["acceptance_reason"],
+                                "selected_action_types": _selected_action_types_from_repair_context(repair_context),
                                 "target_score_before": step.get("target_score_before"),
                                 "target_score_after": step.get("target_score_after"),
+                                "replacement_fingerprint": _fragment_feature_snapshot(replacement_text),
                             }
                         )
                 except ReattachError as exc:
@@ -2980,7 +3044,7 @@ def repair_mismatching_code_objects(
                 gt_code_object=gt_bytecode,
                 derived_code_object=derived_bytecode,
                 verification=current_pylingual_verification,
-                rejected_attempts=[],
+                rejected_attempts=rejected_attempts_by_qualname.get(qualname, []),
             )
             repair_context["_target_identity"] = _mapping_row_identity(target_row)
             repair_context["_target_mapping_resolution"] = target_row.get("_mapping_resolution")
@@ -3098,6 +3162,17 @@ def repair_mismatching_code_objects(
                     current_pylingual_verification = step_pylingual_verification
                 if _pylingual_target_is_equal(current_pylingual_verification, qualname) is True:
                     continue
+            else:
+                _remember_rejected_attempt(
+                    rejected_attempts_by_qualname,
+                    qualname,
+                    attempt=target_attempt_counts[qualname],
+                    replacement_text=replacement_text,
+                    acceptance_reason=acceptance_reason,
+                    target_score_before=target_score_before,
+                    target_score_after=target_score_after,
+                    repair_context=repair_context,
+                )
 
         extra_targets = select_extra_repair_targets(compare_code_object_distances(gt_pyc, current_pyc))
         all_repair_targets.extend(
@@ -3333,7 +3408,7 @@ def repair_mismatching_code_objects(
                     gt_code_object=gt_bytecode,
                     derived_code_object=current_bytecodes.get(qualname),
                     verification=current_pylingual_verification,
-                    rejected_attempts=[],
+                    rejected_attempts=rejected_attempts_by_qualname.get(qualname, []),
                 )
                 repair_context["_parent_target_identity"] = _mapping_row_identity(parent_row)
                 repair_context["_parent_mapping_resolution"] = (
@@ -3434,6 +3509,17 @@ def repair_mismatching_code_objects(
                 current_summary = step_summary
                 if step_pylingual_verification is not None:
                     current_pylingual_verification = step_pylingual_verification
+            else:
+                _remember_rejected_attempt(
+                    rejected_attempts_by_qualname,
+                    qualname,
+                    attempt=target_attempt_counts[qualname],
+                    replacement_text=replacement_text,
+                    acceptance_reason=acceptance_reason,
+                    target_score_before=target_score_before,
+                    target_score_after=target_score_after,
+                    repair_context=repair_context if fragment_fixer is not None else None,
+                )
 
         if accepted_this_iteration == 0 and not _has_retryable_pylingual_targets(current_pylingual_verification, attempted_pylingual_targets):
             break
