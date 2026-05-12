@@ -6,6 +6,7 @@ import json
 import os
 import random
 import time
+import warnings
 from pathlib import Path
 from pprint import pprint
 from typing import Any
@@ -15,10 +16,25 @@ from dotenv import load_dotenv
 
 
 DEFAULT_MODEL_NAME = "unsloth/Qwen3-Coder-30B-A3B-Instruct"
-DEFAULT_DATASET_PATH = "dataset/accepted_codeobject_mining_raw.jsonl"
-DEFAULT_MAX_SEQ_LENGTH = 8192
-DEFAULT_VALIDATION_RATIO = 0.2
+DEFAULT_DATASET_PATH = "dataset/accepted_codeobject_mining_prompt_refresh.jsonl"
+DEFAULT_MAX_SEQ_LENGTH = 32768
+DEFAULT_VALIDATION_RATIO = 0.05
 DEFAULT_RANDOM_SEED = 42
+DEFAULT_RESPONSE_TEMPLATE = ""
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_text(name: str, default: str) -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.encode("utf-8").decode("unicode_escape")
 
 
 def repo_root() -> Path:
@@ -84,7 +100,26 @@ def build_chat_samples(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return samples
 
 
-def formatting_func(example: dict[str, Any], tokenizer: Any) -> list[str]:
+def apply_chat_template(
+    tokenizer: Any,
+    messages: list[dict[str, Any]],
+    *,
+    enable_thinking_template: bool,
+) -> str:
+    kwargs = {
+        "tokenize": False,
+        "add_generation_prompt": False,
+        "enable_thinking": enable_thinking_template,
+    }
+    try:
+        return tokenizer.apply_chat_template(messages, **kwargs)
+    except TypeError:
+        # Older/non-Qwen tokenizers do not expose enable_thinking.
+        kwargs.pop("enable_thinking", None)
+        return tokenizer.apply_chat_template(messages, **kwargs)
+
+
+def formatting_func(example: dict[str, Any], tokenizer: Any, enable_thinking_template: bool) -> list[str]:
     messages_field = example["messages"]
     if (
         isinstance(messages_field, list)
@@ -96,10 +131,10 @@ def formatting_func(example: dict[str, Any], tokenizer: Any) -> list[str]:
         conversations = [messages_field]
 
     return [
-        tokenizer.apply_chat_template(
+        apply_chat_template(
+            tokenizer,
             messages,
-            tokenize=False,
-            add_generation_prompt=False,
+            enable_thinking_template=enable_thinking_template,
         )
         for messages in conversations
     ]
@@ -162,20 +197,46 @@ def load_model_and_tokenizer(args: argparse.Namespace):
             "down_proj",
         ],
         lora_alpha=args.lora_alpha,
-        lora_dropout=0,
+        lora_dropout=args.lora_dropout,
         bias="none",
         use_gradient_checkpointing="unsloth",
         random_state=args.seed,
-        use_rslora=False,
+        use_rslora=args.use_rslora,
         loftq_config=None,
     )
 
     if getattr(tokenizer, "pad_token_id", None) is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
     model.config.use_cache = False
 
     print("Model device:", model.device)
     return model, tokenizer
+
+
+def create_completion_data_collator(tokenizer: Any, args: argparse.Namespace) -> Any | None:
+    if not args.assistant_only_loss:
+        return None
+    if not args.response_template:
+        warnings.warn(
+            "--assistant-only-loss was requested without --response-template; falling back to full-sequence loss.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
+    try:
+        from trl import DataCollatorForCompletionOnlyLM
+    except (ImportError, AttributeError):
+        warnings.warn(
+            "TRL DataCollatorForCompletionOnlyLM is unavailable; falling back to full-sequence loss.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
+    return DataCollatorForCompletionOnlyLM(
+        response_template=args.response_template,
+        tokenizer=tokenizer,
+    )
 
 
 def create_trainer(
@@ -193,25 +254,30 @@ def create_trainer(
     from trl import SFTTrainer
     from unsloth import is_bfloat16_supported
 
-    return SFTTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        formatting_func=partial(formatting_func, tokenizer=tokenizer),
-        max_seq_length=args.max_seq_length,
-        dataset_num_proc=args.dataset_num_proc,
-        packing=args.packing,
-        callbacks=[
+    trainer_kwargs = {
+        "model": model,
+        "tokenizer": tokenizer,
+        "train_dataset": train_dataset,
+        "eval_dataset": val_dataset,
+        "formatting_func": partial(
+            formatting_func,
+            tokenizer=tokenizer,
+            enable_thinking_template=args.enable_thinking_template,
+        ),
+        "max_seq_length": args.max_seq_length,
+        "dataset_num_proc": args.dataset_num_proc,
+        "packing": args.packing,
+        "callbacks": [
             EarlyStoppingCallback(
                 early_stopping_patience=args.early_stopping_patience,
                 early_stopping_threshold=1e-3,
             )
         ],
-        args=TrainingArguments(
+        "args": TrainingArguments(
             per_device_train_batch_size=args.per_device_train_batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             warmup_steps=args.warmup_steps,
+            warmup_ratio=args.warmup_ratio,
             num_train_epochs=args.num_train_epochs,
             eval_strategy="steps",
             eval_steps=args.eval_steps,
@@ -222,6 +288,7 @@ def create_trainer(
             bf16=is_bfloat16_supported(),
             optim=args.optim,
             weight_decay=args.weight_decay,
+            max_grad_norm=args.max_grad_norm,
             lr_scheduler_type=args.lr_scheduler_type,
             seed=args.seed,
             output_dir=str(output_dir),
@@ -233,14 +300,19 @@ def create_trainer(
             greater_is_better=False,
             save_total_limit=args.save_total_limit,
             report_to=args.report_to,
+            group_by_length=args.group_by_length,
         ),
-    )
+    }
+    data_collator = create_completion_data_collator(tokenizer, args)
+    if data_collator is not None:
+        trainer_kwargs["data_collator"] = data_collator
+    return SFTTrainer(**trainer_kwargs)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Fine-tune Qwen2.5-Coder on accepted semantic code-object repair "
+            "Fine-tune Qwen3-Coder on accepted semantic code-object repair "
             "prompt/output examples."
         )
     )
@@ -250,32 +322,62 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("DATASET_PATH_FOR_FINETUNING", DEFAULT_DATASET_PATH),
     )
     parser.add_argument("--max-seq-length", type=int, default=int(os.getenv("MAX_SEQ_LENGTH_FOR_FINETUNING", DEFAULT_MAX_SEQ_LENGTH)))
-    parser.add_argument("--validation-ratio", type=float, default=DEFAULT_VALIDATION_RATIO)
+    parser.add_argument("--validation-ratio", type=float, default=float(os.getenv("VALIDATION_RATIO_FOR_FINETUNING", DEFAULT_VALIDATION_RATIO)))
     parser.add_argument("--seed", type=int, default=DEFAULT_RANDOM_SEED)
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--load-in-4bit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dry-run", action="store_true", help="Only validate and preview the JSONL examples.")
+    parser.add_argument(
+        "--max-sample-chars",
+        type=int,
+        default=int(os.getenv("MAX_SAMPLE_CHARS_FOR_FINETUNING", DEFAULT_MAX_SEQ_LENGTH * 5)),
+        help="Drop extreme prompt+answer examples by character count before tokenization; 0 disables this heuristic.",
+    )
 
     parser.add_argument("--per-device-train-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=16)
-    parser.add_argument("--num-train-epochs", type=float, default=10)
-    parser.add_argument("--learning-rate", type=float, default=2e-4)
-    parser.add_argument("--warmup-steps", type=int, default=10)
+    parser.add_argument("--num-train-epochs", type=float, default=3)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument("--warmup-ratio", type=float, default=0.03)
     parser.add_argument("--eval-steps", type=int, default=100)
     parser.add_argument("--save-steps", type=int, default=100)
     parser.add_argument("--logging-steps", type=int, default=50)
-    parser.add_argument("--save-total-limit", type=int, default=2)
-    parser.add_argument("--early-stopping-patience", type=int, default=3)
+    parser.add_argument("--save-total-limit", type=int, default=3)
+    parser.add_argument("--early-stopping-patience", type=int, default=4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--lr-scheduler-type", default="linear")
+    parser.add_argument("--max-grad-norm", type=float, default=0.3)
+    parser.add_argument("--lr-scheduler-type", default="cosine")
     parser.add_argument("--optim", default="adamw_8bit")
     parser.add_argument("--report-to", default="none")
     parser.add_argument("--dataset-num-proc", type=int, default=2)
     parser.add_argument("--packing", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--lora-r", type=int, default=16)
-    parser.add_argument("--lora-alpha", type=int, default=16)
+    parser.add_argument("--group-by-length", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--assistant-only-loss", action=argparse.BooleanOptionalAction, default=env_bool("ASSISTANT_ONLY_LOSS_FOR_FINETUNING", False))
+    parser.add_argument("--response-template", default=env_text("RESPONSE_TEMPLATE_FOR_FINETUNING", DEFAULT_RESPONSE_TEMPLATE))
+    parser.add_argument("--enable-thinking-template", action=argparse.BooleanOptionalAction, default=env_bool("ENABLE_THINKING_TEMPLATE_FOR_FINETUNING", False))
+    parser.add_argument("--lora-r", type=int, default=32)
+    parser.add_argument("--lora-alpha", type=int, default=64)
+    parser.add_argument("--lora-dropout", type=float, default=0.0)
+    parser.add_argument("--use-rslora", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--merge", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
+
+
+def filter_samples_by_char_budget(samples: list[dict[str, Any]], max_sample_chars: int) -> list[dict[str, Any]]:
+    if max_sample_chars <= 0:
+        return samples
+    kept: list[dict[str, Any]] = []
+    skipped = 0
+    for sample in samples:
+        total_chars = sum(len(str(message.get("content", ""))) for message in sample.get("messages", []))
+        if total_chars <= max_sample_chars:
+            kept.append(sample)
+        else:
+            skipped += 1
+    if skipped:
+        print(f"Skipped {skipped} examples over --max-sample-chars={max_sample_chars}.")
+    return kept
 
 
 def main() -> None:
@@ -289,8 +391,11 @@ def main() -> None:
 
     records = read_jsonl(dataset_path)
     samples = build_chat_samples(records)
+    samples = filter_samples_by_char_budget(samples, args.max_sample_chars)
     if len(samples) < 2:
         raise ValueError("Need at least two valid samples for train/validation split.")
+    if args.assistant_only_loss and args.packing:
+        raise ValueError("--assistant-only-loss requires --no-packing so prompt/assistant masking stays valid.")
 
     print_sample(samples)
     if args.dry_run:
