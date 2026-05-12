@@ -1151,8 +1151,60 @@ def _format_rejected_attempt_summary(repair_context: dict | None) -> str:
         lines.append(f"- last rejected action guidance: {', '.join(last_action_types[:3])}")
     if previous_action_types:
         lines.append(f"- earlier rejected action guidance: {', '.join(previous_action_types[:3])}")
+    last_delta = _format_rejected_replacement_delta(last_attempt.get("replacement_delta"))
+    if last_delta:
+        lines.append(f"- last failed edit shape: {last_delta}")
+    recent_after_scores = [
+        _score_combined_distance(attempt.get("target_score_after"))
+        for attempt in rejected_attempts
+    ]
+    recent_after_scores = [score for score in recent_after_scores if score is not None]
+    if recent_after_scores:
+        lines.append(f"- recent rejected after-distances: {', '.join(str(score) for score in recent_after_scores[-3:])}")
     lines.append("- Prefer a different minimal edit unless the current bytecode evidence strongly supports the rejected action.")
     return "\n".join(lines)
+
+
+def _score_combined_distance(score: Any) -> int | None:
+    if not isinstance(score, dict):
+        return None
+    value = score.get("combined_distance")
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
+
+
+def _format_rejected_replacement_delta(delta: Any) -> str:
+    if not isinstance(delta, dict) or not delta:
+        return ""
+    parts: list[str] = []
+    for key, label in (
+        ("statement_types_added", "statements added"),
+        ("statement_types_removed", "statements removed"),
+        ("control_flow_added", "control flow added"),
+        ("control_flow_removed", "control flow removed"),
+        ("names_added", "names added"),
+        ("names_removed", "names removed"),
+    ):
+        values = delta.get(key)
+        if isinstance(values, list) and values:
+            parts.append(f"{label}={values[:5]}")
+    for key, label in (
+        ("line_count_delta", "line delta"),
+        ("char_count_delta", "char delta"),
+        ("indent_width_delta", "indent delta"),
+    ):
+        value = delta.get(key)
+        if isinstance(value, (int, float)) and value:
+            parts.append(f"{label}={int(value)}")
+    for key, label in (
+        ("parse_transition", "parse"),
+        ("dedented_parse_transition", "dedented parse"),
+    ):
+        value = delta.get(key)
+        if value and value != "True->True":
+            parts.append(f"{label}={value}")
+    return "; ".join(parts[:6])
 
 
 def build_semantic_prompt_summaries(

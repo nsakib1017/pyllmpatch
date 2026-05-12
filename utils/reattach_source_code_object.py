@@ -2132,9 +2132,21 @@ def _compact_rejected_attempts_for_prompt(rejected_attempts: list[dict], *, limi
                 "target_score_before": attempt.get("target_score_before"),
                 "target_score_after": attempt.get("target_score_after"),
                 "replacement_fingerprint": attempt.get("replacement_fingerprint"),
+                "replacement_delta": attempt.get("replacement_delta"),
             }
         )
     return compact
+
+
+def _replacement_delta_for_attempt(source_text_before: str | None, replacement_text: str | None) -> dict[str, Any]:
+    before = _fragment_feature_snapshot(source_text_before)
+    after = _fragment_feature_snapshot(replacement_text)
+    delta = _fragment_feature_delta(before, after)
+    return {
+        key: value
+        for key, value in delta.items()
+        if value not in (None, [], {}, "False->False", "True->True", 0)
+    }
 
 
 def _remember_rejected_attempt(
@@ -2142,6 +2154,7 @@ def _remember_rejected_attempt(
     qualname: str,
     *,
     attempt: int,
+    source_text_before: str | None,
     replacement_text: str | None,
     acceptance_reason: str | None,
     target_score_before: dict | None,
@@ -2157,6 +2170,7 @@ def _remember_rejected_attempt(
             "target_score_before": target_score_before,
             "target_score_after": target_score_after,
             "replacement_fingerprint": _fragment_feature_snapshot(replacement_text),
+            "replacement_delta": _replacement_delta_for_attempt(source_text_before, replacement_text),
         }
     )
     del attempts[:-5]
@@ -2998,6 +3012,7 @@ def repair_mismatching_code_objects(
                                 "target_score_before": step.get("target_score_before"),
                                 "target_score_after": step.get("target_score_after"),
                                 "replacement_fingerprint": _fragment_feature_snapshot(replacement_text),
+                                "replacement_delta": _replacement_delta_for_attempt(extracted_before, replacement_text),
                             }
                         )
                 except ReattachError as exc:
@@ -3167,6 +3182,7 @@ def repair_mismatching_code_objects(
                     rejected_attempts_by_qualname,
                     qualname,
                     attempt=target_attempt_counts[qualname],
+                    source_text_before=extracted_before,
                     replacement_text=replacement_text,
                     acceptance_reason=acceptance_reason,
                     target_score_before=target_score_before,
@@ -3514,6 +3530,7 @@ def repair_mismatching_code_objects(
                     rejected_attempts_by_qualname,
                     qualname,
                     attempt=target_attempt_counts[qualname],
+                    source_text_before=insertion_context,
                     replacement_text=replacement_text,
                     acceptance_reason=acceptance_reason,
                     target_score_before=target_score_before,
