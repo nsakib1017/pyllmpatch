@@ -50,12 +50,18 @@ OPEN_LLM_MODELS =  [
         'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth__Qwen2.5-Coder-32B-Instruct-bnb-4bit/run_1778168589/checkpoint-400",
         'tokenizer_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth__Qwen2.5-Coder-32B-Instruct-bnb-4bit/run_1778168589/checkpoint-400",
     },
-        {
+    {
         'provider': 'Alibaba',
         'name': 'qwen3-coder-30b',
-        'token_for_completion': 8192,
+        'token_for_completion': 16384,
         'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/unsloth__Qwen3-Coder-30B-A3B-Instruct/run_1778297210",
         'tokenizer_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/unsloth__Qwen3-Coder-30B-A3B-Instruct/run_1778297210",
+        'generation_config': {
+            'max_new_tokens': 8192,
+            'do_sample': False,
+            'temperature': 0.0,
+            'top_p': 1.0,
+        },
     },
     {
         'provider': 'IBM',
@@ -236,6 +242,7 @@ def make_llm_call_from_config(messages: List[dict], llm_config: dict[str, Any]) 
             model_path=llm_config["model_path"],
             max_tokens=llm_config["token_for_completion"],
             tokenizer_path=llm_config.get("tokenizer_path"),
+            generation_config=llm_config.get("generation_config"),
         )
         return {"content": content, "usage": None}
 
