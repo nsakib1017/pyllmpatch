@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ast
 import csv
+import hashlib
 import json
 import re
 import sys
@@ -936,8 +937,8 @@ def _rejected_action_type_penalties(repair_context: dict | None) -> dict[str, in
         ]
         if not selected_action_types:
             continue
-        top_penalty = 8 if reverse_index == 0 else 4
-        secondary_penalty = 4 if reverse_index == 0 else 2
+        top_penalty = 18 if reverse_index == 0 else 8
+        secondary_penalty = 8 if reverse_index == 0 else 4
         for index, action_type in enumerate(selected_action_types[:3]):
             penalty = top_penalty if index == 0 else secondary_penalty
             penalties[action_type] = max(penalties.get(action_type, 0), penalty)
@@ -1161,8 +1162,44 @@ def _format_rejected_attempt_summary(repair_context: dict | None) -> str:
     recent_after_scores = [score for score in recent_after_scores if score is not None]
     if recent_after_scores:
         lines.append(f"- recent rejected after-distances: {', '.join(str(score) for score in recent_after_scores[-3:])}")
+    if repair_context and repair_context.get("_force_distinct_retry"):
+        lines.append("- The immediately previous generated candidate duplicated a rejected replacement. Do not return that same replacement again.")
+        duplicate_excerpt = _truncate_rejected_replacement_excerpt(repair_context.get("_duplicate_rejected_output_excerpt"))
+        if duplicate_excerpt:
+            lines.append("Rejected duplicate excerpt:")
+            lines.append("```python")
+            lines.append(duplicate_excerpt)
+            lines.append("```")
     lines.append("- Prefer a different minimal edit unless the current bytecode evidence strongly supports the rejected action.")
     return "\n".join(lines)
+
+
+def _replacement_hash(text: str | None) -> str | None:
+    if text is None:
+        return None
+    normalized = "\n".join(line.rstrip() for line in str(text).strip().splitlines())
+    return hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _candidate_repeats_rejected_attempt(candidate: str, repair_context: dict | None) -> bool:
+    if not repair_context:
+        return False
+    candidate_hash = _replacement_hash(candidate)
+    if not candidate_hash:
+        return False
+    for attempt in repair_context.get("rejected_attempts") or []:
+        if isinstance(attempt, dict) and attempt.get("replacement_hash") == candidate_hash:
+            return True
+    return False
+
+
+def _truncate_rejected_replacement_excerpt(text: Any, *, max_chars: int = 900) -> str:
+    if not text:
+        return ""
+    value = str(text).strip()
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars].rstrip() + "\n# ... truncated ..."
 
 
 def _score_combined_distance(score: Any) -> int | None:
@@ -1453,79 +1490,94 @@ class LLMFragmentFixer(FragmentFixer):
         derived_source_fragment: str,
         repair_context: dict | None = None,
     ) -> str:
-        telemetry_guidance = generate_semantic_repair_guidance(
-            qualname=qualname,
-            derived_code_object=derived_code_object,
-            repair_context=repair_context,
-            telemetry_records=self.telemetry_records,
-        )
-        action_pattern_guidance = generate_action_pattern_guidance(
-            qualname=qualname,
-            gt_code_object=gt_code_object,
-            derived_code_object=derived_code_object,
-            derived_source_fragment=derived_source_fragment,
-            repair_context=repair_context,
-            action_patterns=self.action_patterns,
-        )
-        if action_pattern_guidance:
-            telemetry_guidance = ""
-        prompt_reconstruction_inputs = build_semantic_repair_prompt_payload(
-            qualname=qualname,
-            gt_code_object=gt_code_object,
-            derived_code_object=derived_code_object,
-            derived_source_fragment=derived_source_fragment,
-            repair_context=repair_context,
-            telemetry_guidance=telemetry_guidance,
-            action_pattern_guidance=action_pattern_guidance,
-        )
-        messages = build_semantic_repair_messages(
-            qualname=qualname,
-            gt_code_object=gt_code_object,
-            derived_code_object=derived_code_object,
-            derived_source_fragment=derived_source_fragment,
-            repair_context=repair_context,
-            telemetry_guidance=telemetry_guidance,
-            action_pattern_guidance=action_pattern_guidance,
-        )
-        prompt_record = {
-            "provider": self.llm_config["provider"],
-            "model": self.llm_config["name"],
-            "qualname": qualname,
-            "prompt_variant": SEMANTIC_PROMPT_VARIANT,
-            "prompt_features": _prompt_feature_flags(messages[1]["content"] if len(messages) > 1 else "", repair_context),
-            "prompt_reconstruction_inputs": prompt_reconstruction_inputs,
-            "messages": messages,
-            "system_prompt": messages[0]["content"] if messages else None,
-            "user_prompt": messages[1]["content"] if len(messages) > 1 else None,
-        }
-        started = time.perf_counter()
-        response = make_llm_call_from_config(messages, self.llm_config)
-        elapsed_ms = int((time.perf_counter() - started) * 1000)
-        response_text = strip_code_fences(response)
-        cleaned_response_text = strip_prompt_line_numbers(response_text)
-        content = cleaned_response_text.strip()
-        prompt_record.update(
-            {
-                "latency_ms": elapsed_ms,
-                "usage": None if response is None else str(response.get("usage")),
-                "response_text": response_text,
-                "line_number_stripped_text": cleaned_response_text,
-                "returned_text": content if content else derived_source_fragment,
-            }
-        )
-        if self.prompt_output_dir is not None:
-            self.prompt_output_dir.mkdir(parents=True, exist_ok=True)
-            self._prompt_call_index += 1
-            safe_qualname = (
-                qualname.replace("<", "").replace(">", "").replace(".", "_").replace("/", "_").replace("\\", "_")
+        final_candidate = derived_source_fragment
+        for duplicate_retry_index in range(2):
+            telemetry_guidance = generate_semantic_repair_guidance(
+                qualname=qualname,
+                derived_code_object=derived_code_object,
+                repair_context=repair_context,
+                telemetry_records=self.telemetry_records,
             )
-            prompt_path = self.prompt_output_dir / f"{self._prompt_call_index:04d}_{safe_qualname}.json"
-            prompt_path.write_text(json.dumps(prompt_record, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
-            prompt_record["prompt_path"] = str(prompt_path)
-        self.calls.append(prompt_record)
+            action_pattern_guidance = generate_action_pattern_guidance(
+                qualname=qualname,
+                gt_code_object=gt_code_object,
+                derived_code_object=derived_code_object,
+                derived_source_fragment=derived_source_fragment,
+                repair_context=repair_context,
+                action_patterns=self.action_patterns,
+            )
+            if action_pattern_guidance:
+                telemetry_guidance = ""
+            prompt_reconstruction_inputs = build_semantic_repair_prompt_payload(
+                qualname=qualname,
+                gt_code_object=gt_code_object,
+                derived_code_object=derived_code_object,
+                derived_source_fragment=derived_source_fragment,
+                repair_context=repair_context,
+                telemetry_guidance=telemetry_guidance,
+                action_pattern_guidance=action_pattern_guidance,
+            )
+            messages = build_semantic_repair_messages(
+                qualname=qualname,
+                gt_code_object=gt_code_object,
+                derived_code_object=derived_code_object,
+                derived_source_fragment=derived_source_fragment,
+                repair_context=repair_context,
+                telemetry_guidance=telemetry_guidance,
+                action_pattern_guidance=action_pattern_guidance,
+            )
+            prompt_record = {
+                "provider": self.llm_config["provider"],
+                "model": self.llm_config["name"],
+                "qualname": qualname,
+                "prompt_variant": SEMANTIC_PROMPT_VARIANT,
+                "duplicate_retry_index": duplicate_retry_index,
+                "prompt_features": _prompt_feature_flags(messages[1]["content"] if len(messages) > 1 else "", repair_context),
+                "prompt_reconstruction_inputs": prompt_reconstruction_inputs,
+                "messages": messages,
+                "system_prompt": messages[0]["content"] if messages else None,
+                "user_prompt": messages[1]["content"] if len(messages) > 1 else None,
+            }
+            started = time.perf_counter()
+            response = make_llm_call_from_config(messages, self.llm_config)
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            response_text = strip_code_fences(response)
+            cleaned_response_text = strip_prompt_line_numbers(response_text)
+            content = cleaned_response_text.strip()
+            candidate = content if content else derived_source_fragment
+            duplicate_rejected_candidate = _candidate_repeats_rejected_attempt(candidate, repair_context)
+            prompt_record.update(
+                {
+                    "latency_ms": elapsed_ms,
+                    "usage": None if response is None else str(response.get("usage")),
+                    "response_text": response_text,
+                    "line_number_stripped_text": cleaned_response_text,
+                    "returned_text": candidate,
+                    "duplicate_rejected_candidate": duplicate_rejected_candidate,
+                }
+            )
+            if self.prompt_output_dir is not None:
+                self.prompt_output_dir.mkdir(parents=True, exist_ok=True)
+                self._prompt_call_index += 1
+                safe_qualname = (
+                    qualname.replace("<", "").replace(">", "").replace(".", "_").replace("/", "_").replace("\\", "_")
+                )
+                prompt_path = self.prompt_output_dir / f"{self._prompt_call_index:04d}_{safe_qualname}.json"
+                prompt_path.write_text(json.dumps(prompt_record, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+                prompt_record["prompt_path"] = str(prompt_path)
+            self.calls.append(prompt_record)
+            if repair_context is not None:
+                repair_context["_llm_prompt_record"] = prompt_record
+            final_candidate = candidate
+            if duplicate_rejected_candidate and duplicate_retry_index == 0 and repair_context is not None:
+                repair_context["_force_distinct_retry"] = True
+                repair_context["_duplicate_rejected_output_excerpt"] = _truncate_rejected_replacement_excerpt(candidate)
+                continue
+            break
         if repair_context is not None:
-            repair_context["_llm_prompt_record"] = prompt_record
-        return content if content else derived_source_fragment
+            repair_context.pop("_force_distinct_retry", None)
+            repair_context.pop("_duplicate_rejected_output_excerpt", None)
+        return final_candidate
 
 
 class CodeObjectRepairLoop:

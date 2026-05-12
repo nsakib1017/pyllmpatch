@@ -2131,11 +2131,19 @@ def _compact_rejected_attempts_for_prompt(rejected_attempts: list[dict], *, limi
                 ][:3],
                 "target_score_before": attempt.get("target_score_before"),
                 "target_score_after": attempt.get("target_score_after"),
+                "replacement_hash": attempt.get("replacement_hash"),
                 "replacement_fingerprint": attempt.get("replacement_fingerprint"),
                 "replacement_delta": attempt.get("replacement_delta"),
             }
         )
     return compact
+
+
+def _replacement_hash(text: str | None) -> str | None:
+    if text is None:
+        return None
+    normalized = "\n".join(line.rstrip() for line in str(text).strip().splitlines())
+    return hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()
 
 
 def _replacement_delta_for_attempt(source_text_before: str | None, replacement_text: str | None) -> dict[str, Any]:
@@ -2169,6 +2177,7 @@ def _remember_rejected_attempt(
             "selected_action_types": _selected_action_types_from_repair_context(repair_context),
             "target_score_before": target_score_before,
             "target_score_after": target_score_after,
+            "replacement_hash": _replacement_hash(replacement_text),
             "replacement_fingerprint": _fragment_feature_snapshot(replacement_text),
             "replacement_delta": _replacement_delta_for_attempt(source_text_before, replacement_text),
         }
@@ -3011,6 +3020,7 @@ def repair_mismatching_code_objects(
                                 "selected_action_types": _selected_action_types_from_repair_context(repair_context),
                                 "target_score_before": step.get("target_score_before"),
                                 "target_score_after": step.get("target_score_after"),
+                                "replacement_hash": _replacement_hash(replacement_text),
                                 "replacement_fingerprint": _fragment_feature_snapshot(replacement_text),
                                 "replacement_delta": _replacement_delta_for_attempt(extracted_before, replacement_text),
                             }
