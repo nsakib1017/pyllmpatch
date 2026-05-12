@@ -414,6 +414,7 @@ def _prompt_feature_flags(user_prompt: str, repair_context: dict | None) -> dict
         "localized_instruction_diff": _instruction_diff_available(repair_context),
         "bytecode_evidence_fallback": "Bytecode evidence fallback:" in user_prompt,
         "rejected_attempt_feedback": bool(repair_context and repair_context.get("rejected_attempts")),
+        "duplicate_retry_feedback": "Duplicate retry constraint:" in user_prompt,
         "candidate_diversity_feedback": "Candidate diversity:" in user_prompt,
         "gt_instruction_window": bool(repair_context and repair_context.get("gt_instruction_window")),
         "derived_instruction_window": bool(repair_context and repair_context.get("derived_instruction_window")),
@@ -1175,15 +1176,26 @@ def _format_rejected_attempt_summary(repair_context: dict | None) -> str:
     recent_after_scores = [score for score in recent_after_scores if score is not None]
     if recent_after_scores:
         lines.append(f"- recent rejected after-distances: {', '.join(str(score) for score in recent_after_scores[-3:])}")
-    if repair_context and repair_context.get("_force_distinct_retry"):
-        lines.append("- The immediately previous generated candidate duplicated a rejected replacement. Do not return that same replacement again.")
-        duplicate_excerpt = _truncate_rejected_replacement_excerpt(repair_context.get("_duplicate_rejected_output_excerpt"))
-        if duplicate_excerpt:
-            lines.append("Rejected duplicate excerpt:")
-            lines.append("```python")
-            lines.append(duplicate_excerpt)
-            lines.append("```")
     lines.append("- Prefer a different minimal edit unless the current bytecode evidence strongly supports the rejected action.")
+    return "\n".join(lines)
+
+
+def _format_duplicate_retry_summary(repair_context: dict | None) -> str:
+    if not repair_context or not repair_context.get("_force_distinct_retry"):
+        return ""
+    source = str(repair_context.get("_force_distinct_retry_source") or "duplicate")
+    source_label = "prior same-round candidate" if source == "same_round_candidate" else "rejected replacement"
+    lines = [
+        "Duplicate retry constraint:",
+        f"- The immediately previous generated candidate duplicated a {source_label}.",
+        "- Do not return that same replacement again; choose a different local edit shape.",
+    ]
+    duplicate_excerpt = _truncate_rejected_replacement_excerpt(repair_context.get("_duplicate_rejected_output_excerpt"))
+    if duplicate_excerpt:
+        lines.append("Duplicate output excerpt:")
+        lines.append("```python")
+        lines.append(duplicate_excerpt)
+        lines.append("```")
     return "\n".join(lines)
 
 
@@ -1307,6 +1319,7 @@ def build_semantic_prompt_summaries(
         _format_current_mismatch_summary(repair_context),
         _format_code_shape_summary(gt_code_object=gt_code_object, derived_code_object=derived_code_object),
         _format_rejected_attempt_summary(repair_context),
+        _format_duplicate_retry_summary(repair_context),
         _format_candidate_strategy_summary(repair_context),
         _format_prior_candidate_outputs_summary(repair_context),
     ]
@@ -1662,7 +1675,12 @@ class LLMFragmentFixer(FragmentFixer):
             cleaned_response_text = strip_prompt_line_numbers(response_text)
             content = cleaned_response_text.strip()
             candidate = content if content else derived_source_fragment
+            candidate_hash = _replacement_hash(candidate)
             duplicate_rejected_candidate = _candidate_repeats_rejected_attempt(candidate, repair_context)
+            same_round_seen_hashes = set()
+            if repair_context is not None:
+                same_round_seen_hashes = set(repair_context.get("_same_round_seen_hashes") or [])
+            duplicate_same_round_candidate = bool(candidate_hash and candidate_hash in same_round_seen_hashes)
             prompt_record.update(
                 {
                     "latency_ms": elapsed_ms,
@@ -1670,7 +1688,9 @@ class LLMFragmentFixer(FragmentFixer):
                     "response_text": response_text,
                     "line_number_stripped_text": cleaned_response_text,
                     "returned_text": candidate,
+                    "replacement_hash": candidate_hash,
                     "duplicate_rejected_candidate": duplicate_rejected_candidate,
+                    "duplicate_same_round_candidate": duplicate_same_round_candidate,
                 }
             )
             if self.prompt_output_dir is not None:
@@ -1688,11 +1708,18 @@ class LLMFragmentFixer(FragmentFixer):
             final_candidate = candidate
             if duplicate_rejected_candidate and duplicate_retry_index == 0 and repair_context is not None:
                 repair_context["_force_distinct_retry"] = True
+                repair_context["_force_distinct_retry_source"] = "rejected_attempt"
+                repair_context["_duplicate_rejected_output_excerpt"] = _truncate_rejected_replacement_excerpt(candidate)
+                continue
+            if duplicate_same_round_candidate and duplicate_retry_index == 0 and repair_context is not None:
+                repair_context["_force_distinct_retry"] = True
+                repair_context["_force_distinct_retry_source"] = "same_round_candidate"
                 repair_context["_duplicate_rejected_output_excerpt"] = _truncate_rejected_replacement_excerpt(candidate)
                 continue
             break
         if repair_context is not None:
             repair_context.pop("_force_distinct_retry", None)
+            repair_context.pop("_force_distinct_retry_source", None)
             repair_context.pop("_duplicate_rejected_output_excerpt", None)
         return final_candidate
 
@@ -1718,6 +1745,8 @@ class LLMFragmentFixer(FragmentFixer):
                 candidate_context["_candidate_strategy_prompt"] = strategy_prompt
             if prior_candidate_outputs:
                 candidate_context["_prior_candidate_outputs"] = prior_candidate_outputs[-2:]
+            if seen_hashes:
+                candidate_context["_same_round_seen_hashes"] = set(seen_hashes)
             if strategy_name != "retrieval_guided":
                 candidate_context["_suppress_action_pattern_guidance"] = True
             text = self.generate_candidate(
