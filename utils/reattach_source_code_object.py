@@ -35,7 +35,7 @@ class ReattachError(RuntimeError):
     pass
 
 
-FragmentFixer = Callable[[str, Any, Any, str, dict | None], str]
+FragmentFixer = Callable[[str, Any, Any, str, dict | None], Any]
 
 
 @dataclass(frozen=True)
@@ -2146,6 +2146,73 @@ def _replacement_hash(text: str | None) -> str | None:
     return hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()
 
 
+def _normalize_fragment_candidates(raw_candidates: Any) -> list[dict[str, Any]]:
+    if isinstance(raw_candidates, list):
+        items = raw_candidates
+    else:
+        items = [raw_candidates]
+
+    candidates: list[dict[str, Any]] = []
+    seen_hashes: set[str] = set()
+    for index, item in enumerate(items):
+        metadata: dict[str, Any] = {"candidate_index": index}
+        if isinstance(item, dict):
+            text = item.get("text") or item.get("candidate") or item.get("replacement_text")
+            metadata.update({key: value for key, value in item.items() if key not in {"text", "candidate", "replacement_text"}})
+        else:
+            text = item
+        if text is None:
+            continue
+        text = str(text)
+        candidate_hash = _replacement_hash(text)
+        if candidate_hash and candidate_hash in seen_hashes:
+            continue
+        if candidate_hash:
+            seen_hashes.add(candidate_hash)
+        metadata["text"] = text
+        metadata["replacement_hash"] = candidate_hash
+        candidates.append(metadata)
+    return candidates
+
+
+def _candidate_result_distance(result: dict[str, Any]) -> int:
+    score = result.get("target_score_after") or {}
+    if isinstance(score, dict) and isinstance(score.get("combined_distance"), (int, float)):
+        return int(score["combined_distance"])
+    return 10**9
+
+
+def _candidate_result_successes(result: dict[str, Any]) -> int:
+    successes = _count_pylingual_successes(result.get("pylingual_verification"))
+    return -1 if successes is None else int(successes)
+
+
+def _candidate_result_rank(result: dict[str, Any]) -> tuple[int, int, int, int]:
+    return (
+        0 if result.get("accepted") else 1,
+        _candidate_result_distance(result),
+        -_candidate_result_successes(result),
+        int(result.get("candidate_index") or 0),
+    )
+
+
+def _compact_candidate_result(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "candidate_index": result.get("candidate_index"),
+        "strategy": result.get("strategy"),
+        "accepted": result.get("accepted"),
+        "acceptance_reason": result.get("acceptance_reason"),
+        "compile_error": result.get("compile_error"),
+        "target_score_after": result.get("target_score_after"),
+        "reattachment_candidate_kind": result.get("reattachment_candidate_kind"),
+        "reattachment_structure_ok": result.get("reattachment_structure_ok"),
+        "reattachment_structure_reason": result.get("reattachment_structure_reason"),
+        "replacement_hash": result.get("replacement_hash"),
+        "selected_action_types": result.get("selected_action_types"),
+        "prompt_path": result.get("prompt_path"),
+    }
+
+
 def _replacement_delta_for_attempt(source_text_before: str | None, replacement_text: str | None) -> dict[str, Any]:
     before = _fragment_feature_snapshot(source_text_before)
     after = _fragment_feature_snapshot(replacement_text)
@@ -3080,6 +3147,7 @@ def repair_mismatching_code_objects(
                 gt_target_identity = _mapping_row_identity(gt_row)
                 gt_mapping_resolution = gt_row.get("_mapping_resolution")
                 replacement_text = extract_source_segment(source_text, gt_row)
+                raw_candidates = replacement_text
             else:
                 gt_mapping_resolution = None
                 _announce_semantic_step(
@@ -3090,54 +3158,125 @@ def repair_mismatching_code_objects(
                     source_kind=target_row.get("source_kind"),
                     file_hash=file_hash,
                 )
-                replacement_text = fragment_fixer(
+                raw_candidates = fragment_fixer(
                     qualname,
                     gt_bytecode,
                     derived_bytecode,
                     extracted_before,
                     repair_context,
                 )
-            reattachment_candidate = choose_best_reattachment(
-                current_text,
-                target_row,
-                replacement_text,
-                extracted_before,
-            )
-            replacement_text = reattachment_candidate.replacement_text
-            fragment_path = fragments_dir / f"{step_index:02d}_{qualname.replace('<', '').replace('>', '').replace('.', '_')}.pyfrag"
+            candidate_inputs = _normalize_fragment_candidates(raw_candidates)
+            candidate_results: list[dict[str, Any]] = []
+            safe_qualname = qualname.replace("<", "").replace(">", "").replace(".", "_")
+            for candidate_input in candidate_inputs:
+                candidate_index = int(candidate_input.get("candidate_index") or 0)
+                candidate_text = str(candidate_input.get("text") or "")
+                candidate_result: dict[str, Any] = {
+                    "candidate_index": candidate_index,
+                    "strategy": candidate_input.get("strategy"),
+                    "selected_action_types": candidate_input.get("selected_action_types"),
+                    "prompt_path": candidate_input.get("prompt_path"),
+                    "prompt_record": candidate_input.get("prompt_record"),
+                    "replacement_hash": candidate_input.get("replacement_hash"),
+                    "accepted": False,
+                }
+                try:
+                    candidate_reattachment = choose_best_reattachment(
+                        current_text,
+                        target_row,
+                        candidate_text,
+                        extracted_before,
+                    )
+                    candidate_replacement_text = candidate_reattachment.replacement_text
+                    candidate_updated_text = candidate_reattachment.updated_source
+                    candidate_source = output_dir / f"step{step_index}_cand{candidate_index}_{derived_source.stem}.py"
+                    candidate_source.write_text(candidate_updated_text, encoding="utf-8")
+                    candidate_pyc = pyc_dir / f"{candidate_source.stem}.cpython-310.pyc"
+                    compile_source_to_pyc(candidate_source, candidate_pyc)
+                    structure_ok, structure_reason = _validate_reattached_code_object_structure(
+                        previous_pyc=current_pyc,
+                        candidate_pyc=candidate_pyc,
+                        qualname=qualname,
+                    )
+
+                    step_rows = compare_code_object_distances(gt_pyc, candidate_pyc)
+                    candidate_summary = summarize_results(step_rows)
+                    candidate_target_score_after = _score_snapshot(_find_distance_row(step_rows, qualname))
+                    candidate_pylingual_verification = (
+                        run_pylingual_verification(gt_pyc, candidate_pyc)
+                        if verify_with_pylingual and verify_each_step_with_pylingual
+                        else None
+                    )
+                    candidate_accepted, candidate_acceptance_reason = _should_accept_candidate(
+                        current_summary,
+                        candidate_summary,
+                        current_pylingual_verification,
+                        candidate_pylingual_verification,
+                    )
+                    if not reject_non_improving_candidates:
+                        candidate_accepted = True
+                        candidate_acceptance_reason = "candidate retained without acceptance filtering"
+                    if not structure_ok:
+                        candidate_accepted = False
+                        candidate_acceptance_reason = structure_reason
+                    candidate_result.update(
+                        {
+                            "accepted": candidate_accepted,
+                            "acceptance_reason": candidate_acceptance_reason,
+                            "replacement_text": candidate_replacement_text,
+                            "updated_text": candidate_updated_text,
+                            "output_source": candidate_source,
+                            "output_pyc": candidate_pyc,
+                            "reattachment_candidate_kind": candidate_reattachment.kind,
+                            "reattachment_parse_ok": candidate_reattachment.parse_ok,
+                            "reattachment_parse_error": candidate_reattachment.parse_error,
+                            "reattachment_structure_ok": structure_ok,
+                            "reattachment_structure_reason": structure_reason,
+                            "target_score_after": candidate_target_score_after,
+                            "summary": candidate_summary,
+                            "pylingual_verification": candidate_pylingual_verification,
+                        }
+                    )
+                except Exception as exc:
+                    candidate_result.update(
+                        {
+                            "accepted": False,
+                            "acceptance_reason": f"candidate could not be evaluated: {type(exc).__name__}: {exc}",
+                            "compile_error": f"{type(exc).__name__}: {exc}",
+                            "replacement_text": candidate_text,
+                        }
+                    )
+                candidate_results.append(candidate_result)
+
+            if not candidate_results:
+                candidate_results.append(
+                    {
+                        "candidate_index": 0,
+                        "accepted": False,
+                        "acceptance_reason": "fragment fixer returned no candidates",
+                        "replacement_text": extracted_before,
+                    }
+                )
+            best_candidate = min(candidate_results, key=_candidate_result_rank)
+            replacement_text = str(best_candidate.get("replacement_text") or extracted_before)
+            fragment_path = fragments_dir / f"{step_index:02d}_{safe_qualname}.pyfrag"
             fragment_path.write_text(replacement_text, encoding="utf-8")
-            updated_text = reattachment_candidate.updated_source
-
-            next_source = output_dir / f"step{step_index}_{derived_source.stem}.py"
-            next_source.write_text(updated_text, encoding="utf-8")
-            next_pyc = pyc_dir / f"{next_source.stem}.cpython-310.pyc"
-            compile_source_to_pyc(next_source, next_pyc)
-            structure_ok, structure_reason = _validate_reattached_code_object_structure(
-                previous_pyc=current_pyc,
-                candidate_pyc=next_pyc,
-                qualname=qualname,
-            )
-
-            step_rows = compare_code_object_distances(gt_pyc, next_pyc)
-            step_summary = summarize_results(step_rows)
-            target_score_after = _score_snapshot(_find_distance_row(step_rows, qualname))
-            step_pylingual_verification = (
-                run_pylingual_verification(gt_pyc, next_pyc)
-                if verify_with_pylingual and verify_each_step_with_pylingual
-                else None
-            )
-            accepted, acceptance_reason = _should_accept_candidate(
-                current_summary,
-                step_summary,
-                current_pylingual_verification,
-                step_pylingual_verification,
-            )
-            if not reject_non_improving_candidates:
-                accepted = True
-                acceptance_reason = "candidate retained without acceptance filtering"
-            if not structure_ok:
-                accepted = False
-                acceptance_reason = structure_reason
+            next_source = best_candidate.get("output_source")
+            next_pyc = best_candidate.get("output_pyc")
+            step_summary = best_candidate.get("summary")
+            target_score_after = best_candidate.get("target_score_after")
+            step_pylingual_verification = best_candidate.get("pylingual_verification")
+            accepted = bool(best_candidate.get("accepted"))
+            acceptance_reason = str(best_candidate.get("acceptance_reason") or "candidate rejected")
+            reattachment_candidate_kind = best_candidate.get("reattachment_candidate_kind")
+            reattachment_parse_ok = best_candidate.get("reattachment_parse_ok")
+            reattachment_parse_error = best_candidate.get("reattachment_parse_error")
+            structure_ok = bool(best_candidate.get("reattachment_structure_ok"))
+            structure_reason = best_candidate.get("reattachment_structure_reason")
+            if isinstance(repair_context, dict):
+                repair_context["_selected_action_pattern_types"] = best_candidate.get("selected_action_types") or []
+                if isinstance(best_candidate.get("prompt_record"), dict):
+                    repair_context["_llm_prompt_record"] = best_candidate["prompt_record"]
             _store_semantic_step(
                 steps,
                 {
@@ -3155,15 +3294,19 @@ def repair_mismatching_code_objects(
                     "target_mapping_resolution": target_row.get("_mapping_resolution"),
                     "gt_mapping_resolution": gt_mapping_resolution,
                     "fragment_path": str(fragment_path),
-                    "output_source": str(next_source),
-                    "output_pyc": str(next_pyc),
+                    "output_source": str(next_source) if next_source is not None else None,
+                    "output_pyc": str(next_pyc) if next_pyc is not None else None,
                     "gt_code_object_name": getattr(gt_code_object, "co_name", None),
                     "derived_code_object_name": getattr(derived_code_object, "co_name", None),
                     "extracted_before": extracted_before,
                     "replacement_text": replacement_text,
-                    "reattachment_candidate_kind": reattachment_candidate.kind,
-                    "reattachment_parse_ok": reattachment_candidate.parse_ok,
-                    "reattachment_parse_error": reattachment_candidate.parse_error,
+                    "candidate_count": len(candidate_results),
+                    "selected_candidate_index": best_candidate.get("candidate_index"),
+                    "selected_candidate_strategy": best_candidate.get("strategy"),
+                    "candidate_results": [_compact_candidate_result(result) for result in candidate_results],
+                    "reattachment_candidate_kind": reattachment_candidate_kind,
+                    "reattachment_parse_ok": reattachment_parse_ok,
+                    "reattachment_parse_error": reattachment_parse_error,
                     "reattachment_structure_ok": structure_ok,
                     "reattachment_structure_reason": structure_reason,
                     "target_score_before": target_score_before,
@@ -3180,6 +3323,8 @@ def repair_mismatching_code_objects(
             )
             if accepted:
                 accepted_this_iteration += 1
+                if next_source is None or next_pyc is None or step_summary is None:
+                    raise ReattachError("accepted candidate is missing output artifacts")
                 current_source = next_source
                 current_pyc = next_pyc
                 current_summary = step_summary
@@ -3188,6 +3333,8 @@ def repair_mismatching_code_objects(
                 if _pylingual_target_is_equal(current_pylingual_verification, qualname) is True:
                     continue
             else:
+                if isinstance(repair_context, dict):
+                    repair_context["_selected_action_pattern_types"] = best_candidate.get("selected_action_types") or []
                 _remember_rejected_attempt(
                     rejected_attempts_by_qualname,
                     qualname,

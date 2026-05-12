@@ -5,6 +5,7 @@ import ast
 import csv
 import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -52,6 +53,17 @@ Edit only the provided source fragment. Preserve the same public names, function
 """
 
 SEMANTIC_PROMPT_VARIANT = "semantic_v4_indent_contract_line_numbers_compact_metadata"
+
+
+def _bounded_int_env(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+SEMANTIC_REPAIR_CANDIDATE_COUNT = _bounded_int_env("SEMANTIC_REPAIR_CANDIDATE_COUNT", 3, minimum=1, maximum=5)
 
 INDENTATION_CONTRACT = """Indentation contract:
 - Preserve the first line's relative indentation exactly as shown.
@@ -1174,6 +1186,17 @@ def _format_rejected_attempt_summary(repair_context: dict | None) -> str:
     return "\n".join(lines)
 
 
+def _format_candidate_strategy_summary(repair_context: dict | None) -> str:
+    if not repair_context or not repair_context.get("_candidate_strategy_prompt"):
+        return ""
+    return "\n".join(
+        [
+            "Candidate strategy:",
+            f"- {repair_context.get('_candidate_strategy_prompt')}",
+        ]
+    )
+
+
 def _replacement_hash(text: str | None) -> str | None:
     if text is None:
         return None
@@ -1258,6 +1281,7 @@ def build_semantic_prompt_summaries(
         _format_current_mismatch_summary(repair_context),
         _format_code_shape_summary(gt_code_object=gt_code_object, derived_code_object=derived_code_object),
         _format_rejected_attempt_summary(repair_context),
+        _format_candidate_strategy_summary(repair_context),
     ]
     content = "\n\n".join(section for section in sections if section)
     if not content:
@@ -1419,6 +1443,25 @@ class FragmentFixer(ABC):
     ) -> str:
         raise NotImplementedError
 
+    def generate_candidates(
+        self,
+        *,
+        qualname: str,
+        gt_code_object: Any,
+        derived_code_object: Any,
+        derived_source_fragment: str,
+        repair_context: dict | None = None,
+    ) -> list[Any]:
+        return [
+            self.generate_candidate(
+                qualname=qualname,
+                gt_code_object=gt_code_object,
+                derived_code_object=derived_code_object,
+                derived_source_fragment=derived_source_fragment,
+                repair_context=repair_context,
+            )
+        ]
+
 
 class OracleFragmentFixer(FragmentFixer):
     def __init__(self, gt_pyc: Path, gt_source: Path | None = None):
@@ -1466,6 +1509,35 @@ def _load_semantic_repair_telemetry_records(path: Path = ACCEPTED_CODE_OBJECT_TE
     except OSError:
         return []
     return records
+
+
+SEMANTIC_CANDIDATE_STRATEGIES = [
+    (
+        "retrieval_guided",
+        "Follow the highest-ranked retrieved repair pattern when it matches the current instruction diff.",
+    ),
+    (
+        "control_flow_residual",
+        "Focus on remaining jump, loop, branch, else/finally, break, continue, or block-placement drift; preserve expressions unless needed.",
+    ),
+    (
+        "call_attribute_residual",
+        "Focus on call, method, attribute, receiver, and argument-order drift; avoid moving unrelated control-flow blocks.",
+    ),
+    (
+        "metadata_literal_name_residual",
+        "Focus on constants, names, local variables, and literal/expression mismatches shown by metadata; preserve surrounding structure.",
+    ),
+    (
+        "conservative_minimal_delta",
+        "Make the smallest local edit that changes the current bytecode evidence; do not repeat a rejected edit shape.",
+    ),
+]
+
+
+def _candidate_strategy_specs(count: int, repair_context: dict | None) -> list[tuple[str, str]]:
+    del repair_context
+    return SEMANTIC_CANDIDATE_STRATEGIES[: max(1, min(count, len(SEMANTIC_CANDIDATE_STRATEGIES)))]
 
 
 class LLMFragmentFixer(FragmentFixer):
@@ -1579,6 +1651,50 @@ class LLMFragmentFixer(FragmentFixer):
             repair_context.pop("_duplicate_rejected_output_excerpt", None)
         return final_candidate
 
+    def generate_candidates(
+        self,
+        *,
+        qualname: str,
+        gt_code_object: Any,
+        derived_code_object: Any,
+        derived_source_fragment: str,
+        repair_context: dict | None = None,
+    ) -> list[dict[str, Any]]:
+        strategies = _candidate_strategy_specs(SEMANTIC_REPAIR_CANDIDATE_COUNT, repair_context)
+        candidates: list[dict[str, Any]] = []
+        seen_hashes: set[str] = set()
+        for candidate_index, (strategy_name, strategy_prompt) in enumerate(strategies):
+            candidate_context = dict(repair_context or {})
+            if len(strategies) > 1:
+                candidate_context["_candidate_strategy"] = strategy_name
+                candidate_context["_candidate_strategy_prompt"] = strategy_prompt
+            text = self.generate_candidate(
+                qualname=qualname,
+                gt_code_object=gt_code_object,
+                derived_code_object=derived_code_object,
+                derived_source_fragment=derived_source_fragment,
+                repair_context=candidate_context,
+            )
+            candidate_hash = _replacement_hash(text)
+            if candidate_hash and candidate_hash in seen_hashes:
+                continue
+            if candidate_hash:
+                seen_hashes.add(candidate_hash)
+            prompt_record = candidate_context.get("_llm_prompt_record") or {}
+            candidates.append(
+                {
+                    "candidate_index": candidate_index,
+                    "strategy": strategy_name,
+                    "text": text,
+                    "replacement_hash": candidate_hash,
+                    "selected_action_types": candidate_context.get("_selected_action_pattern_types") or [],
+                    "prompt_path": prompt_record.get("prompt_path") if isinstance(prompt_record, dict) else None,
+                    "prompt_record": prompt_record if isinstance(prompt_record, dict) else None,
+                    "duplicate_rejected_candidate": prompt_record.get("duplicate_rejected_candidate") if isinstance(prompt_record, dict) else None,
+                }
+            )
+        return candidates or [{"candidate_index": 0, "strategy": "fallback", "text": derived_source_fragment}]
+
 
 class CodeObjectRepairLoop:
     def __init__(self, fixer: FragmentFixer):
@@ -1635,7 +1751,15 @@ class CodeObjectRepairLoop:
         derived_code_object: Any,
         derived_source_fragment: str,
         repair_context: dict | None = None,
-    ) -> str:
+    ) -> Any:
+        if qualname != "<module>" and derived_code_object is not None and hasattr(self.fixer, "generate_candidates"):
+            return getattr(self.fixer, "generate_candidates")(
+                qualname=qualname,
+                gt_code_object=gt_code_object,
+                derived_code_object=derived_code_object,
+                derived_source_fragment=derived_source_fragment,
+                repair_context=repair_context,
+            )
         return self.fixer.generate_candidate(
             qualname=qualname,
             gt_code_object=gt_code_object,
