@@ -414,6 +414,7 @@ def _prompt_feature_flags(user_prompt: str, repair_context: dict | None) -> dict
         "localized_instruction_diff": _instruction_diff_available(repair_context),
         "bytecode_evidence_fallback": "Bytecode evidence fallback:" in user_prompt,
         "rejected_attempt_feedback": bool(repair_context and repair_context.get("rejected_attempts")),
+        "candidate_diversity_feedback": "Candidate diversity:" in user_prompt,
         "gt_instruction_window": bool(repair_context and repair_context.get("gt_instruction_window")),
         "derived_instruction_window": bool(repair_context and repair_context.get("derived_instruction_window")),
         "telemetry_guidance": "Action guidance from prior accepted repairs:" in user_prompt,
@@ -1197,6 +1198,31 @@ def _format_candidate_strategy_summary(repair_context: dict | None) -> str:
     )
 
 
+def _format_prior_candidate_outputs_summary(repair_context: dict | None) -> str:
+    prior_candidates = [] if not repair_context else repair_context.get("_prior_candidate_outputs") or []
+    prior_candidates = [item for item in prior_candidates[-2:] if isinstance(item, dict)]
+    if not prior_candidates:
+        return ""
+
+    lines = [
+        "Candidate diversity:",
+        "- Do not return any prior candidate below.",
+        "- Produce a structurally different repair while still following the bytecode and metadata evidence.",
+    ]
+    for index, candidate in enumerate(prior_candidates, start=1):
+        strategy = str(candidate.get("strategy") or "unknown")
+        candidate_hash = str(candidate.get("replacement_hash") or "")
+        hash_suffix = f", hash={candidate_hash[:12]}" if candidate_hash else ""
+        excerpt = _truncate_rejected_replacement_excerpt(candidate.get("text"), max_chars=700)
+        if not excerpt:
+            continue
+        lines.append(f"Prior same-round candidate {index} ({strategy}{hash_suffix}):")
+        lines.append("```python")
+        lines.append(excerpt)
+        lines.append("```")
+    return "\n".join(lines)
+
+
 def _replacement_hash(text: str | None) -> str | None:
     if text is None:
         return None
@@ -1282,6 +1308,7 @@ def build_semantic_prompt_summaries(
         _format_code_shape_summary(gt_code_object=gt_code_object, derived_code_object=derived_code_object),
         _format_rejected_attempt_summary(repair_context),
         _format_candidate_strategy_summary(repair_context),
+        _format_prior_candidate_outputs_summary(repair_context),
     ]
     content = "\n\n".join(section for section in sections if section)
     if not content:
@@ -1518,19 +1545,19 @@ SEMANTIC_CANDIDATE_STRATEGIES = [
     ),
     (
         "control_flow_residual",
-        "Focus on remaining jump, loop, branch, else/finally, break, continue, or block-placement drift; preserve expressions unless needed.",
+        "Keep call, method, attribute, receiver, and argument expressions unchanged unless impossible. Change only jump, loop, branch, else/finally, break/continue, or block-placement structure.",
     ),
     (
         "call_attribute_residual",
-        "Focus on call, method, attribute, receiver, and argument-order drift; avoid moving unrelated control-flow blocks.",
+        "Keep the existing branch/loop/else layout unchanged. Change only call, method, attribute, receiver, or argument expression shape.",
     ),
     (
         "metadata_literal_name_residual",
-        "Focus on constants, names, local variables, and literal/expression mismatches shown by metadata; preserve surrounding structure.",
+        "Keep control-flow and call structure unchanged. Change only constants, names, local variables, or literal/reference expressions shown by metadata.",
     ),
     (
         "conservative_minimal_delta",
-        "Make the smallest local edit that changes the current bytecode evidence; do not repeat a rejected edit shape.",
+        "Make the smallest local edit that changes the current bytecode evidence. Do not repeat any rejected or prior same-round candidate edit shape.",
     ),
 ]
 
@@ -1564,20 +1591,29 @@ class LLMFragmentFixer(FragmentFixer):
     ) -> str:
         final_candidate = derived_source_fragment
         for duplicate_retry_index in range(2):
-            telemetry_guidance = generate_semantic_repair_guidance(
-                qualname=qualname,
-                derived_code_object=derived_code_object,
-                repair_context=repair_context,
-                telemetry_records=self.telemetry_records,
+            suppress_retrieval_guidance = bool(
+                repair_context and repair_context.get("_suppress_action_pattern_guidance")
             )
-            action_pattern_guidance = generate_action_pattern_guidance(
-                qualname=qualname,
-                gt_code_object=gt_code_object,
-                derived_code_object=derived_code_object,
-                derived_source_fragment=derived_source_fragment,
-                repair_context=repair_context,
-                action_patterns=self.action_patterns,
-            )
+            if suppress_retrieval_guidance:
+                telemetry_guidance = ""
+                action_pattern_guidance = ""
+                if repair_context is not None:
+                    repair_context["_selected_action_pattern_types"] = []
+            else:
+                telemetry_guidance = generate_semantic_repair_guidance(
+                    qualname=qualname,
+                    derived_code_object=derived_code_object,
+                    repair_context=repair_context,
+                    telemetry_records=self.telemetry_records,
+                )
+                action_pattern_guidance = generate_action_pattern_guidance(
+                    qualname=qualname,
+                    gt_code_object=gt_code_object,
+                    derived_code_object=derived_code_object,
+                    derived_source_fragment=derived_source_fragment,
+                    repair_context=repair_context,
+                    action_patterns=self.action_patterns,
+                )
             if action_pattern_guidance:
                 telemetry_guidance = ""
             prompt_reconstruction_inputs = build_semantic_repair_prompt_payload(
@@ -1603,6 +1639,15 @@ class LLMFragmentFixer(FragmentFixer):
                 "model": self.llm_config["name"],
                 "qualname": qualname,
                 "prompt_variant": SEMANTIC_PROMPT_VARIANT,
+                "candidate_index": None if not repair_context else repair_context.get("_candidate_index"),
+                "candidate_strategy": None if not repair_context else repair_context.get("_candidate_strategy"),
+                "candidate_strategy_prompt": None
+                if not repair_context
+                else repair_context.get("_candidate_strategy_prompt"),
+                "suppressed_action_pattern_guidance": suppress_retrieval_guidance,
+                "prior_same_round_candidate_count": 0
+                if not repair_context
+                else len(repair_context.get("_prior_candidate_outputs") or []),
                 "duplicate_retry_index": duplicate_retry_index,
                 "prompt_features": _prompt_feature_flags(messages[1]["content"] if len(messages) > 1 else "", repair_context),
                 "prompt_reconstruction_inputs": prompt_reconstruction_inputs,
@@ -1662,12 +1707,19 @@ class LLMFragmentFixer(FragmentFixer):
     ) -> list[dict[str, Any]]:
         strategies = _candidate_strategy_specs(SEMANTIC_REPAIR_CANDIDATE_COUNT, repair_context)
         candidates: list[dict[str, Any]] = []
+        prior_candidate_outputs: list[dict[str, Any]] = []
         seen_hashes: set[str] = set()
         for candidate_index, (strategy_name, strategy_prompt) in enumerate(strategies):
             candidate_context = dict(repair_context or {})
+            candidate_context.pop("_llm_prompt_record", None)
+            candidate_context["_candidate_index"] = candidate_index
             if len(strategies) > 1:
                 candidate_context["_candidate_strategy"] = strategy_name
                 candidate_context["_candidate_strategy_prompt"] = strategy_prompt
+            if prior_candidate_outputs:
+                candidate_context["_prior_candidate_outputs"] = prior_candidate_outputs[-2:]
+            if strategy_name != "retrieval_guided":
+                candidate_context["_suppress_action_pattern_guidance"] = True
             text = self.generate_candidate(
                 qualname=qualname,
                 gt_code_object=gt_code_object,
@@ -1680,6 +1732,13 @@ class LLMFragmentFixer(FragmentFixer):
                 continue
             if candidate_hash:
                 seen_hashes.add(candidate_hash)
+            prior_candidate_outputs.append(
+                {
+                    "strategy": strategy_name,
+                    "replacement_hash": candidate_hash,
+                    "text": text,
+                }
+            )
             prompt_record = candidate_context.get("_llm_prompt_record") or {}
             candidates.append(
                 {
