@@ -16,7 +16,7 @@ import torch
 from dotenv import load_dotenv
 
 
-DEFAULT_MODEL_NAME = "unsloth/Qwen3-Coder-30B-A3B-Instruct"
+DEFAULT_MODEL_NAME = "/home/mxs220189/pylingual_collaboration/pylingual_download/code/finetuning/finetuned_models/Qwen3-Coder-30B-A3B-Instruct-Up/run_1778647681"
 DEFAULT_DATASET_PATH = "dataset/accepted_codeobject_mining_prompt_refresh.jsonl"
 DEFAULT_MAX_SEQ_LENGTH = 16384
 DEFAULT_VALIDATION_RATIO = 0.05
@@ -181,30 +181,33 @@ def load_model_and_tokenizer(args: argparse.Namespace):
         max_seq_length=args.max_seq_length,
         dtype=None,
         load_in_4bit=args.load_in_4bit,
-        device_map=args.device_map,
+        device_map={"": 0},
         **auth_kwargs,
     )
 
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=args.lora_r,
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=args.seed,
-        use_rslora=args.use_rslora,
-        loftq_config=None,
-    )
+    if hasattr(model, "peft_config") and model.peft_config:
+        print("Loaded existing LoRA checkpoint.")
+    else:
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=args.lora_r,
+            target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            use_gradient_checkpointing="unsloth",
+            random_state=args.seed,
+            use_rslora=args.use_rslora,
+            loftq_config=None,
+        )
 
     if getattr(tokenizer, "pad_token_id", None) is None:
         tokenizer.pad_token = tokenizer.eos_token
