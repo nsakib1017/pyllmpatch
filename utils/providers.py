@@ -54,8 +54,8 @@ OPEN_LLM_MODELS =  [
         'provider': 'Alibaba',
         'name': 'qwen3-coder-30b',
         'token_for_completion': 16384,
-        'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/Qwen3-Coder-30B-A3B-Instruct-Up__run_1778647681/run_1778696366",
-        'tokenizer_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/Qwen3-Coder-30B-A3B-Instruct-Up__run_1778647681/run_1778696366",
+        'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/Qwen3-Coder-30B-A3B-Instruct_run_1778647681/run_1778696366",
+        'tokenizer_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/Qwen3-Coder-30B-A3B-Instruct_run_1778647681/run_1778696366",
         'generation_config': {
             'max_new_tokens': 8192,
             'do_sample': False,

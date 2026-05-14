@@ -87,7 +87,7 @@ def load_model_once(
             max_seq_length=max_seq_length,
             dtype=None,
             load_in_4bit=LOAD_IN_4BIT if "LOAD_IN_4BIT" in globals() else True,
-            device_map=device_map,
+            device_map={"": 0},
             **auth_kwargs,
         )
 
