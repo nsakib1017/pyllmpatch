@@ -7,13 +7,11 @@ import hashlib
 import json
 import os
 import re
-import signal
 import sys
 import textwrap
 import time
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +33,7 @@ from utils.file_helpers import fetch_pyllmpatch_repair_paths, fetch_pyllmpatch_s
 from utils.providers import find_llm_config, make_llm_call_from_config
 from utils.token_helpers import count_tokens_safe
 from utils.reattach_source_code_object import (
+    SemanticRepairTimeoutNoImprovement,
     _find_target_row,
     extract_source_segment,
     infer_source_from_pyc,
@@ -75,33 +74,19 @@ SEMANTIC_REPAIR_SAMPLE_TIMEOUT_SECONDS = _bounded_int_env(
     minimum=0,
     maximum=30 * 24 * 60 * 60,
 )
+SEMANTIC_REPAIR_TIMEOUT_PATIENCE_SECONDS = _bounded_int_env(
+    "SEMANTIC_REPAIR_TIMEOUT_PATIENCE_SECONDS",
+    15 * 60,
+    minimum=0,
+    maximum=30 * 24 * 60 * 60,
+)
+SEMANTIC_REPAIR_TIMEOUT_MIN_IMPROVEMENT_DELTA = _bounded_int_env(
+    "SEMANTIC_REPAIR_TIMEOUT_MIN_IMPROVEMENT_DELTA",
+    1,
+    minimum=1,
+    maximum=200000,
+)
 
-
-class SemanticSampleTimeoutError(TimeoutError):
-    pass
-
-
-@contextmanager
-def _semantic_sample_timeout(timeout_seconds: int):
-    timeout_seconds = max(0, int(timeout_seconds))
-    if timeout_seconds <= 0 or not hasattr(signal, "SIGALRM"):
-        yield
-        return
-
-    def _handle_timeout(_signum, _frame):
-        raise SemanticSampleTimeoutError(f"sample exceeded timeout of {timeout_seconds} seconds")
-
-    try:
-        previous_handler = signal.signal(signal.SIGALRM, _handle_timeout)
-    except ValueError:
-        yield
-        return
-    signal.alarm(timeout_seconds)
-    try:
-        yield
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, previous_handler)
 
 INDENTATION_CONTRACT = """Indentation contract:
 - Preserve the first line's relative indentation exactly as shown.
@@ -2060,6 +2045,10 @@ class CodeObjectRepairLoop:
         verify_each_step_with_pylingual: bool = True,
         reject_non_improving_candidates: bool = True,
         max_iterations: int = 1,
+        sample_timeout_deadline: float | None = None,
+        sample_timeout_seconds: int | None = None,
+        sample_timeout_patience_seconds: int = SEMANTIC_REPAIR_TIMEOUT_PATIENCE_SECONDS,
+        sample_timeout_min_improvement_delta: int = SEMANTIC_REPAIR_TIMEOUT_MIN_IMPROVEMENT_DELTA,
     ) -> dict:
         self._set_prompt_output_dir(output_dir, derived_source)
         result = repair_mismatching_code_objects(
@@ -2076,6 +2065,10 @@ class CodeObjectRepairLoop:
             verify_each_step_with_pylingual=verify_each_step_with_pylingual,
             reject_non_improving_candidates=reject_non_improving_candidates,
             max_iterations=max_iterations,
+            sample_timeout_deadline=sample_timeout_deadline,
+            sample_timeout_seconds=sample_timeout_seconds,
+            sample_timeout_patience_seconds=sample_timeout_patience_seconds,
+            sample_timeout_min_improvement_delta=sample_timeout_min_improvement_delta,
         )
         if hasattr(self.fixer, "calls"):
             result["llm_calls"] = getattr(self.fixer, "calls")
@@ -2245,9 +2238,13 @@ def run_dataset_repair_loop(
     llm_provider: str = "Google",
     llm_model: str = "gemini-2.5-flash-lite",
     sample_timeout_seconds: int = SEMANTIC_REPAIR_SAMPLE_TIMEOUT_SECONDS,
+    sample_timeout_patience_seconds: int = SEMANTIC_REPAIR_TIMEOUT_PATIENCE_SECONDS,
+    sample_timeout_min_improvement_delta: int = SEMANTIC_REPAIR_TIMEOUT_MIN_IMPROVEMENT_DELTA,
 ) -> dict:
     dataset_path = dataset_path.expanduser().resolve()
     sample_timeout_seconds = max(0, int(sample_timeout_seconds))
+    sample_timeout_patience_seconds = max(0, int(sample_timeout_patience_seconds))
+    sample_timeout_min_improvement_delta = max(1, int(sample_timeout_min_improvement_delta))
     if output_dir is None:
         run_id, log_base, log_file = build_run_paths(current_run_timestamp())
     else:
@@ -2267,7 +2264,9 @@ def run_dataset_repair_loop(
     timed_out = 0
     if sample_timeout_seconds > 0:
         print(
-            f"[semantic_repair] per-sample timeout: {sample_timeout_seconds} seconds",
+            f"[semantic_repair] per-sample timeout: {sample_timeout_seconds} seconds; "
+            f"patience={sample_timeout_patience_seconds} seconds; "
+            f"min_delta={sample_timeout_min_improvement_delta}",
             flush=True,
         )
     else:
@@ -2283,68 +2282,88 @@ def run_dataset_repair_loop(
             derived_pyc = None
             derived_source = None
             try:
-                with _semantic_sample_timeout(sample_timeout_seconds):
-                    gt_source = fetch_pyllmpatch_source_path(row.file_hash, row.source)
-                    gt_pyc, derived_pyc, derived_source = fetch_pyllmpatch_repair_paths(row.file_hash, row.source)
-                    if gt_source is None or gt_pyc is None or derived_pyc is None or derived_source is None:
-                        error_row = _dataset_error_row(row, gt_pyc, derived_pyc, derived_source, "Could not resolve gt_source, gt_pyc, derived_pyc, and/or derived_source")
-                        writer.writerow(error_row)
-                        append_log(
-                            log_file,
-                            {
-                                "run_id": run_id,
-                                "timestamp": now_iso(),
-                                "mode": "semantic_repair",
-                                "stage": "error",
-                                **error_row,
-                            },
-                        )
-                        failed += 1
-                        continue
-
-                    row_output_dir = log_base / "semantic_repair" / str(row.source) / str(row.file_hash)
-                    row_output_dir.mkdir(parents=True, exist_ok=True)
-                    result_json_path = row_output_dir / "result.json"
-                    if fixer_name not in {"oracle", "llm"}:
-                        raise ValueError(f"Unsupported fixer backend: {fixer_name}")
-                    fixer = (
-                        OracleFragmentFixer(gt_pyc, gt_source)
-                        if fixer_name == "oracle"
-                        else LLMFragmentFixer(provider=llm_provider, model=llm_model)
-                    )
-                    loop = CodeObjectRepairLoop(fixer)
-                    print(f"[semantic_repair] file_hash={row.file_hash}", flush=True)
-                    result = loop.run(
-                        gt_pyc=gt_pyc,
-                        derived_pyc=derived_pyc,
-                        derived_source=derived_source,
-                        output_dir=row_output_dir,
-                        log_file=log_file,
-                        run_id=run_id,
-                        file_hash=str(row.file_hash),
-                        verify_with_pylingual=verify_with_pylingual,
-                        verify_each_step_with_pylingual=verify_each_step_with_pylingual,
-                        reject_non_improving_candidates=reject_non_improving_candidates,
-                        max_iterations=max_iterations,
-                    )
-                    result_json_path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
-                    result_row = _dataset_result_row(row, result, result_json_path)
-                    writer.writerow(result_row)
+                sample_timeout_deadline = (
+                    time.monotonic() + sample_timeout_seconds if sample_timeout_seconds > 0 else None
+                )
+                gt_source = fetch_pyllmpatch_source_path(row.file_hash, row.source)
+                gt_pyc, derived_pyc, derived_source = fetch_pyllmpatch_repair_paths(row.file_hash, row.source)
+                if gt_source is None or gt_pyc is None or derived_pyc is None or derived_source is None:
+                    error_row = _dataset_error_row(row, gt_pyc, derived_pyc, derived_source, "Could not resolve gt_source, gt_pyc, derived_pyc, and/or derived_source")
+                    writer.writerow(error_row)
                     append_log(
                         log_file,
                         {
                             "run_id": run_id,
                             "timestamp": now_iso(),
                             "mode": "semantic_repair",
-                            "stage": "result",
-                            **result_row,
+                            "stage": "error",
+                            **error_row,
                         },
                     )
-                    repaired += 1
-            except SemanticSampleTimeoutError as exc:
+                    failed += 1
+                    continue
+
+                row_output_dir = log_base / "semantic_repair" / str(row.source) / str(row.file_hash)
+                row_output_dir.mkdir(parents=True, exist_ok=True)
+                result_json_path = row_output_dir / "result.json"
+                if fixer_name not in {"oracle", "llm"}:
+                    raise ValueError(f"Unsupported fixer backend: {fixer_name}")
+                fixer = (
+                    OracleFragmentFixer(gt_pyc, gt_source)
+                    if fixer_name == "oracle"
+                    else LLMFragmentFixer(provider=llm_provider, model=llm_model)
+                )
+                loop = CodeObjectRepairLoop(fixer)
+                print(f"[semantic_repair] file_hash={row.file_hash}", flush=True)
+                result = loop.run(
+                    gt_pyc=gt_pyc,
+                    derived_pyc=derived_pyc,
+                    derived_source=derived_source,
+                    output_dir=row_output_dir,
+                    log_file=log_file,
+                    run_id=run_id,
+                    file_hash=str(row.file_hash),
+                    verify_with_pylingual=verify_with_pylingual,
+                    verify_each_step_with_pylingual=verify_each_step_with_pylingual,
+                    reject_non_improving_candidates=reject_non_improving_candidates,
+                    max_iterations=max_iterations,
+                    sample_timeout_deadline=sample_timeout_deadline,
+                    sample_timeout_seconds=sample_timeout_seconds,
+                    sample_timeout_patience_seconds=sample_timeout_patience_seconds,
+                    sample_timeout_min_improvement_delta=sample_timeout_min_improvement_delta,
+                )
+                result_json_path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+                result_row = _dataset_result_row(row, result, result_json_path)
+                if result.get("sample_timed_out"):
+                    timed_out += 1
+                    print(
+                        f"[semantic_repair] file_hash={row.file_hash} -> timeout reached after improvement; kept best partial result",
+                        flush=True,
+                    )
+                writer.writerow(result_row)
+                append_log(
+                    log_file,
+                    {
+                        "run_id": run_id,
+                        "timestamp": now_iso(),
+                        "mode": "semantic_repair",
+                        "stage": "result",
+                        "sample_timeout_seconds": sample_timeout_seconds,
+                        "sample_timeout_patience_seconds": sample_timeout_patience_seconds,
+                        "sample_timeout_min_improvement_delta": sample_timeout_min_improvement_delta,
+                        "sample_timed_out": result.get("sample_timed_out"),
+                        "sample_timeout_action": result.get("sample_timeout_action"),
+                        "sample_timeout_reason": result.get("sample_timeout_reason"),
+                        "sample_timeout_best_combined_distance": result.get("sample_timeout_best_combined_distance"),
+                        "sample_timeout_best_improvement_reason": result.get("sample_timeout_best_improvement_reason"),
+                        **result_row,
+                    },
+                )
+                repaired += 1
+            except SemanticRepairTimeoutNoImprovement as exc:
                 timeout_message = f"{type(exc).__name__}: {exc}"
                 print(
-                    f"[semantic_repair] file_hash={row.file_hash} -> timed out after {sample_timeout_seconds} seconds; skipping sample",
+                    f"[semantic_repair] file_hash={row.file_hash} -> timed out without combined distance improvement; skipping sample",
                     flush=True,
                 )
                 error_row = _dataset_error_row(row, gt_pyc, derived_pyc, derived_source, timeout_message)
@@ -2357,6 +2376,9 @@ def run_dataset_repair_loop(
                         "mode": "semantic_repair",
                         "stage": "timeout",
                         "sample_timeout_seconds": sample_timeout_seconds,
+                        "sample_timeout_patience_seconds": sample_timeout_patience_seconds,
+                        "sample_timeout_min_improvement_delta": sample_timeout_min_improvement_delta,
+                        "sample_timeout_policy": "skip_without_combined_distance_improvement",
                         **error_row,
                     },
                 )
@@ -2388,6 +2410,8 @@ def run_dataset_repair_loop(
         "failed_rows": failed,
         "timed_out_rows": timed_out,
         "sample_timeout_seconds": sample_timeout_seconds,
+        "sample_timeout_patience_seconds": sample_timeout_patience_seconds,
+        "sample_timeout_min_improvement_delta": sample_timeout_min_improvement_delta,
     }
 
 
@@ -2448,8 +2472,27 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=SEMANTIC_REPAIR_SAMPLE_TIMEOUT_SECONDS,
         help=(
-            "Maximum runtime for one dataset-mode sample in seconds. "
+            "Timeout checkpoint for one dataset-mode sample in seconds; "
+            "skip only if no combined-distance improvement exists. "
             f"Defaults to {SEMANTIC_REPAIR_SAMPLE_TIMEOUT_SECONDS}; set 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--sample-timeout-patience-seconds",
+        type=int,
+        default=SEMANTIC_REPAIR_TIMEOUT_PATIENCE_SECONDS,
+        help=(
+            "Grace window after the timeout checkpoint when recent improvements exist. "
+            f"Defaults to {SEMANTIC_REPAIR_TIMEOUT_PATIENCE_SECONDS}; set 0 to stop at the checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--sample-timeout-min-improvement-delta",
+        type=int,
+        default=SEMANTIC_REPAIR_TIMEOUT_MIN_IMPROVEMENT_DELTA,
+        help=(
+            "Minimum combined-distance decrease counted as timeout progress. "
+            f"Defaults to {SEMANTIC_REPAIR_TIMEOUT_MIN_IMPROVEMENT_DELTA}."
         ),
     )
     parser.add_argument(
@@ -2522,6 +2565,8 @@ def main() -> int:
             llm_provider=args.llm_provider,
             llm_model=args.llm_model,
             sample_timeout_seconds=args.sample_timeout_seconds,
+            sample_timeout_patience_seconds=args.sample_timeout_patience_seconds,
+            sample_timeout_min_improvement_delta=args.sample_timeout_min_improvement_delta,
         )
     else:
         if args.gt_pyc is None or args.derived_pyc is None or args.derived_source is None:

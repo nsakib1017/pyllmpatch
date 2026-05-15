@@ -110,13 +110,20 @@ Optional semantic repair flags:
 --skip-step-verification
 --keep-non-improving
 --sample-timeout-seconds 3600
+--sample-timeout-patience-seconds 900
+--sample-timeout-min-improvement-delta 1
 --output-dir /path/to/output_dir
 --json-out /path/to/result.json
 ```
 
-Dataset-mode semantic repair caps each sample at 3600 seconds by default. Override
-with `--sample-timeout-seconds` or `SEMANTIC_REPAIR_SAMPLE_TIMEOUT_SECONDS`; use
-`0` to disable the timeout.
+Dataset-mode semantic repair checks each sample after 3600 seconds by default.
+If no combined-distance improvement has been made when the timeout is reached,
+the sample is skipped. If the combined distance has improved recently, the loop
+gets a bounded patience window and then keeps the best partial result seen so
+far. Override with `--sample-timeout-seconds`,
+`--sample-timeout-patience-seconds`, `--sample-timeout-min-improvement-delta`,
+or the matching `SEMANTIC_REPAIR_*` environment variables; use
+`--sample-timeout-seconds 0` to disable the timeout.
 
 For all CLI options:
 

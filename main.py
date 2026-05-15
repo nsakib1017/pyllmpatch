@@ -79,8 +79,27 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "Maximum runtime for one semantic dataset-mode sample in seconds. "
+            "Timeout checkpoint for one semantic dataset-mode sample in seconds. "
+            "If no combined-distance improvement exists at the checkpoint, skip the sample. "
             "Defaults to SEMANTIC_REPAIR_SAMPLE_TIMEOUT_SECONDS or 3600; set 0 to disable."
+        ),
+    )
+    repair_loop.add_argument(
+        "--sample-timeout-patience-seconds",
+        type=int,
+        default=None,
+        help=(
+            "Grace window after the semantic dataset-mode timeout checkpoint when recent improvements exist. "
+            "Defaults to SEMANTIC_REPAIR_TIMEOUT_PATIENCE_SECONDS or 900; set 0 to stop at the checkpoint."
+        ),
+    )
+    repair_loop.add_argument(
+        "--sample-timeout-min-improvement-delta",
+        type=int,
+        default=None,
+        help=(
+            "Minimum combined-distance decrease counted as timeout progress. "
+            "Defaults to SEMANTIC_REPAIR_TIMEOUT_MIN_IMPROVEMENT_DELTA or 1."
         ),
     )
     repair_loop.add_argument(
@@ -143,6 +162,8 @@ def main() -> None:
     if command == "semantic-repair":
         from pipeline.code_object_repair_loop import (
             SEMANTIC_REPAIR_SAMPLE_TIMEOUT_SECONDS,
+            SEMANTIC_REPAIR_TIMEOUT_MIN_IMPROVEMENT_DELTA,
+            SEMANTIC_REPAIR_TIMEOUT_PATIENCE_SECONDS,
             CodeObjectRepairLoop,
             LLMFragmentFixer,
             OracleFragmentFixer,
@@ -171,6 +192,12 @@ def main() -> None:
                 sample_timeout_seconds=args.sample_timeout_seconds
                 if args.sample_timeout_seconds is not None
                 else SEMANTIC_REPAIR_SAMPLE_TIMEOUT_SECONDS,
+                sample_timeout_patience_seconds=args.sample_timeout_patience_seconds
+                if args.sample_timeout_patience_seconds is not None
+                else SEMANTIC_REPAIR_TIMEOUT_PATIENCE_SECONDS,
+                sample_timeout_min_improvement_delta=args.sample_timeout_min_improvement_delta
+                if args.sample_timeout_min_improvement_delta is not None
+                else SEMANTIC_REPAIR_TIMEOUT_MIN_IMPROVEMENT_DELTA,
             )
         else:
             if args.gt_pyc is None or args.derived_pyc is None or args.derived_source is None:

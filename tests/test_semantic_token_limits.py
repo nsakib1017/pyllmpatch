@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import contextlib
 import io
-import signal
 import unittest
 from unittest.mock import patch
 
 from finetuning.model_finetuner_qwen_codeobject_semantic import filter_samples_by_token_budget
-from pipeline.code_object_repair_loop import LLMFragmentFixer, SemanticSampleTimeoutError, _semantic_sample_timeout
+from pipeline.code_object_repair_loop import LLMFragmentFixer
+from utils.reattach_source_code_object import _combined_distance_improved
 
 
 class CodeObj:
@@ -92,11 +92,12 @@ class SemanticTokenLimitTest(unittest.TestCase):
 
         self.assertEqual(kept, [samples[0]])
 
-    @unittest.skipUnless(hasattr(signal, "SIGALRM"), "SIGALRM is required for sample timeout tests")
-    def test_semantic_sample_timeout_raises_clear_error(self) -> None:
-        with self.assertRaisesRegex(SemanticSampleTimeoutError, "sample exceeded timeout of 10 seconds"):
-            with _semantic_sample_timeout(10):
-                signal.raise_signal(signal.SIGALRM)
+    def test_combined_distance_improvement_check(self) -> None:
+        self.assertTrue(_combined_distance_improved({"combined_distance": 10}, {"combined_distance": 9}))
+        self.assertFalse(_combined_distance_improved({"combined_distance": 10}, {"combined_distance": 10}))
+        self.assertFalse(_combined_distance_improved({"combined_distance": 10}, {"combined_distance": 11}))
+        self.assertTrue(_combined_distance_improved({"combined_distance": 10}, {"combined_distance": 8}, min_delta=2))
+        self.assertFalse(_combined_distance_improved({"combined_distance": 10}, {"combined_distance": 9}, min_delta=2))
 
 
 if __name__ == "__main__":
