@@ -75,6 +75,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum semantic repair iterations over recomputed mismatch targets",
     )
     repair_loop.add_argument(
+        "--sample-timeout-seconds",
+        type=int,
+        default=None,
+        help=(
+            "Maximum runtime for one semantic dataset-mode sample in seconds. "
+            "Defaults to SEMANTIC_REPAIR_SAMPLE_TIMEOUT_SECONDS or 3600; set 0 to disable."
+        ),
+    )
+    repair_loop.add_argument(
         "--json-out",
         type=Path,
         default=None,
@@ -132,7 +141,13 @@ def main() -> None:
         return
 
     if command == "semantic-repair":
-        from pipeline.code_object_repair_loop import CodeObjectRepairLoop, LLMFragmentFixer, OracleFragmentFixer, run_dataset_repair_loop
+        from pipeline.code_object_repair_loop import (
+            SEMANTIC_REPAIR_SAMPLE_TIMEOUT_SECONDS,
+            CodeObjectRepairLoop,
+            LLMFragmentFixer,
+            OracleFragmentFixer,
+            run_dataset_repair_loop,
+        )
         from pipeline.config import BASE_DATASET_PATH
 
         if args.fixer not in {"oracle", "llm"}:
@@ -153,6 +168,9 @@ def main() -> None:
                 max_iterations=args.max_iterations,
                 llm_provider=args.llm_provider,
                 llm_model=args.llm_model,
+                sample_timeout_seconds=args.sample_timeout_seconds
+                if args.sample_timeout_seconds is not None
+                else SEMANTIC_REPAIR_SAMPLE_TIMEOUT_SECONDS,
             )
         else:
             if args.gt_pyc is None or args.derived_pyc is None or args.derived_source is None:

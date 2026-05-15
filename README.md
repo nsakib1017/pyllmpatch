@@ -109,9 +109,14 @@ Optional semantic repair flags:
 --skip-pylingual-verification
 --skip-step-verification
 --keep-non-improving
+--sample-timeout-seconds 3600
 --output-dir /path/to/output_dir
 --json-out /path/to/result.json
 ```
+
+Dataset-mode semantic repair caps each sample at 3600 seconds by default. Override
+with `--sample-timeout-seconds` or `SEMANTIC_REPAIR_SAMPLE_TIMEOUT_SECONDS`; use
+`0` to disable the timeout.
 
 For all CLI options:
 
