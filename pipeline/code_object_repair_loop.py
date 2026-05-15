@@ -1839,6 +1839,18 @@ class LLMFragmentFixer(FragmentFixer):
             )
             if skipped_due_to_token_limit:
                 candidate = fallback_candidate
+                candidate_label = (
+                    f"candidate {prompt_record.get('candidate_index')}"
+                    if prompt_record.get("candidate_index") is not None
+                    else "single candidate"
+                )
+                strategy_label = prompt_record.get("candidate_strategy") or "default"
+                print(
+                    "[semantic_repair]   -> skipping LLM call for "
+                    f"{qualname} {candidate_label} strategy={strategy_label}: "
+                    f"prompt token count {prompt_token_count} exceeds threshold {token_threshold}",
+                    flush=True,
+                )
                 prompt_record.update(
                     {
                         "latency_ms": 0,

@@ -2694,13 +2694,20 @@ def _store_semantic_step(
     target_after = step_record.get("target_score_after") or {}
     before_distance = target_before.get("combined_distance") if isinstance(target_before, dict) else None
     after_distance = target_after.get("combined_distance") if isinstance(target_after, dict) else None
-    status = "accepted" if accepted else "rejected"
+    token_limit_skip = bool(step_record.get("skipped_due_to_token_limit"))
+    status = "accepted" if accepted else "skipped_token_limit" if token_limit_skip else "rejected"
     _semantic_print(
         f"-> step {step} iter {iteration} {qualname} ({repair_operation}) -> {status} "
         f"(combined_distance {before_distance} -> {after_distance})",
         indent=1,
         tagged=False,
     )
+    if token_limit_skip:
+        _semantic_print(
+            "-> skipped: semantic repair prompt exceeded token threshold; no LLM call was made",
+            indent=2,
+            tagged=False,
+        )
     if acceptance_reason:
         _semantic_print(f"-> reason: {acceptance_reason}", indent=2, tagged=False)
     _append_accepted_code_object_dataset(log_file, run_id, file_hash, step_record)
@@ -3080,9 +3087,10 @@ def repair_mismatching_code_objects(
                     prompt_record = repair_context.get("_llm_prompt_record") if isinstance(repair_context, dict) else {}
                     if isinstance(prompt_record, dict) and prompt_record.get("skipped_due_to_token_limit"):
                         acceptance_reason = prompt_record.get("skip_reason") or "semantic repair prompt exceeded token limit"
+                        skipped_attempt = target_attempt_counts[qualname]
                         module_rejected_attempts.append(
                             {
-                                "attempt": target_attempt_counts[qualname],
+                                "attempt": skipped_attempt,
                                 "localized_line_number": line_number,
                                 "replacement_text": replacement_text,
                                 "acceptance_reason": acceptance_reason,
@@ -3106,6 +3114,10 @@ def repair_mismatching_code_objects(
                                 "target_score_before": target_score_before,
                                 "target_score_after": None,
                                 "repair_context": repair_context,
+                                "skipped_due_to_token_limit": True,
+                                "skip_reason": acceptance_reason,
+                                "prompt_token_count": prompt_record.get("prompt_token_count"),
+                                "token_threshold_used": prompt_record.get("token_threshold_used"),
                                 "accepted": False,
                                 "acceptance_reason": acceptance_reason,
                             },
@@ -3113,6 +3125,7 @@ def repair_mismatching_code_objects(
                             run_id=run_id,
                             file_hash=file_hash,
                         )
+                        target_attempt_counts[qualname] = max_iterations
                         continue
                     accepted, _, next_source, next_pyc, step_summary, step_pylingual_verification, step, _ = _apply_module_statement_candidate(
                         gt_pyc=gt_pyc,
@@ -3251,6 +3264,15 @@ def repair_mismatching_code_objects(
                     "accepted": False,
                 }
                 if candidate_input.get("skipped_due_to_token_limit"):
+                    _semantic_print(
+                        (
+                            f"-> skipped candidate {candidate_index} for {qualname}: "
+                            f"prompt token count {candidate_input.get('prompt_token_count')} exceeds "
+                            f"threshold {candidate_input.get('token_threshold_used')}; no LLM call was made"
+                        ),
+                        indent=2,
+                        tagged=False,
+                    )
                     candidate_result.update(
                         {
                             "acceptance_reason": candidate_input.get("skip_reason")
@@ -3400,6 +3422,10 @@ def repair_mismatching_code_objects(
                     "summary": step_summary,
                     "pylingual_verification": step_pylingual_verification,
                     "repair_context": repair_context,
+                    "skipped_due_to_token_limit": best_candidate.get("skipped_due_to_token_limit"),
+                    "skip_reason": best_candidate.get("skip_reason"),
+                    "prompt_token_count": best_candidate.get("prompt_token_count"),
+                    "token_threshold_used": best_candidate.get("token_threshold_used"),
                     "accepted": accepted,
                     "acceptance_reason": acceptance_reason,
                 },
@@ -3421,10 +3447,12 @@ def repair_mismatching_code_objects(
             else:
                 if isinstance(repair_context, dict):
                     repair_context["_selected_action_pattern_types"] = best_candidate.get("selected_action_types") or []
+                skipped_due_to_token_limit = bool(best_candidate.get("skipped_due_to_token_limit"))
+                rejected_attempt = target_attempt_counts[qualname]
                 _remember_rejected_attempt(
                     rejected_attempts_by_qualname,
                     qualname,
-                    attempt=target_attempt_counts[qualname],
+                    attempt=rejected_attempt,
                     source_text_before=extracted_before,
                     replacement_text=replacement_text,
                     acceptance_reason=acceptance_reason,
@@ -3432,6 +3460,8 @@ def repair_mismatching_code_objects(
                     target_score_after=target_score_after,
                     repair_context=repair_context,
                 )
+                if skipped_due_to_token_limit:
+                    target_attempt_counts[qualname] = max_iterations
 
         extra_targets = select_extra_repair_targets(compare_code_object_distances(gt_pyc, current_pyc))
         all_repair_targets.extend(
@@ -3719,6 +3749,10 @@ def repair_mismatching_code_objects(
                             "target_score_before": target_score_before,
                             "target_score_after": None,
                             "repair_context": repair_context,
+                            "skipped_due_to_token_limit": True,
+                            "skip_reason": acceptance_reason,
+                            "prompt_token_count": prompt_record.get("prompt_token_count"),
+                            "token_threshold_used": prompt_record.get("token_threshold_used"),
                             "accepted": False,
                             "acceptance_reason": acceptance_reason,
                         },

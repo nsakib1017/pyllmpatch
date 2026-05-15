@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import unittest
 from unittest.mock import patch
 
@@ -36,21 +38,25 @@ class SemanticTokenLimitTest(unittest.TestCase):
         fixer = LLMFragmentFixer(provider="Google", model="gemini-2.5-flash-lite")
         source = "def sample():\n    return 1\n"
 
+        output = io.StringIO()
         with patch("pipeline.code_object_repair_loop.count_tokens_safe", return_value=70000), patch(
             "pipeline.code_object_repair_loop.make_llm_call_from_config"
         ) as mocked_call:
-            candidate = fixer.generate_candidate(
-                qualname="<module>.sample",
-                gt_code_object=CodeObj(),
-                derived_code_object=CodeObj(),
-                derived_source_fragment=source,
-                repair_context={},
-            )
+            with contextlib.redirect_stdout(output):
+                candidate = fixer.generate_candidate(
+                    qualname="<module>.sample",
+                    gt_code_object=CodeObj(),
+                    derived_code_object=CodeObj(),
+                    derived_source_fragment=source,
+                    repair_context={},
+                )
 
         mocked_call.assert_not_called()
         self.assertEqual(candidate, source)
         self.assertTrue(fixer.calls[-1]["skipped_due_to_token_limit"])
         self.assertEqual(fixer.calls[-1]["prompt_token_count"], 70000)
+        self.assertIn("skipping LLM call for <module>.sample", output.getvalue())
+        self.assertIn("prompt token count 70000 exceeds threshold", output.getvalue())
 
     def test_missing_target_token_skip_returns_empty_fragment(self) -> None:
         fixer = LLMFragmentFixer(provider="Google", model="gemini-2.5-flash-lite")
