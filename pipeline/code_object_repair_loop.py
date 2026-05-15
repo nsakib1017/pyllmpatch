@@ -31,6 +31,7 @@ from pipeline.config import (
 from pipeline.logging_utils import append_log
 from utils.file_helpers import fetch_pyllmpatch_repair_paths, fetch_pyllmpatch_source_path, strip_code_fences
 from utils.providers import find_llm_config, make_llm_call_from_config
+from utils.token_helpers import count_tokens_safe
 from utils.reattach_source_code_object import (
     _find_target_row,
     extract_source_segment,
@@ -65,6 +66,7 @@ def _bounded_int_env(name: str, default: int, *, minimum: int, maximum: int) -> 
 
 
 SEMANTIC_REPAIR_CANDIDATE_COUNT = _bounded_int_env("SEMANTIC_REPAIR_CANDIDATE_COUNT", 3, minimum=1, maximum=5)
+SEMANTIC_REPAIR_TOKEN_HEADROOM = _bounded_int_env("SEMANTIC_REPAIR_TOKEN_HEADROOM", 5000, minimum=0, maximum=200000)
 
 INDENTATION_CONTRACT = """Indentation contract:
 - Preserve the first line's relative indentation exactly as shown.
@@ -77,6 +79,48 @@ BYTECODE_PROMPT_WINDOW_RADIUS = 12
 BYTECODE_PROMPT_MAX_LINES_PER_SIDE = 30
 BYTECODE_PROMPT_FULL_LISTING_MAX_INSTRUCTIONS = 80
 SEMANTIC_ACTION_PATTERN_INDEX_PATH = REPO_ROOT / "results" / "semantic_repair_action_patterns" / "semantic_repair_action_patterns.jsonl"
+
+
+def _message_text_for_token_count(messages: list[dict]) -> str:
+    return "\n\n".join(
+        f"{message.get('role', '')}:\n{message.get('content', '')}"
+        for message in messages
+        if isinstance(message, dict)
+    )
+
+
+def _semantic_prompt_token_limit(llm_config: dict[str, Any]) -> int | None:
+    try:
+        token_limit = int(llm_config.get("token_for_completion") or 0)
+    except (TypeError, ValueError):
+        return None
+    return token_limit if token_limit > 0 else None
+
+
+def _semantic_prompt_token_threshold(llm_config: dict[str, Any]) -> int | None:
+    token_limit = _semantic_prompt_token_limit(llm_config)
+    if token_limit is None:
+        return None
+    return max(1, token_limit - SEMANTIC_REPAIR_TOKEN_HEADROOM)
+
+
+def _semantic_prompt_token_count(messages: list[dict], llm_config: dict[str, Any]) -> int:
+    return count_tokens_safe(
+        _message_text_for_token_count(messages),
+        llm_config.get("provider"),
+        llm_config.get("name"),
+    )
+
+
+def _fallback_semantic_candidate(
+    *,
+    qualname: str,
+    derived_code_object: Any,
+    derived_source_fragment: str,
+) -> str:
+    if qualname != "<module>" and derived_code_object is None:
+        return ""
+    return derived_source_fragment
 
 
 def _safe_instruction_argrepr(opname: str, arg: int | None, code_object: Any) -> str:
@@ -1684,6 +1728,20 @@ class LLMFragmentFixer(FragmentFixer):
         self.prompt_output_dir = None if prompt_output_dir is None else prompt_output_dir.expanduser().resolve()
         self._prompt_call_index = 0
 
+    def _record_prompt(self, *, prompt_record: dict[str, Any], qualname: str, repair_context: dict | None) -> None:
+        if self.prompt_output_dir is not None:
+            self.prompt_output_dir.mkdir(parents=True, exist_ok=True)
+            self._prompt_call_index += 1
+            safe_qualname = (
+                qualname.replace("<", "").replace(">", "").replace(".", "_").replace("/", "_").replace("\\", "_")
+            )
+            prompt_path = self.prompt_output_dir / f"{self._prompt_call_index:04d}_{safe_qualname}.json"
+            prompt_path.write_text(json.dumps(prompt_record, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+            prompt_record["prompt_path"] = str(prompt_path)
+        self.calls.append(prompt_record)
+        if repair_context is not None:
+            repair_context["_llm_prompt_record"] = prompt_record
+
     def generate_candidate(
         self,
         *,
@@ -1693,7 +1751,12 @@ class LLMFragmentFixer(FragmentFixer):
         derived_source_fragment: str,
         repair_context: dict | None = None,
     ) -> str:
-        final_candidate = derived_source_fragment
+        fallback_candidate = _fallback_semantic_candidate(
+            qualname=qualname,
+            derived_code_object=derived_code_object,
+            derived_source_fragment=derived_source_fragment,
+        )
+        final_candidate = fallback_candidate
         for duplicate_retry_index in range(2):
             suppress_retrieval_guidance = bool(
                 repair_context and repair_context.get("_suppress_action_pattern_guidance")
@@ -1759,13 +1822,50 @@ class LLMFragmentFixer(FragmentFixer):
                 "system_prompt": messages[0]["content"] if messages else None,
                 "user_prompt": messages[1]["content"] if len(messages) > 1 else None,
             }
+            prompt_token_count = _semantic_prompt_token_count(messages, self.llm_config)
+            token_limit = _semantic_prompt_token_limit(self.llm_config)
+            token_threshold = _semantic_prompt_token_threshold(self.llm_config)
+            skipped_due_to_token_limit = (
+                token_threshold is not None and prompt_token_count > token_threshold
+            )
+            prompt_record.update(
+                {
+                    "prompt_token_count": prompt_token_count,
+                    "token_limit_for_completion": token_limit,
+                    "token_threshold_used": token_threshold,
+                    "semantic_repair_token_headroom": SEMANTIC_REPAIR_TOKEN_HEADROOM,
+                    "skipped_due_to_token_limit": skipped_due_to_token_limit,
+                }
+            )
+            if skipped_due_to_token_limit:
+                candidate = fallback_candidate
+                prompt_record.update(
+                    {
+                        "latency_ms": 0,
+                        "usage": None,
+                        "response_text": "",
+                        "line_number_stripped_text": "",
+                        "returned_text": candidate,
+                        "replacement_hash": _replacement_hash(candidate),
+                        "replacement_structural_hash": _replacement_structural_hash(candidate),
+                        "duplicate_rejected_candidate": False,
+                        "duplicate_same_round_candidate": False,
+                        "skip_reason": (
+                            f"semantic repair prompt token count {prompt_token_count} exceeds "
+                            f"threshold {token_threshold}"
+                        ),
+                    }
+                )
+                self._record_prompt(prompt_record=prompt_record, qualname=qualname, repair_context=repair_context)
+                final_candidate = candidate
+                break
             started = time.perf_counter()
             response = make_llm_call_from_config(messages, self.llm_config)
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             response_text = strip_code_fences(response)
             cleaned_response_text = strip_prompt_line_numbers(response_text)
             content = cleaned_response_text.strip()
-            candidate = content if content else derived_source_fragment
+            candidate = content if content else fallback_candidate
             candidate_hash = _replacement_hash(candidate)
             candidate_structural_hash = _replacement_structural_hash(candidate)
             duplicate_rejected_candidate = _candidate_repeats_rejected_attempt(candidate, repair_context)
@@ -1791,18 +1891,7 @@ class LLMFragmentFixer(FragmentFixer):
                     "duplicate_same_round_candidate": duplicate_same_round_candidate,
                 }
             )
-            if self.prompt_output_dir is not None:
-                self.prompt_output_dir.mkdir(parents=True, exist_ok=True)
-                self._prompt_call_index += 1
-                safe_qualname = (
-                    qualname.replace("<", "").replace(">", "").replace(".", "_").replace("/", "_").replace("\\", "_")
-                )
-                prompt_path = self.prompt_output_dir / f"{self._prompt_call_index:04d}_{safe_qualname}.json"
-                prompt_path.write_text(json.dumps(prompt_record, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
-                prompt_record["prompt_path"] = str(prompt_path)
-            self.calls.append(prompt_record)
-            if repair_context is not None:
-                repair_context["_llm_prompt_record"] = prompt_record
+            self._record_prompt(prompt_record=prompt_record, qualname=qualname, repair_context=repair_context)
             final_candidate = candidate
             if duplicate_rejected_candidate and duplicate_retry_index == 0 and repair_context is not None:
                 repair_context["_force_distinct_retry"] = True
@@ -1888,6 +1977,10 @@ class LLMFragmentFixer(FragmentFixer):
                     "prompt_path": prompt_record.get("prompt_path") if isinstance(prompt_record, dict) else None,
                     "prompt_record": prompt_record if isinstance(prompt_record, dict) else None,
                     "duplicate_rejected_candidate": prompt_record.get("duplicate_rejected_candidate") if isinstance(prompt_record, dict) else None,
+                    "skipped_due_to_token_limit": prompt_record.get("skipped_due_to_token_limit") if isinstance(prompt_record, dict) else None,
+                    "skip_reason": prompt_record.get("skip_reason") if isinstance(prompt_record, dict) else None,
+                    "prompt_token_count": prompt_record.get("prompt_token_count") if isinstance(prompt_record, dict) else None,
+                    "token_threshold_used": prompt_record.get("token_threshold_used") if isinstance(prompt_record, dict) else None,
                 }
             )
         return candidates or [{"candidate_index": 0, "strategy": "fallback", "text": derived_source_fragment}]

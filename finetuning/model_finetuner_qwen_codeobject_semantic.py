@@ -407,6 +407,72 @@ def filter_samples_by_char_budget(samples: list[dict[str, Any]], max_sample_char
     return kept
 
 
+def tokenized_text_length(tokenizer: Any, text: str) -> int:
+    try:
+        encoded = tokenizer(text, add_special_tokens=False, truncation=False)
+    except TypeError:
+        encoded = tokenizer(text, add_special_tokens=False)
+    if isinstance(encoded, dict):
+        input_ids = encoded.get("input_ids", [])
+    elif hasattr(encoded, "input_ids"):
+        input_ids = encoded.input_ids
+    else:
+        input_ids = encoded
+    if hasattr(input_ids, "shape") and getattr(input_ids, "shape", None):
+        return int(input_ids.shape[-1])
+    if hasattr(input_ids, "numel"):
+        return int(input_ids.numel())
+    if input_ids and isinstance(input_ids[0], list):
+        return max(len(row) for row in input_ids)
+    return len(input_ids)
+
+
+def sample_token_lengths(
+    sample: dict[str, Any],
+    tokenizer: Any,
+    *,
+    enable_thinking_template: bool,
+) -> list[int]:
+    texts = formatting_func(
+        sample,
+        tokenizer,
+        enable_thinking_template=enable_thinking_template,
+    )
+    return [tokenized_text_length(tokenizer, text) for text in texts]
+
+
+def filter_samples_by_token_budget(
+    samples: list[dict[str, Any]],
+    tokenizer: Any,
+    *,
+    max_seq_length: int,
+    enable_thinking_template: bool,
+) -> list[dict[str, Any]]:
+    if max_seq_length <= 0:
+        return samples
+    kept: list[dict[str, Any]] = []
+    skipped = 0
+    max_seen = 0
+    for sample in samples:
+        lengths = sample_token_lengths(
+            sample,
+            tokenizer,
+            enable_thinking_template=enable_thinking_template,
+        )
+        sample_max = max(lengths, default=0)
+        max_seen = max(max_seen, sample_max)
+        if sample_max <= max_seq_length:
+            kept.append(sample)
+        else:
+            skipped += 1
+    if skipped:
+        print(
+            f"Skipped {skipped} examples over --max-seq-length={max_seq_length} "
+            f"after chat templating; max observed length was {max_seen} tokens."
+        )
+    return kept
+
+
 def main() -> None:
     load_dotenv()
     args = parse_args()
@@ -430,6 +496,16 @@ def main() -> None:
 
     from datasets import Dataset
 
+    model, tokenizer = load_model_and_tokenizer(args)
+    samples = filter_samples_by_token_budget(
+        samples,
+        tokenizer,
+        max_seq_length=args.max_seq_length,
+        enable_thinking_template=args.enable_thinking_template,
+    )
+    if len(samples) < 2:
+        raise ValueError("Need at least two valid samples within --max-seq-length for train/validation split.")
+
     train_samples, val_samples = split_samples(
         samples,
         validation_ratio=args.validation_ratio,
@@ -437,8 +513,6 @@ def main() -> None:
     )
     train_dataset = Dataset.from_list(train_samples)
     val_dataset = Dataset.from_list(val_samples)
-
-    model, tokenizer = load_model_and_tokenizer(args)
 
     run_id = int(time.time())
     model_slug = args.model_name.strip("/").replace("/", "__")

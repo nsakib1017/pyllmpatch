@@ -2232,6 +2232,10 @@ def _compact_candidate_result(result: dict[str, Any]) -> dict[str, Any]:
         "replacement_structural_hash": result.get("replacement_structural_hash"),
         "selected_action_types": result.get("selected_action_types"),
         "prompt_path": result.get("prompt_path"),
+        "skipped_due_to_token_limit": result.get("skipped_due_to_token_limit"),
+        "skip_reason": result.get("skip_reason"),
+        "prompt_token_count": result.get("prompt_token_count"),
+        "token_threshold_used": result.get("token_threshold_used"),
     }
 
 
@@ -3073,6 +3077,43 @@ def repair_mismatching_code_objects(
                         extracted_before,
                         repair_context,
                     )
+                    prompt_record = repair_context.get("_llm_prompt_record") if isinstance(repair_context, dict) else {}
+                    if isinstance(prompt_record, dict) and prompt_record.get("skipped_due_to_token_limit"):
+                        acceptance_reason = prompt_record.get("skip_reason") or "semantic repair prompt exceeded token limit"
+                        module_rejected_attempts.append(
+                            {
+                                "attempt": target_attempt_counts[qualname],
+                                "localized_line_number": line_number,
+                                "replacement_text": replacement_text,
+                                "acceptance_reason": acceptance_reason,
+                            }
+                        )
+                        _store_semantic_step(
+                            steps,
+                            {
+                                "step": step_index,
+                                "iteration": iteration,
+                                "qualname": qualname,
+                                "repair_operation": "repair_module_statement",
+                                "module_body_strategy": "localized_module_statement_repair",
+                                "localized_line_number": line_number,
+                                "source_lineno": line_number,
+                                "fragment_path": None,
+                                "output_source": None,
+                                "output_pyc": None,
+                                "extracted_before": extracted_before,
+                                "replacement_text": replacement_text,
+                                "target_score_before": target_score_before,
+                                "target_score_after": None,
+                                "repair_context": repair_context,
+                                "accepted": False,
+                                "acceptance_reason": acceptance_reason,
+                            },
+                            log_file=log_file,
+                            run_id=run_id,
+                            file_hash=file_hash,
+                        )
+                        continue
                     accepted, _, next_source, next_pyc, step_summary, step_pylingual_verification, step, _ = _apply_module_statement_candidate(
                         gt_pyc=gt_pyc,
                         current_source=current_source,
@@ -3203,8 +3244,24 @@ def repair_mismatching_code_objects(
                     "prompt_record": candidate_input.get("prompt_record"),
                     "replacement_hash": candidate_input.get("replacement_hash"),
                     "replacement_structural_hash": candidate_input.get("replacement_structural_hash"),
+                    "skipped_due_to_token_limit": candidate_input.get("skipped_due_to_token_limit"),
+                    "skip_reason": candidate_input.get("skip_reason"),
+                    "prompt_token_count": candidate_input.get("prompt_token_count"),
+                    "token_threshold_used": candidate_input.get("token_threshold_used"),
                     "accepted": False,
                 }
+                if candidate_input.get("skipped_due_to_token_limit"):
+                    candidate_result.update(
+                        {
+                            "acceptance_reason": candidate_input.get("skip_reason")
+                            or "semantic repair prompt exceeded token limit",
+                            "replacement_text": candidate_text,
+                            "replacement_hash": _replacement_hash(candidate_text),
+                            "replacement_structural_hash": _replacement_structural_hash(candidate_text),
+                        }
+                    )
+                    candidate_results.append(candidate_result)
+                    continue
                 try:
                     candidate_reattachment = choose_best_reattachment(
                         current_text,
@@ -3631,6 +3688,56 @@ def repair_mismatching_code_objects(
                     insertion_context,
                     repair_context,
                 )
+                prompt_record = repair_context.get("_llm_prompt_record") if isinstance(repair_context, dict) else {}
+                if isinstance(prompt_record, dict) and prompt_record.get("skipped_due_to_token_limit"):
+                    acceptance_reason = prompt_record.get("skip_reason") or "semantic repair prompt exceeded token limit"
+                    unsupported_missing_targets.add(qualname)
+                    _store_semantic_step(
+                        steps,
+                        {
+                            "step": step_index,
+                            "iteration": iteration,
+                            "qualname": qualname,
+                            "repair_operation": "insert_missing",
+                            "parent_qualname": parent_row.get("source_qualname") if parent_row is not None else "<module>",
+                            "source_kind": parent_row.get("source_kind") if parent_row is not None else None,
+                            "source_lineno": int(parent_row["source_lineno"]) if parent_row is not None else None,
+                            "source_col_offset": int(parent_row["source_col_offset"]) if parent_row is not None else None,
+                            "source_end_lineno": int(parent_row["source_end_lineno"]) if parent_row is not None else None,
+                            "source_end_col_offset": int(parent_row["source_end_col_offset"]) if parent_row is not None else None,
+                            "parent_target_identity": _mapping_row_identity(parent_row),
+                            "gt_target_identity": gt_target_identity,
+                            "parent_mapping_resolution": parent_row.get("_mapping_resolution") if parent_row is not None else None,
+                            "gt_mapping_resolution": gt_mapping_resolution,
+                            "fragment_path": None,
+                            "output_source": None,
+                            "output_pyc": None,
+                            "gt_code_object_name": getattr(gt_code_object, "co_name", None),
+                            "derived_code_object_name": None,
+                            "extracted_before": insertion_context,
+                            "replacement_text": replacement_text,
+                            "target_score_before": target_score_before,
+                            "target_score_after": None,
+                            "repair_context": repair_context,
+                            "accepted": False,
+                            "acceptance_reason": acceptance_reason,
+                        },
+                        log_file=log_file,
+                        run_id=run_id,
+                        file_hash=file_hash,
+                    )
+                    _remember_rejected_attempt(
+                        rejected_attempts_by_qualname,
+                        qualname,
+                        attempt=target_attempt_counts[qualname],
+                        source_text_before=insertion_context,
+                        replacement_text=replacement_text,
+                        acceptance_reason=acceptance_reason,
+                        target_score_before=target_score_before,
+                        target_score_after=None,
+                        repair_context=repair_context,
+                    )
+                    continue
 
             updated_text, parent_qualname, insertion_indent = insert_missing_source_segment(
                 current_text,
