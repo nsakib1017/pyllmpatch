@@ -40,6 +40,10 @@ class SemanticRepairTimeoutNoImprovement(TimeoutError):
     pass
 
 
+class SemanticRepairHardTimeoutNoImprovement(SemanticRepairTimeoutNoImprovement):
+    pass
+
+
 FragmentFixer = Callable[[str, Any, Any, str, dict | None], Any]
 
 
@@ -2890,8 +2894,9 @@ def repair_mismatching_code_objects(
     reject_non_improving_candidates: bool = True,
     max_iterations: int = 1,
     sample_timeout_deadline: float | None = None,
+    sample_hard_timeout_deadline: float | None = None,
     sample_timeout_seconds: int | None = None,
-    sample_timeout_patience_seconds: int = 15 * 60,
+    sample_hard_timeout_seconds: int | None = None,
     sample_timeout_min_improvement_delta: int = 1,
 ) -> dict:
     gt_pyc = validate_input(gt_pyc)
@@ -2918,7 +2923,6 @@ def repair_mismatching_code_objects(
     pyc_dir.mkdir(parents=True, exist_ok=True)
 
     max_iterations = max(1, int(max_iterations))
-    sample_timeout_patience_seconds = max(0, int(sample_timeout_patience_seconds))
     sample_timeout_min_improvement_delta = max(1, int(sample_timeout_min_improvement_delta))
     initial_rows = compare_code_object_distances(gt_pyc, derived_pyc)
     initial_summary = summarize_results(initial_rows)
@@ -2937,8 +2941,9 @@ def repair_mismatching_code_objects(
     best_pyc = current_pyc
     best_summary = current_summary
     best_pylingual_verification = current_pylingual_verification
-    best_improvement_at: float | None = None
     best_improvement_reason: str | None = None
+    timeout_checkpoint_summary = current_summary
+    timeout_checkpoint_count = 0
     steps: list[dict] = []
 
     all_repair_targets = list(repair_targets)
@@ -2951,12 +2956,14 @@ def repair_mismatching_code_objects(
     module_rejected_attempts: list[dict] = []
     rejected_attempts_by_qualname: dict[str, list[dict]] = {}
     sample_timed_out = False
+    sample_timeout_reached = False
+    sample_hard_timeout_reached = False
     sample_timeout_reason: str | None = None
     sample_timeout_action: str | None = None
 
     def record_best_state_if_improved(reason: str) -> None:
         nonlocal best_source, best_pyc, best_summary, best_pylingual_verification
-        nonlocal best_improvement_at, best_improvement_reason
+        nonlocal best_improvement_reason
         if not _combined_distance_improved(
             best_summary,
             current_summary,
@@ -2967,7 +2974,6 @@ def repair_mismatching_code_objects(
         best_pyc = current_pyc
         best_summary = current_summary
         best_pylingual_verification = current_pylingual_verification
-        best_improvement_at = time.monotonic()
         best_improvement_reason = reason
 
     def restore_best_state_if_needed() -> None:
@@ -2980,10 +2986,46 @@ def repair_mismatching_code_objects(
         current_pylingual_verification = best_pylingual_verification
 
     def handle_sample_timeout_if_needed(*, location: str) -> bool:
-        nonlocal sample_timed_out, sample_timeout_reason, sample_timeout_action
+        nonlocal sample_timeout_deadline, sample_timeout_reached, sample_timeout_reason, sample_timeout_action
+        nonlocal sample_timed_out
+        nonlocal sample_hard_timeout_reached
+        nonlocal timeout_checkpoint_summary, timeout_checkpoint_count
+        if sample_hard_timeout_reached:
+            return True
+        if sample_hard_timeout_deadline is not None and time.monotonic() >= sample_hard_timeout_deadline:
+            initial_distance = _summary_combined_distance(initial_summary)
+            current_distance = _summary_combined_distance(current_summary)
+            best_distance = _summary_combined_distance(best_summary)
+            hard_label = (
+                f"{sample_hard_timeout_seconds} seconds"
+                if sample_hard_timeout_seconds is not None and sample_hard_timeout_seconds > 0
+                else "configured hard timeout"
+            )
+            if not _combined_distance_improved(
+                initial_summary,
+                best_summary,
+                min_delta=sample_timeout_min_improvement_delta,
+            ):
+                raise SemanticRepairHardTimeoutNoImprovement(
+                    f"sample exceeded hard timeout {hard_label} at {location} without combined distance improvement "
+                    f"({initial_distance} -> {current_distance})"
+                )
+            restore_best_state_if_needed()
+            sample_timed_out = True
+            sample_timeout_reached = True
+            sample_hard_timeout_reached = True
+            sample_timeout_action = "stopped_at_hard_timeout_kept_best_result"
+            sample_timeout_reason = (
+                f"sample exceeded hard timeout {hard_label} at {location}; keeping best result "
+                f"({initial_distance} -> {best_distance})"
+            )
+            if best_improvement_reason:
+                sample_timeout_reason += f"; best improvement: {best_improvement_reason}"
+            _semantic_print(f"-> hard timeout reached: {sample_timeout_reason}", indent=1)
+            return True
         if sample_timeout_deadline is None or time.monotonic() < sample_timeout_deadline:
             return False
-        initial_distance = _summary_combined_distance(initial_summary)
+        checkpoint_distance = _summary_combined_distance(timeout_checkpoint_summary)
         current_distance = _summary_combined_distance(current_summary)
         best_distance = _summary_combined_distance(best_summary)
         elapsed_label = (
@@ -2992,33 +3034,30 @@ def repair_mismatching_code_objects(
             else "configured timeout"
         )
         if not _combined_distance_improved(
-            initial_summary,
+            timeout_checkpoint_summary,
             best_summary,
             min_delta=sample_timeout_min_improvement_delta,
         ):
             raise SemanticRepairTimeoutNoImprovement(
                 f"sample exceeded {elapsed_label} at {location} without combined distance improvement "
-                f"({initial_distance} -> {current_distance})"
+                f"since the previous checkpoint ({checkpoint_distance} -> {current_distance})"
             )
-        now = time.monotonic()
-        grace_deadline = sample_timeout_deadline + sample_timeout_patience_seconds
-        recent_improvement = (
-            best_improvement_at is not None
-            and now - best_improvement_at < sample_timeout_patience_seconds
-        )
-        if sample_timeout_patience_seconds > 0 and recent_improvement and now < grace_deadline:
-            return False
-        restore_best_state_if_needed()
-        sample_timed_out = True
-        sample_timeout_action = "kept_best_partial_result"
+        timeout_checkpoint_count += 1
+        sample_timeout_reached = True
+        sample_timeout_action = "continued_after_checkpoint_improvement"
         sample_timeout_reason = (
-            f"sample exceeded {elapsed_label} at {location}; keeping best partial result "
-            f"({initial_distance} -> {best_distance})"
+            f"sample exceeded {elapsed_label} at {location}; continuing because combined distance improved since "
+            f"the previous checkpoint ({checkpoint_distance} -> {best_distance})"
         )
         if best_improvement_reason:
             sample_timeout_reason += f"; best improvement: {best_improvement_reason}"
-        _semantic_print(f"-> timeout reached: {sample_timeout_reason}", indent=1)
-        return True
+        _semantic_print(f"-> timeout checkpoint reached: {sample_timeout_reason}", indent=1)
+        timeout_checkpoint_summary = best_summary
+        if sample_timeout_seconds is not None and sample_timeout_seconds > 0:
+            sample_timeout_deadline = time.monotonic() + sample_timeout_seconds
+        else:
+            sample_timeout_deadline = None
+        return False
 
     preprocessing_rows = compare_code_object_distances(gt_pyc, current_pyc)
     if _module_needs_repair(preprocessing_rows) and "<module>" not in all_repair_targets:
@@ -3579,9 +3618,6 @@ def repair_mismatching_code_objects(
                 if skipped_due_to_token_limit:
                     target_attempt_counts[qualname] = max_iterations
 
-        if sample_timed_out:
-            break
-
         extra_targets = select_extra_repair_targets(compare_code_object_distances(gt_pyc, current_pyc))
         all_repair_targets.extend(
             qualname for qualname in extra_targets if qualname not in all_repair_targets
@@ -3755,8 +3791,6 @@ def repair_mismatching_code_objects(
                 if step_pylingual_verification is not None:
                     current_pylingual_verification = step_pylingual_verification
                 record_best_state_if_improved(f"accepted {qualname} at step {step_index}")
-        if sample_timed_out:
-            break
         missing_targets = select_missing_repair_targets(compare_code_object_distances(gt_pyc, current_pyc))
         all_repair_targets.extend(
             qualname for qualname in missing_targets if qualname not in all_repair_targets
@@ -3992,43 +4026,13 @@ def repair_mismatching_code_objects(
                     repair_context=repair_context if fragment_fixer is not None else None,
                 )
 
-        if sample_timed_out:
-            break
-
         if handle_sample_timeout_if_needed(location=f"iteration {iteration} end"):
             break
 
         if accepted_this_iteration == 0 and not _has_retryable_pylingual_targets(current_pylingual_verification, attempted_pylingual_targets):
             break
 
-    if sample_timeout_deadline is not None and time.monotonic() >= sample_timeout_deadline:
-        initial_distance = _summary_combined_distance(initial_summary)
-        best_distance = _summary_combined_distance(best_summary)
-        elapsed_label = (
-            f"{sample_timeout_seconds} seconds"
-            if sample_timeout_seconds is not None and sample_timeout_seconds > 0
-            else "configured timeout"
-        )
-        if not _combined_distance_improved(
-            initial_summary,
-            best_summary,
-            min_delta=sample_timeout_min_improvement_delta,
-        ):
-            current_distance = _summary_combined_distance(current_summary)
-            raise SemanticRepairTimeoutNoImprovement(
-                f"sample exceeded {elapsed_label} at finalization without combined distance improvement "
-                f"({initial_distance} -> {current_distance})"
-            )
-        restore_best_state_if_needed()
-        if not sample_timed_out:
-            sample_timed_out = True
-            sample_timeout_action = "completed_after_timeout_kept_best_result"
-            sample_timeout_reason = (
-                f"sample exceeded {elapsed_label} before completion; keeping best result "
-                f"({initial_distance} -> {best_distance})"
-            )
-            if best_improvement_reason:
-                sample_timeout_reason += f"; best improvement: {best_improvement_reason}"
+    handle_sample_timeout_if_needed(location="finalization")
 
     final_rows = compare_code_object_distances(gt_pyc, current_pyc)
     final_summary = summarize_results(final_rows)
@@ -4056,8 +4060,11 @@ def repair_mismatching_code_objects(
         "unsupported_module_body_repair": unsupported_module_body_repair,
         "max_iterations": max_iterations,
         "sample_timed_out": sample_timed_out,
+        "sample_timeout_reached": sample_timeout_reached,
+        "sample_hard_timeout_reached": sample_hard_timeout_reached,
+        "sample_timeout_checkpoint_count": timeout_checkpoint_count,
         "sample_timeout_seconds": sample_timeout_seconds,
-        "sample_timeout_patience_seconds": sample_timeout_patience_seconds,
+        "sample_hard_timeout_seconds": sample_hard_timeout_seconds,
         "sample_timeout_min_improvement_delta": sample_timeout_min_improvement_delta,
         "sample_timeout_action": sample_timeout_action,
         "sample_timeout_reason": sample_timeout_reason,
@@ -4069,7 +4076,7 @@ def repair_mismatching_code_objects(
                 final_summary,
                 min_delta=sample_timeout_min_improvement_delta,
             )
-            if sample_timed_out
+            if sample_timeout_reached
             else None
         ),
         "target_attempt_counts": target_attempt_counts,

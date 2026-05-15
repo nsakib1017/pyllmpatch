@@ -33,6 +33,7 @@ from utils.file_helpers import fetch_pyllmpatch_repair_paths, fetch_pyllmpatch_s
 from utils.providers import find_llm_config, make_llm_call_from_config
 from utils.token_helpers import count_tokens_safe
 from utils.reattach_source_code_object import (
+    SemanticRepairHardTimeoutNoImprovement,
     SemanticRepairTimeoutNoImprovement,
     _find_target_row,
     extract_source_segment,
@@ -74,17 +75,17 @@ SEMANTIC_REPAIR_SAMPLE_TIMEOUT_SECONDS = _bounded_int_env(
     minimum=0,
     maximum=30 * 24 * 60 * 60,
 )
-SEMANTIC_REPAIR_TIMEOUT_PATIENCE_SECONDS = _bounded_int_env(
-    "SEMANTIC_REPAIR_TIMEOUT_PATIENCE_SECONDS",
-    15 * 60,
-    minimum=0,
-    maximum=30 * 24 * 60 * 60,
-)
 SEMANTIC_REPAIR_TIMEOUT_MIN_IMPROVEMENT_DELTA = _bounded_int_env(
     "SEMANTIC_REPAIR_TIMEOUT_MIN_IMPROVEMENT_DELTA",
     1,
     minimum=1,
     maximum=200000,
+)
+SEMANTIC_REPAIR_SAMPLE_HARD_TIMEOUT_SECONDS = _bounded_int_env(
+    "SEMANTIC_REPAIR_SAMPLE_HARD_TIMEOUT_SECONDS",
+    3 * 60 * 60,
+    minimum=0,
+    maximum=30 * 24 * 60 * 60,
 )
 
 
@@ -2046,8 +2047,9 @@ class CodeObjectRepairLoop:
         reject_non_improving_candidates: bool = True,
         max_iterations: int = 1,
         sample_timeout_deadline: float | None = None,
+        sample_hard_timeout_deadline: float | None = None,
         sample_timeout_seconds: int | None = None,
-        sample_timeout_patience_seconds: int = SEMANTIC_REPAIR_TIMEOUT_PATIENCE_SECONDS,
+        sample_hard_timeout_seconds: int | None = None,
         sample_timeout_min_improvement_delta: int = SEMANTIC_REPAIR_TIMEOUT_MIN_IMPROVEMENT_DELTA,
     ) -> dict:
         self._set_prompt_output_dir(output_dir, derived_source)
@@ -2066,8 +2068,9 @@ class CodeObjectRepairLoop:
             reject_non_improving_candidates=reject_non_improving_candidates,
             max_iterations=max_iterations,
             sample_timeout_deadline=sample_timeout_deadline,
+            sample_hard_timeout_deadline=sample_hard_timeout_deadline,
             sample_timeout_seconds=sample_timeout_seconds,
-            sample_timeout_patience_seconds=sample_timeout_patience_seconds,
+            sample_hard_timeout_seconds=sample_hard_timeout_seconds,
             sample_timeout_min_improvement_delta=sample_timeout_min_improvement_delta,
         )
         if hasattr(self.fixer, "calls"):
@@ -2238,12 +2241,12 @@ def run_dataset_repair_loop(
     llm_provider: str = "Google",
     llm_model: str = "gemini-2.5-flash-lite",
     sample_timeout_seconds: int = SEMANTIC_REPAIR_SAMPLE_TIMEOUT_SECONDS,
-    sample_timeout_patience_seconds: int = SEMANTIC_REPAIR_TIMEOUT_PATIENCE_SECONDS,
+    sample_hard_timeout_seconds: int = SEMANTIC_REPAIR_SAMPLE_HARD_TIMEOUT_SECONDS,
     sample_timeout_min_improvement_delta: int = SEMANTIC_REPAIR_TIMEOUT_MIN_IMPROVEMENT_DELTA,
 ) -> dict:
     dataset_path = dataset_path.expanduser().resolve()
     sample_timeout_seconds = max(0, int(sample_timeout_seconds))
-    sample_timeout_patience_seconds = max(0, int(sample_timeout_patience_seconds))
+    sample_hard_timeout_seconds = max(0, int(sample_hard_timeout_seconds))
     sample_timeout_min_improvement_delta = max(1, int(sample_timeout_min_improvement_delta))
     if output_dir is None:
         run_id, log_base, log_file = build_run_paths(current_run_timestamp())
@@ -2262,15 +2265,16 @@ def run_dataset_repair_loop(
     repaired = 0
     failed = 0
     timed_out = 0
-    if sample_timeout_seconds > 0:
-        print(
-            f"[semantic_repair] per-sample timeout: {sample_timeout_seconds} seconds; "
-            f"patience={sample_timeout_patience_seconds} seconds; "
-            f"min_delta={sample_timeout_min_improvement_delta}",
-            flush=True,
-        )
-    else:
-        print("[semantic_repair] per-sample timeout disabled", flush=True)
+    hard_timed_out = 0
+    timeout_label = f"{sample_timeout_seconds} seconds" if sample_timeout_seconds > 0 else "disabled"
+    hard_timeout_label = (
+        f"{sample_hard_timeout_seconds} seconds" if sample_hard_timeout_seconds > 0 else "disabled"
+    )
+    print(
+        f"[semantic_repair] per-sample timeout: checkpoint={timeout_label}; "
+        f"hard_cap={hard_timeout_label}; min_delta={sample_timeout_min_improvement_delta}",
+        flush=True,
+    )
 
     with results_csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=_dataset_fieldnames())
@@ -2284,6 +2288,9 @@ def run_dataset_repair_loop(
             try:
                 sample_timeout_deadline = (
                     time.monotonic() + sample_timeout_seconds if sample_timeout_seconds > 0 else None
+                )
+                sample_hard_timeout_deadline = (
+                    time.monotonic() + sample_hard_timeout_seconds if sample_hard_timeout_seconds > 0 else None
                 )
                 gt_source = fetch_pyllmpatch_source_path(row.file_hash, row.source)
                 gt_pyc, derived_pyc, derived_source = fetch_pyllmpatch_repair_paths(row.file_hash, row.source)
@@ -2328,16 +2335,23 @@ def run_dataset_repair_loop(
                     reject_non_improving_candidates=reject_non_improving_candidates,
                     max_iterations=max_iterations,
                     sample_timeout_deadline=sample_timeout_deadline,
+                    sample_hard_timeout_deadline=sample_hard_timeout_deadline,
                     sample_timeout_seconds=sample_timeout_seconds,
-                    sample_timeout_patience_seconds=sample_timeout_patience_seconds,
+                    sample_hard_timeout_seconds=sample_hard_timeout_seconds,
                     sample_timeout_min_improvement_delta=sample_timeout_min_improvement_delta,
                 )
                 result_json_path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
                 result_row = _dataset_result_row(row, result, result_json_path)
-                if result.get("sample_timed_out"):
+                if result.get("sample_hard_timeout_reached"):
                     timed_out += 1
+                    hard_timed_out += 1
                     print(
-                        f"[semantic_repair] file_hash={row.file_hash} -> timeout reached after improvement; kept best partial result",
+                        f"[semantic_repair] file_hash={row.file_hash} -> hard timeout reached after combined-distance improvement; kept best result",
+                        flush=True,
+                    )
+                elif result.get("sample_timeout_checkpoint_count"):
+                    print(
+                        f"[semantic_repair] file_hash={row.file_hash} -> timeout checkpoint passed with combined-distance improvement; sample completed normally",
                         flush=True,
                     )
                 writer.writerow(result_row)
@@ -2349,8 +2363,11 @@ def run_dataset_repair_loop(
                         "mode": "semantic_repair",
                         "stage": "result",
                         "sample_timeout_seconds": sample_timeout_seconds,
-                        "sample_timeout_patience_seconds": sample_timeout_patience_seconds,
+                        "sample_hard_timeout_seconds": sample_hard_timeout_seconds,
                         "sample_timeout_min_improvement_delta": sample_timeout_min_improvement_delta,
+                        "sample_timeout_reached": result.get("sample_timeout_reached"),
+                        "sample_hard_timeout_reached": result.get("sample_hard_timeout_reached"),
+                        "sample_timeout_checkpoint_count": result.get("sample_timeout_checkpoint_count"),
                         "sample_timed_out": result.get("sample_timed_out"),
                         "sample_timeout_action": result.get("sample_timeout_action"),
                         "sample_timeout_reason": result.get("sample_timeout_reason"),
@@ -2362,8 +2379,9 @@ def run_dataset_repair_loop(
                 repaired += 1
             except SemanticRepairTimeoutNoImprovement as exc:
                 timeout_message = f"{type(exc).__name__}: {exc}"
+                hard_timeout_reached = isinstance(exc, SemanticRepairHardTimeoutNoImprovement)
                 print(
-                    f"[semantic_repair] file_hash={row.file_hash} -> timed out without combined distance improvement; skipping sample",
+                    f"[semantic_repair] file_hash={row.file_hash} -> {exc}; skipping sample",
                     flush=True,
                 )
                 error_row = _dataset_error_row(row, gt_pyc, derived_pyc, derived_source, timeout_message)
@@ -2376,14 +2394,17 @@ def run_dataset_repair_loop(
                         "mode": "semantic_repair",
                         "stage": "timeout",
                         "sample_timeout_seconds": sample_timeout_seconds,
-                        "sample_timeout_patience_seconds": sample_timeout_patience_seconds,
+                        "sample_hard_timeout_seconds": sample_hard_timeout_seconds,
                         "sample_timeout_min_improvement_delta": sample_timeout_min_improvement_delta,
+                        "sample_hard_timeout_reached": hard_timeout_reached,
                         "sample_timeout_policy": "skip_without_combined_distance_improvement",
                         **error_row,
                     },
                 )
                 failed += 1
                 timed_out += 1
+                if hard_timeout_reached:
+                    hard_timed_out += 1
             except Exception as exc:
                 error_row = _dataset_error_row(row, gt_pyc, derived_pyc, derived_source, f"{type(exc).__name__}: {exc}")
                 writer.writerow(error_row)
@@ -2409,8 +2430,9 @@ def run_dataset_repair_loop(
         "repaired_rows": repaired,
         "failed_rows": failed,
         "timed_out_rows": timed_out,
+        "hard_timed_out_rows": hard_timed_out,
         "sample_timeout_seconds": sample_timeout_seconds,
-        "sample_timeout_patience_seconds": sample_timeout_patience_seconds,
+        "sample_hard_timeout_seconds": sample_hard_timeout_seconds,
         "sample_timeout_min_improvement_delta": sample_timeout_min_improvement_delta,
     }
 
@@ -2478,12 +2500,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--sample-timeout-patience-seconds",
+        "--sample-hard-timeout-seconds",
         type=int,
-        default=SEMANTIC_REPAIR_TIMEOUT_PATIENCE_SECONDS,
+        default=SEMANTIC_REPAIR_SAMPLE_HARD_TIMEOUT_SECONDS,
         help=(
-            "Grace window after the timeout checkpoint when recent improvements exist. "
-            f"Defaults to {SEMANTIC_REPAIR_TIMEOUT_PATIENCE_SECONDS}; set 0 to stop at the checkpoint."
+            "Absolute hard cap for one dataset-mode sample in seconds. "
+            f"Defaults to {SEMANTIC_REPAIR_SAMPLE_HARD_TIMEOUT_SECONDS}; set 0 to disable."
         ),
     )
     parser.add_argument(
@@ -2565,7 +2587,7 @@ def main() -> int:
             llm_provider=args.llm_provider,
             llm_model=args.llm_model,
             sample_timeout_seconds=args.sample_timeout_seconds,
-            sample_timeout_patience_seconds=args.sample_timeout_patience_seconds,
+            sample_hard_timeout_seconds=args.sample_hard_timeout_seconds,
             sample_timeout_min_improvement_delta=args.sample_timeout_min_improvement_delta,
         )
     else:
