@@ -1758,11 +1758,7 @@ def _should_accept_candidate(
         if candidate_successes is not None and previous_successes is not None and candidate_successes > previous_successes:
             return True, "PyLingual success count improved"
 
-    return (
-        False,
-        "candidate did not improve sample combined distance or PyLingual success count "
-        f"({previous_distance} -> {candidate_distance})",
-    )
+    return False, "candidate did not improve combined distance or PyLingual success count"
 
 
 def _summary_combined_distance(summary: dict | None) -> int | None:
@@ -2707,16 +2703,6 @@ def _step_combined_distance_delta(step_record: dict[str, Any]) -> int | None:
     return int(after_distance) - int(before_distance)
 
 
-def _summary_distance_from_step_record(step_record: dict[str, Any], key: str) -> int | None:
-    summary = step_record.get(key)
-    if not isinstance(summary, dict):
-        return None
-    value = summary.get("combined_distance")
-    if value is None:
-        return None
-    return int(value)
-
-
 def _semantic_print(message: str, *, indent: int = 0, tagged: bool = True) -> None:
     prefix = "[semantic_repair] " if tagged else ""
     print(f"{'  ' * max(0, indent)}{prefix}{message}", flush=True)
@@ -2741,18 +2727,11 @@ def _store_semantic_step(
     target_after = step_record.get("target_score_after") or {}
     before_distance = target_before.get("combined_distance") if isinstance(target_before, dict) else None
     after_distance = target_after.get("combined_distance") if isinstance(target_after, dict) else None
-    previous_summary_distance = _summary_distance_from_step_record(step_record, "previous_summary")
-    summary_distance = _summary_distance_from_step_record(step_record, "summary")
-    summary_segment = (
-        f", sample_combined_distance {previous_summary_distance} -> {summary_distance}"
-        if previous_summary_distance is not None or summary_distance is not None
-        else ""
-    )
     token_limit_skip = bool(step_record.get("skipped_due_to_token_limit"))
     status = "accepted" if accepted else "skipped_token_limit" if token_limit_skip else "rejected"
     _semantic_print(
         f"-> step {step} iter {iteration} {qualname} ({repair_operation}) -> {status} "
-        f"(target_combined_distance {before_distance} -> {after_distance}{summary_segment})",
+        f"(combined_distance {before_distance} -> {after_distance})",
         indent=1,
         tagged=False,
     )
@@ -2882,7 +2861,6 @@ def _apply_module_statement_candidate(
         "reattachment_parse_error": reattachment_candidate.parse_error,
         "target_score_before": target_score_before,
         "target_score_after": target_score_after,
-        "previous_summary": current_summary,
         "summary": step_summary,
         "pylingual_verification": step_pylingual_verification,
         "accepted": accepted,
@@ -3595,7 +3573,6 @@ def repair_mismatching_code_objects(
                     "reattachment_structure_reason": structure_reason,
                     "target_score_before": target_score_before,
                     "target_score_after": target_score_after,
-                    "previous_summary": current_summary,
                     "summary": step_summary,
                     "pylingual_verification": step_pylingual_verification,
                     "repair_context": repair_context,
@@ -3797,7 +3774,6 @@ def repair_mismatching_code_objects(
                     "replacement_text": replacement_text,
                     "target_score_before": target_score_before,
                     "target_score_after": target_score_after,
-                    "previous_summary": current_summary,
                     "summary": step_summary,
                     "pylingual_verification": step_pylingual_verification,
                     "accepted": accepted,
@@ -4019,7 +3995,6 @@ def repair_mismatching_code_objects(
                     "replacement_text": replacement_text,
                     "target_score_before": target_score_before,
                     "target_score_after": target_score_after,
-                    "previous_summary": current_summary,
                     "summary": step_summary,
                     "pylingual_verification": step_pylingual_verification,
                     "repair_context": repair_context if fragment_fixer is not None else None,

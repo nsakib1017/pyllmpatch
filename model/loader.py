@@ -5,7 +5,6 @@ import warnings
 from pathlib import Path
 
 from dotenv import load_dotenv
-from finetuning.model_finetuner_chat_templates import LOAD_IN_4BIT
 from unsloth import FastLanguageModel
 from transformers import AutoTokenizer
 
@@ -13,6 +12,13 @@ _MODEL_CACHE: dict[tuple[str, str | None], tuple[object, object]] = {}
 _MODEL_LOAD_FAILURES: dict[tuple[str, str | None], BaseException] = {}
 
 load_dotenv()
+
+
+def _env_flag(name: str, default: str = "true") -> bool:
+    return str(os.getenv(name, default)).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+LOAD_IN_4BIT = _env_flag("LOAD_IN_4BIT", "true")
 
 warnings.filterwarnings(
     "ignore",

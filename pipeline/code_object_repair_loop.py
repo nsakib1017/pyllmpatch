@@ -1893,7 +1893,31 @@ class LLMFragmentFixer(FragmentFixer):
                 final_candidate = candidate
                 break
             started = time.perf_counter()
-            response = make_llm_call_from_config(messages, self.llm_config)
+            try:
+                response = make_llm_call_from_config(messages, self.llm_config)
+            except Exception as exc:
+                elapsed_ms = int((time.perf_counter() - started) * 1000)
+                error_message = f"{type(exc).__name__}: {exc}"
+                prompt_record.update(
+                    {
+                        "latency_ms": elapsed_ms,
+                        "usage": None,
+                        "response_text": "",
+                        "line_number_stripped_text": "",
+                        "returned_text": fallback_candidate,
+                        "replacement_hash": _replacement_hash(fallback_candidate),
+                        "replacement_structural_hash": _replacement_structural_hash(fallback_candidate),
+                        "duplicate_rejected_candidate": False,
+                        "duplicate_same_round_candidate": False,
+                        "llm_call_error": error_message,
+                    }
+                )
+                self._record_prompt(prompt_record=prompt_record, qualname=qualname, repair_context=repair_context)
+                print(
+                    f"[semantic_repair]   -> LLM call failed for {qualname}: {error_message}",
+                    flush=True,
+                )
+                raise
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             response_text = strip_code_fences(response)
             cleaned_response_text = strip_prompt_line_numbers(response_text)
@@ -2257,6 +2281,22 @@ def run_dataset_repair_loop(
         log_base = output_dir
         log_file = output_dir / f"run_log_{run_id}_{dataset_path.stem}.jsonl"
     results_csv = log_base / f"semantic_repair_results_{dataset_path.stem}.csv"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.touch(exist_ok=True)
+    append_log(
+        log_file,
+        {
+            "run_id": run_id,
+            "timestamp": now_iso(),
+            "mode": "semantic_repair",
+            "stage": "start",
+            "dataset_path": str(dataset_path),
+            "output_dir": str(log_base),
+            "sample_timeout_seconds": sample_timeout_seconds,
+            "sample_hard_timeout_seconds": sample_hard_timeout_seconds,
+            "sample_timeout_min_improvement_delta": sample_timeout_min_improvement_delta,
+        },
+    )
 
     df = pd.read_csv(dataset_path)
     semantic_df = _filter_semantic_dataset_rows(df, source=source, file_hash=file_hash, row_range=row_range, limit=limit)
