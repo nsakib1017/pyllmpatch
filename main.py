@@ -103,6 +103,58 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     repair_loop.add_argument(
+        "--defer-preflight-risky-samples",
+        action="store_true",
+        help=(
+            "In dataset mode, write samples that fail the bytecode-distance preflight to "
+            "semantic_repair_deferred_*.csv instead of processing them."
+        ),
+    )
+    repair_loop.add_argument(
+        "--defer-timeout-no-improvement",
+        action="store_true",
+        help=(
+            "In dataset mode, write timeout-without-improvement samples to "
+            "semantic_repair_deferred_*.csv instead of the main results CSV."
+        ),
+    )
+    repair_loop.add_argument(
+        "--process-easy-cases-first",
+        action="store_true",
+        help=(
+            "In dataset mode, compute preflight metrics and process likely easy samples first "
+            "within the selected row set."
+        ),
+    )
+    repair_loop.add_argument(
+        "--preflight-max-repair-targets",
+        type=int,
+        default=None,
+        help=(
+            "Maximum initial repair targets allowed by --defer-preflight-risky-samples. "
+            "Defaults to SEMANTIC_REPAIR_PREFLIGHT_MAX_REPAIR_TARGETS or 2."
+        ),
+    )
+    repair_loop.add_argument(
+        "--preflight-max-initial-combined-distance",
+        type=int,
+        default=None,
+        help=(
+            "Maximum initial combined distance allowed by --defer-preflight-risky-samples. "
+            "Defaults to SEMANTIC_REPAIR_PREFLIGHT_MAX_INITIAL_COMBINED_DISTANCE or 200."
+        ),
+    )
+    repair_loop.add_argument(
+        "--preflight-allow-missing-targets",
+        action="store_true",
+        help="Allow preflight samples with initial missing code-object targets.",
+    )
+    repair_loop.add_argument(
+        "--preflight-allow-extra-targets",
+        action="store_true",
+        help="Allow preflight samples with initial extra derived code-object targets.",
+    )
+    repair_loop.add_argument(
         "--json-out",
         type=Path,
         default=None,
@@ -161,6 +213,8 @@ def main() -> None:
 
     if command == "semantic-repair":
         from pipeline.code_object_repair_loop import (
+            SEMANTIC_REPAIR_PREFLIGHT_MAX_INITIAL_COMBINED_DISTANCE,
+            SEMANTIC_REPAIR_PREFLIGHT_MAX_REPAIR_TARGETS,
             SEMANTIC_REPAIR_SAMPLE_HARD_TIMEOUT_SECONDS,
             SEMANTIC_REPAIR_SAMPLE_TIMEOUT_SECONDS,
             SEMANTIC_REPAIR_TIMEOUT_MIN_IMPROVEMENT_DELTA,
@@ -198,6 +252,17 @@ def main() -> None:
                 sample_timeout_min_improvement_delta=args.sample_timeout_min_improvement_delta
                 if args.sample_timeout_min_improvement_delta is not None
                 else SEMANTIC_REPAIR_TIMEOUT_MIN_IMPROVEMENT_DELTA,
+                defer_preflight_risky_samples=args.defer_preflight_risky_samples,
+                defer_timeout_no_improvement=args.defer_timeout_no_improvement,
+                process_easy_cases_first=args.process_easy_cases_first,
+                preflight_max_repair_targets=args.preflight_max_repair_targets
+                if args.preflight_max_repair_targets is not None
+                else SEMANTIC_REPAIR_PREFLIGHT_MAX_REPAIR_TARGETS,
+                preflight_max_initial_combined_distance=args.preflight_max_initial_combined_distance
+                if args.preflight_max_initial_combined_distance is not None
+                else SEMANTIC_REPAIR_PREFLIGHT_MAX_INITIAL_COMBINED_DISTANCE,
+                preflight_allow_missing_targets=args.preflight_allow_missing_targets,
+                preflight_allow_extra_targets=args.preflight_allow_extra_targets,
             )
         else:
             if args.gt_pyc is None or args.derived_pyc is None or args.derived_source is None:
