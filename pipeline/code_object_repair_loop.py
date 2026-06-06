@@ -2502,7 +2502,15 @@ def run_dataset_repair_loop(
     preflight_plan: dict[tuple[str, str], dict[str, Any]] = {}
     if process_easy_cases_first:
         scored_rows = []
-        for row in row_items:
+        preflight_total = len(row_items)
+        preflight_progress_interval = (
+            1 if preflight_total <= 20 else max(10, min(100, preflight_total // 20))
+        )
+        print(
+            f"[semantic_repair] preflighting {preflight_total} rows for easy-first ordering",
+            flush=True,
+        )
+        for preflight_index, row in enumerate(row_items, start=1):
             plan: dict[str, Any] = {}
             try:
                 planned_gt_source = fetch_pyllmpatch_source_path(row.file_hash, row.source)
@@ -2522,7 +2530,20 @@ def run_dataset_repair_loop(
             except Exception as exc:
                 plan["preflight_error"] = f"{type(exc).__name__}: {exc}"
             preflight_plan[_dataset_row_key(row)] = plan
-            scored_rows.append((_preflight_easy_sort_key(plan.get("preflight")), row))
+            sort_key = _preflight_easy_sort_key(plan.get("preflight"))
+            scored_rows.append((sort_key, row))
+            if (
+                preflight_index == 1
+                or preflight_index == preflight_total
+                or preflight_index % preflight_progress_interval == 0
+            ):
+                status = "error" if "preflight_error" in plan else f"sort_key={sort_key}"
+                print(
+                    "[semantic_repair] preflight easy-first "
+                    f"{preflight_index}/{preflight_total} "
+                    f"file_hash={str(row.file_hash)[:16]} {status}",
+                    flush=True,
+                )
         row_items = [row for _, row in sorted(scored_rows, key=lambda item: item[0])]
         print(
             f"[semantic_repair] processing easy cases first using preflight scores for {len(row_items)} rows",
