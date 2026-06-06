@@ -36,9 +36,15 @@ from utils.reattach_source_code_object import (
     SemanticRepairHardTimeoutNoImprovement,
     SemanticRepairTimeoutNoImprovement,
     _find_target_row,
+    compare_code_object_distances,
     extract_source_segment,
     infer_source_from_pyc,
     repair_mismatching_code_objects,
+    select_extra_repair_targets,
+    select_missing_expression_child_parent_records,
+    select_repair_targets,
+    select_unreattachable_missing_targets,
+    summarize_results,
 )
 
 PYLINGUAL_ROOT = REPO_ROOT / "pylingual"
@@ -86,6 +92,18 @@ SEMANTIC_REPAIR_SAMPLE_HARD_TIMEOUT_SECONDS = _bounded_int_env(
     3 * 60 * 60,
     minimum=0,
     maximum=30 * 24 * 60 * 60,
+)
+SEMANTIC_REPAIR_PREFLIGHT_MAX_REPAIR_TARGETS = _bounded_int_env(
+    "SEMANTIC_REPAIR_PREFLIGHT_MAX_REPAIR_TARGETS",
+    2,
+    minimum=0,
+    maximum=100000,
+)
+SEMANTIC_REPAIR_PREFLIGHT_MAX_INITIAL_COMBINED_DISTANCE = _bounded_int_env(
+    "SEMANTIC_REPAIR_PREFLIGHT_MAX_INITIAL_COMBINED_DISTANCE",
+    200,
+    minimum=0,
+    maximum=1000000,
 )
 
 
@@ -2149,6 +2167,30 @@ def _dataset_fieldnames() -> list[str]:
     ]
 
 
+def _dataset_deferred_fieldnames() -> list[str]:
+    return [
+        "file_hash",
+        "source",
+        "error_type",
+        "defer_stage",
+        "defer_reason",
+        "gt_pyc",
+        "derived_pyc",
+        "derived_source",
+        "initial_combined_distance",
+        "initial_gt_code_object_count",
+        "initial_derived_code_object_count",
+        "repair_target_count",
+        "missing_target_count",
+        "extra_target_count",
+        "expression_child_parent_target_count",
+        "sample_timeout_seconds",
+        "sample_hard_timeout_seconds",
+        "sample_timeout_min_improvement_delta",
+        "error_message",
+    ]
+
+
 def _dataset_result_row(row, result: dict, result_json_path: Path) -> dict:
     accepted_steps = sum(1 for step in result["steps"] if step["accepted"])
     verification = result.get("pylingual_verification")
@@ -2199,6 +2241,121 @@ def _dataset_error_row(row, gt_pyc: Path | None, derived_pyc: Path | None, deriv
         "error_message": message,
         "result_json": None,
     }
+
+
+def _dataset_deferred_row(
+    row,
+    gt_pyc: Path | None,
+    derived_pyc: Path | None,
+    derived_source: Path | None,
+    *,
+    defer_stage: str,
+    defer_reason: str,
+    preflight: dict[str, Any] | None = None,
+    error_message: str | None = None,
+    sample_timeout_seconds: int | None = None,
+    sample_hard_timeout_seconds: int | None = None,
+    sample_timeout_min_improvement_delta: int | None = None,
+) -> dict[str, Any]:
+    preflight = preflight or {}
+    return {
+        "file_hash": row.file_hash,
+        "source": row.source,
+        "error_type": row.error_type,
+        "defer_stage": defer_stage,
+        "defer_reason": defer_reason,
+        "gt_pyc": str(gt_pyc) if gt_pyc else None,
+        "derived_pyc": str(derived_pyc) if derived_pyc else None,
+        "derived_source": str(derived_source) if derived_source else None,
+        "initial_combined_distance": preflight.get("initial_combined_distance"),
+        "initial_gt_code_object_count": preflight.get("initial_gt_code_object_count"),
+        "initial_derived_code_object_count": preflight.get("initial_derived_code_object_count"),
+        "repair_target_count": preflight.get("repair_target_count"),
+        "missing_target_count": preflight.get("missing_target_count"),
+        "extra_target_count": preflight.get("extra_target_count"),
+        "expression_child_parent_target_count": preflight.get("expression_child_parent_target_count"),
+        "sample_timeout_seconds": sample_timeout_seconds,
+        "sample_hard_timeout_seconds": sample_hard_timeout_seconds,
+        "sample_timeout_min_improvement_delta": sample_timeout_min_improvement_delta,
+        "error_message": error_message,
+    }
+
+
+def _semantic_repair_preflight(gt_pyc: Path, derived_pyc: Path) -> dict[str, Any]:
+    distance_rows = compare_code_object_distances(gt_pyc, derived_pyc)
+    summary = summarize_results(distance_rows)
+    repair_targets = select_repair_targets(distance_rows, include_module=True)
+    missing_targets = select_unreattachable_missing_targets(distance_rows)
+    extra_targets = select_extra_repair_targets(distance_rows)
+    expression_child_parent_records = select_missing_expression_child_parent_records(distance_rows)
+    return {
+        "initial_combined_distance": summary.get("combined_distance"),
+        "initial_gt_code_object_count": summary.get("gt_code_object_count"),
+        "initial_derived_code_object_count": summary.get("derived_code_object_count"),
+        "repair_target_count": len(repair_targets),
+        "missing_target_count": len(missing_targets),
+        "extra_target_count": len(extra_targets),
+        "expression_child_parent_target_count": len(expression_child_parent_records),
+        "repair_targets": repair_targets,
+        "missing_targets": missing_targets,
+        "extra_targets": extra_targets,
+        "expression_child_parent_targets": [
+            record.get("parent_qualname") for record in expression_child_parent_records
+        ],
+    }
+
+
+def _preflight_defer_reason(
+    preflight: dict[str, Any],
+    *,
+    max_repair_targets: int | None,
+    max_initial_combined_distance: int | None,
+    allow_missing_targets: bool,
+    allow_extra_targets: bool,
+) -> str | None:
+    reasons: list[str] = []
+    initial_distance = preflight.get("initial_combined_distance")
+    repair_target_count = preflight.get("repair_target_count")
+    missing_target_count = preflight.get("missing_target_count")
+    extra_target_count = preflight.get("extra_target_count")
+    if (
+        max_initial_combined_distance is not None
+        and isinstance(initial_distance, (int, float))
+        and initial_distance > max_initial_combined_distance
+    ):
+        reasons.append(
+            f"initial_combined_distance {initial_distance} exceeds {max_initial_combined_distance}"
+        )
+    if (
+        max_repair_targets is not None
+        and isinstance(repair_target_count, int)
+        and repair_target_count > max_repair_targets
+    ):
+        reasons.append(f"repair_target_count {repair_target_count} exceeds {max_repair_targets}")
+    if not allow_missing_targets and missing_target_count:
+        reasons.append(f"missing_target_count {missing_target_count} is nonzero")
+    if not allow_extra_targets and extra_target_count:
+        reasons.append(f"extra_target_count {extra_target_count} is nonzero")
+    return "; ".join(reasons) if reasons else None
+
+
+def _dataset_row_key(row) -> tuple[str, str]:
+    return str(row.source), str(row.file_hash)
+
+
+def _preflight_easy_sort_key(preflight: dict[str, Any] | None) -> tuple[int, int, int, int]:
+    if not preflight:
+        return (1, 1_000_000, 1_000_000_000, 1_000_000)
+    topology_penalty = int(bool(preflight.get("missing_target_count") or preflight.get("extra_target_count")))
+    repair_target_count = preflight.get("repair_target_count")
+    initial_distance = preflight.get("initial_combined_distance")
+    expression_parent_count = preflight.get("expression_child_parent_target_count")
+    return (
+        topology_penalty,
+        int(repair_target_count) if isinstance(repair_target_count, int) else 1_000_000,
+        int(initial_distance) if isinstance(initial_distance, (int, float)) else 1_000_000_000,
+        int(expression_parent_count) if isinstance(expression_parent_count, int) else 1_000_000,
+    )
 
 
 def _filter_semantic_dataset_rows(
@@ -2267,11 +2424,28 @@ def run_dataset_repair_loop(
     sample_timeout_seconds: int = SEMANTIC_REPAIR_SAMPLE_TIMEOUT_SECONDS,
     sample_hard_timeout_seconds: int = SEMANTIC_REPAIR_SAMPLE_HARD_TIMEOUT_SECONDS,
     sample_timeout_min_improvement_delta: int = SEMANTIC_REPAIR_TIMEOUT_MIN_IMPROVEMENT_DELTA,
+    defer_preflight_risky_samples: bool = False,
+    defer_timeout_no_improvement: bool = False,
+    process_easy_cases_first: bool = False,
+    preflight_max_repair_targets: int | None = SEMANTIC_REPAIR_PREFLIGHT_MAX_REPAIR_TARGETS,
+    preflight_max_initial_combined_distance: int | None = SEMANTIC_REPAIR_PREFLIGHT_MAX_INITIAL_COMBINED_DISTANCE,
+    preflight_allow_missing_targets: bool = False,
+    preflight_allow_extra_targets: bool = False,
 ) -> dict:
     dataset_path = dataset_path.expanduser().resolve()
     sample_timeout_seconds = max(0, int(sample_timeout_seconds))
     sample_hard_timeout_seconds = max(0, int(sample_hard_timeout_seconds))
     sample_timeout_min_improvement_delta = max(1, int(sample_timeout_min_improvement_delta))
+    preflight_max_repair_targets = (
+        None
+        if preflight_max_repair_targets is None
+        else max(0, int(preflight_max_repair_targets))
+    )
+    preflight_max_initial_combined_distance = (
+        None
+        if preflight_max_initial_combined_distance is None
+        else max(0, int(preflight_max_initial_combined_distance))
+    )
     if output_dir is None:
         run_id, log_base, log_file = build_run_paths(current_run_timestamp())
     else:
@@ -2281,6 +2455,7 @@ def run_dataset_repair_loop(
         log_base = output_dir
         log_file = output_dir / f"run_log_{run_id}_{dataset_path.stem}.jsonl"
     results_csv = log_base / f"semantic_repair_results_{dataset_path.stem}.csv"
+    deferred_csv = log_base / f"semantic_repair_deferred_{dataset_path.stem}.csv"
     log_file.parent.mkdir(parents=True, exist_ok=True)
     log_file.touch(exist_ok=True)
     append_log(
@@ -2295,6 +2470,13 @@ def run_dataset_repair_loop(
             "sample_timeout_seconds": sample_timeout_seconds,
             "sample_hard_timeout_seconds": sample_hard_timeout_seconds,
             "sample_timeout_min_improvement_delta": sample_timeout_min_improvement_delta,
+            "defer_preflight_risky_samples": defer_preflight_risky_samples,
+            "defer_timeout_no_improvement": defer_timeout_no_improvement,
+            "process_easy_cases_first": process_easy_cases_first,
+            "preflight_max_repair_targets": preflight_max_repair_targets,
+            "preflight_max_initial_combined_distance": preflight_max_initial_combined_distance,
+            "preflight_allow_missing_targets": preflight_allow_missing_targets,
+            "preflight_allow_extra_targets": preflight_allow_extra_targets,
         },
     )
 
@@ -2306,6 +2488,7 @@ def run_dataset_repair_loop(
     failed = 0
     timed_out = 0
     hard_timed_out = 0
+    deferred = 0
     timeout_label = f"{sample_timeout_seconds} seconds" if sample_timeout_seconds > 0 else "disabled"
     hard_timeout_label = (
         f"{sample_hard_timeout_seconds} seconds" if sample_hard_timeout_seconds > 0 else "disabled"
@@ -2315,16 +2498,51 @@ def run_dataset_repair_loop(
         f"hard_cap={hard_timeout_label}; min_delta={sample_timeout_min_improvement_delta}",
         flush=True,
     )
+    row_items = list(semantic_df.itertuples(index=False))
+    preflight_plan: dict[tuple[str, str], dict[str, Any]] = {}
+    if process_easy_cases_first:
+        scored_rows = []
+        for row in row_items:
+            plan: dict[str, Any] = {}
+            try:
+                planned_gt_source = fetch_pyllmpatch_source_path(row.file_hash, row.source)
+                planned_gt_pyc, planned_derived_pyc, planned_derived_source = fetch_pyllmpatch_repair_paths(
+                    row.file_hash, row.source
+                )
+                plan.update(
+                    {
+                        "gt_source": planned_gt_source,
+                        "gt_pyc": planned_gt_pyc,
+                        "derived_pyc": planned_derived_pyc,
+                        "derived_source": planned_derived_source,
+                    }
+                )
+                if planned_gt_pyc is not None and planned_derived_pyc is not None:
+                    plan["preflight"] = _semantic_repair_preflight(planned_gt_pyc, planned_derived_pyc)
+            except Exception as exc:
+                plan["preflight_error"] = f"{type(exc).__name__}: {exc}"
+            preflight_plan[_dataset_row_key(row)] = plan
+            scored_rows.append((_preflight_easy_sort_key(plan.get("preflight")), row))
+        row_items = [row for _, row in sorted(scored_rows, key=lambda item: item[0])]
+        print(
+            f"[semantic_repair] processing easy cases first using preflight scores for {len(row_items)} rows",
+            flush=True,
+        )
 
-    with results_csv.open("w", newline="", encoding="utf-8") as handle:
+    with results_csv.open("w", newline="", encoding="utf-8") as handle, deferred_csv.open(
+        "w", newline="", encoding="utf-8"
+    ) as deferred_handle:
         writer = csv.DictWriter(handle, fieldnames=_dataset_fieldnames())
+        deferred_writer = csv.DictWriter(deferred_handle, fieldnames=_dataset_deferred_fieldnames())
         writer.writeheader()
+        deferred_writer.writeheader()
 
-        for row in semantic_df.itertuples(index=False):
+        for row in row_items:
             processed += 1
             gt_pyc = None
             derived_pyc = None
             derived_source = None
+            preflight: dict[str, Any] | None = None
             try:
                 sample_timeout_deadline = (
                     time.monotonic() + sample_timeout_seconds if sample_timeout_seconds > 0 else None
@@ -2332,8 +2550,15 @@ def run_dataset_repair_loop(
                 sample_hard_timeout_deadline = (
                     time.monotonic() + sample_hard_timeout_seconds if sample_hard_timeout_seconds > 0 else None
                 )
-                gt_source = fetch_pyllmpatch_source_path(row.file_hash, row.source)
-                gt_pyc, derived_pyc, derived_source = fetch_pyllmpatch_repair_paths(row.file_hash, row.source)
+                plan = preflight_plan.get(_dataset_row_key(row), {})
+                gt_source = plan.get("gt_source")
+                gt_pyc = plan.get("gt_pyc")
+                derived_pyc = plan.get("derived_pyc")
+                derived_source = plan.get("derived_source")
+                if not plan:
+                    gt_source = fetch_pyllmpatch_source_path(row.file_hash, row.source)
+                    gt_pyc, derived_pyc, derived_source = fetch_pyllmpatch_repair_paths(row.file_hash, row.source)
+                preflight = plan.get("preflight")
                 if gt_source is None or gt_pyc is None or derived_pyc is None or derived_source is None:
                     error_row = _dataset_error_row(row, gt_pyc, derived_pyc, derived_source, "Could not resolve gt_source, gt_pyc, derived_pyc, and/or derived_source")
                     writer.writerow(error_row)
@@ -2349,6 +2574,50 @@ def run_dataset_repair_loop(
                     )
                     failed += 1
                     continue
+
+                if defer_preflight_risky_samples:
+                    preflight = plan.get("preflight")
+                    if preflight is None:
+                        preflight = _semantic_repair_preflight(gt_pyc, derived_pyc)
+                    defer_reason = _preflight_defer_reason(
+                        preflight,
+                        max_repair_targets=preflight_max_repair_targets,
+                        max_initial_combined_distance=preflight_max_initial_combined_distance,
+                        allow_missing_targets=preflight_allow_missing_targets,
+                        allow_extra_targets=preflight_allow_extra_targets,
+                    )
+                    if defer_reason:
+                        deferred_row = _dataset_deferred_row(
+                            row,
+                            gt_pyc,
+                            derived_pyc,
+                            derived_source,
+                            defer_stage="preflight",
+                            defer_reason=defer_reason,
+                            preflight=preflight,
+                            sample_timeout_seconds=sample_timeout_seconds,
+                            sample_hard_timeout_seconds=sample_hard_timeout_seconds,
+                            sample_timeout_min_improvement_delta=sample_timeout_min_improvement_delta,
+                        )
+                        deferred_writer.writerow(deferred_row)
+                        append_log(
+                            log_file,
+                            {
+                                "run_id": run_id,
+                                "timestamp": now_iso(),
+                                "mode": "semantic_repair",
+                                "stage": "deferred",
+                                "defer_policy": "preflight_risky_sample",
+                                "preflight": preflight,
+                                **deferred_row,
+                            },
+                        )
+                        print(
+                            f"[semantic_repair] file_hash={row.file_hash} -> deferred by preflight: {defer_reason}",
+                            flush=True,
+                        )
+                        deferred += 1
+                        continue
 
                 row_output_dir = log_base / "semantic_repair" / str(row.source) / str(row.file_hash)
                 row_output_dir.mkdir(parents=True, exist_ok=True)
@@ -2424,6 +2693,39 @@ def run_dataset_repair_loop(
                     f"[semantic_repair] file_hash={row.file_hash} -> {exc}; skipping sample",
                     flush=True,
                 )
+                if defer_timeout_no_improvement:
+                    deferred_row = _dataset_deferred_row(
+                        row,
+                        gt_pyc,
+                        derived_pyc,
+                        derived_source,
+                        defer_stage="timeout_no_improvement",
+                        defer_reason="sample timed out without combined-distance improvement",
+                        preflight=preflight,
+                        error_message=timeout_message,
+                        sample_timeout_seconds=sample_timeout_seconds,
+                        sample_hard_timeout_seconds=sample_hard_timeout_seconds,
+                        sample_timeout_min_improvement_delta=sample_timeout_min_improvement_delta,
+                    )
+                    deferred_writer.writerow(deferred_row)
+                    append_log(
+                        log_file,
+                        {
+                            "run_id": run_id,
+                            "timestamp": now_iso(),
+                            "mode": "semantic_repair",
+                            "stage": "deferred",
+                            "defer_policy": "timeout_no_improvement",
+                            "sample_hard_timeout_reached": hard_timeout_reached,
+                            "sample_timeout_policy": "defer_without_combined_distance_improvement",
+                            **deferred_row,
+                        },
+                    )
+                    deferred += 1
+                    timed_out += 1
+                    if hard_timeout_reached:
+                        hard_timed_out += 1
+                    continue
                 error_row = _dataset_error_row(row, gt_pyc, derived_pyc, derived_source, timeout_message)
                 writer.writerow(error_row)
                 append_log(
@@ -2464,16 +2766,25 @@ def run_dataset_repair_loop(
         "dataset_path": str(dataset_path),
         "output_dir": str(log_base),
         "results_csv": str(results_csv),
+        "deferred_csv": str(deferred_csv),
         "run_log": str(log_file),
         "run_id": run_id,
         "processed_rows": processed,
         "repaired_rows": repaired,
         "failed_rows": failed,
+        "deferred_rows": deferred,
         "timed_out_rows": timed_out,
         "hard_timed_out_rows": hard_timed_out,
         "sample_timeout_seconds": sample_timeout_seconds,
         "sample_hard_timeout_seconds": sample_hard_timeout_seconds,
         "sample_timeout_min_improvement_delta": sample_timeout_min_improvement_delta,
+        "defer_preflight_risky_samples": defer_preflight_risky_samples,
+        "defer_timeout_no_improvement": defer_timeout_no_improvement,
+        "process_easy_cases_first": process_easy_cases_first,
+        "preflight_max_repair_targets": preflight_max_repair_targets,
+        "preflight_max_initial_combined_distance": preflight_max_initial_combined_distance,
+        "preflight_allow_missing_targets": preflight_allow_missing_targets,
+        "preflight_allow_extra_targets": preflight_allow_extra_targets,
     }
 
 
@@ -2558,6 +2869,58 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--defer-preflight-risky-samples",
+        action="store_true",
+        help=(
+            "In dataset mode, write samples that fail the cheap bytecode-distance preflight to "
+            "semantic_repair_deferred_*.csv instead of processing them."
+        ),
+    )
+    parser.add_argument(
+        "--defer-timeout-no-improvement",
+        action="store_true",
+        help=(
+            "In dataset mode, write timeout-without-improvement samples to "
+            "semantic_repair_deferred_*.csv instead of the main results CSV."
+        ),
+    )
+    parser.add_argument(
+        "--process-easy-cases-first",
+        action="store_true",
+        help=(
+            "In dataset mode, compute cheap preflight metrics and process likely easy samples first "
+            "before larger or topology-mismatched samples."
+        ),
+    )
+    parser.add_argument(
+        "--preflight-max-repair-targets",
+        type=int,
+        default=SEMANTIC_REPAIR_PREFLIGHT_MAX_REPAIR_TARGETS,
+        help=(
+            "Maximum initial repair targets allowed by --defer-preflight-risky-samples. "
+            f"Defaults to {SEMANTIC_REPAIR_PREFLIGHT_MAX_REPAIR_TARGETS}."
+        ),
+    )
+    parser.add_argument(
+        "--preflight-max-initial-combined-distance",
+        type=int,
+        default=SEMANTIC_REPAIR_PREFLIGHT_MAX_INITIAL_COMBINED_DISTANCE,
+        help=(
+            "Maximum initial combined distance allowed by --defer-preflight-risky-samples. "
+            f"Defaults to {SEMANTIC_REPAIR_PREFLIGHT_MAX_INITIAL_COMBINED_DISTANCE}."
+        ),
+    )
+    parser.add_argument(
+        "--preflight-allow-missing-targets",
+        action="store_true",
+        help="Allow preflight samples with initial missing code-object targets.",
+    )
+    parser.add_argument(
+        "--preflight-allow-extra-targets",
+        action="store_true",
+        help="Allow preflight samples with initial extra derived code-object targets.",
+    )
+    parser.add_argument(
         "--json-out",
         type=Path,
         default=None,
@@ -2629,6 +2992,13 @@ def main() -> int:
             sample_timeout_seconds=args.sample_timeout_seconds,
             sample_hard_timeout_seconds=args.sample_hard_timeout_seconds,
             sample_timeout_min_improvement_delta=args.sample_timeout_min_improvement_delta,
+            defer_preflight_risky_samples=args.defer_preflight_risky_samples,
+            defer_timeout_no_improvement=args.defer_timeout_no_improvement,
+            process_easy_cases_first=args.process_easy_cases_first,
+            preflight_max_repair_targets=args.preflight_max_repair_targets,
+            preflight_max_initial_combined_distance=args.preflight_max_initial_combined_distance,
+            preflight_allow_missing_targets=args.preflight_allow_missing_targets,
+            preflight_allow_extra_targets=args.preflight_allow_extra_targets,
         )
     else:
         if args.gt_pyc is None or args.derived_pyc is None or args.derived_source is None:
