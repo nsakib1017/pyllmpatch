@@ -1,67 +1,103 @@
 # pyllmpatch
 
-`pyllmpatch` repairs Python decompiler output. It has two complementary repair
-pipelines:
+`pyllmpatch` repairs Python decompiler output with two pipelines:
 
-- A syntactic repair pipeline that turns uncompilable decompiled Python into a
-  compilable `.py`/`.pyc` pair.
-- A semantic repair pipeline that compares ground-truth and derived `.pyc`
-  files at the code-object level, edits localized source fragments, recompiles,
-  and keeps candidates that improve bytecode distance or PyLingual verification.
+- **Syntactic repair**: make uncompilable decompiled Python compile again.
+- **Semantic repair**: reduce bytecode drift between a ground-truth `.pyc` and
+  a derived `.pyc` by editing localized source fragments.
 
-The project is research-oriented: most commands operate against dataset rows
-identified by `file_hash`, `source`, `error_type`, bytecode paths, and derived
-source paths.
+The project is dataset-oriented. Most commands work from rows keyed by
+`file_hash`, `source`, `error_type`, bytecode paths, and derived source paths.
+Manual single-file semantic repair is also supported.
+
+## Contents
+
+- [Which Pipeline Should I Run?](#which-pipeline-should-i-run)
+- [Repository Layout](#repository-layout)
+- [Setup](#setup)
+- [Running](#running)
+- [Architecture](#architecture)
+- [Artifacts and Logs](#artifacts-and-logs)
+- [Tests](#tests)
+- [Development Notes](#development-notes)
+
+## Which Pipeline Should I Run?
+
+| Goal | Command | Repair unit | Main success signal |
+| --- | --- | --- | --- |
+| Make decompiled source compile | `syntactic-repair` | Error-localized source window or whole file | Python compiler accepts the output |
+| Validate semantic source reattachment with known-good fragments | `semantic-repair --fixer oracle` | Mapped code-object fragment | Combined bytecode distance improves |
+| Generate semantic fixes with an LLM | `semantic-repair --fixer llm` | Mapped code-object fragment, insertion, deletion, or module statement | Combined distance and optional PyLingual checks improve |
+| Run semantic repair over a dataset | `semantic-repair --dataset-mode` | One dataset row at a time | Result/deferred CSVs plus per-row `result.json` |
 
 ## Repository Layout
 
 ```text
-main.py                         CLI entry point for syntactic and semantic repair
+main.py                         CLI entry point
 pipeline/
   config.py                     Environment-backed runtime configuration
-  runner.py                     Dataset-level syntactic repair orchestration
+  runner.py                     Syntactic repair dataset runner
   repair_engine.py              Syntax prompt construction and LLM dispatch
-  code_object_repair_loop.py    Semantic repair CLI, dataset runner, fragment fixers
+  code_object_repair_loop.py    Semantic CLI, dataset runner, fragment fixers
   dataset.py                    Dataset filtering and previous-run selection
   logging_utils.py              JSONL logging and compile-failure cleanup
 model/
   loader.py                     Cached local model loading through Unsloth
   inference.py                  Local chat-template inference wrapper
 utils/
-  reattach_source_code_object.py Source mapping, source replacement, semantic loop core
-  pyc_code_object_distance.py   Code-object bytecode and CFG distance metrics
+  reattach_source_code_object.py Semantic repair core: mapping, reattachment, acceptance
+  pyc_code_object_distance.py   Instruction, CFG, unmatched-object distance metrics
   map_source_code_objects.py    AST source spans mapped to `.pyc` code objects
-  file_helpers.py               Dataset path resolution, syntax context windows
-  generate_bytecode.py          Version-aware Python compilation helpers
+  file_helpers.py               Dataset path resolution and syntax context windows
+  generate_bytecode.py          Version-aware Python compilation
   delete_only_compilation.py    Non-LLM syntax repair by deleting bad spans
   providers.py                  API and local LLM provider registry
   mine_semantic_repair_actions.py
-                                 Builds reusable action-pattern telemetry
+                                 Action-pattern mining from accepted repairs
 finetuning/                     Fine-tuning scripts for syntax and semantic repair data
 tools/                          Reporting and presentation helpers
-tests/                          Focused unit tests for semantic token limits and dataset flow
+tests/                          Focused unit tests for semantic orchestration
 ```
 
 ## Setup
 
-Create and activate a virtual environment, then install dependencies:
+### Prerequisites
+
+- Python with `venv`.
+- `uvx` or `pyenv` if you need to compile bytecode for Python versions other
+  than the interpreter running the command.
+- Provider credentials for API-backed LLM repair, or local model checkpoints for
+  local LLM repair.
+- A dataset and decompiled-file tree matching the path conventions described in
+  [Dataset and Path Resolution](#dataset-and-path-resolution).
+
+### Install
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-Create a local environment file:
-
-```bash
 cp .env.example .env
 ```
 
-At minimum, configure the project root, dataset, and decompiled-file roots:
+### Required Environment
+
+`pipeline/config.py` loads `.env` at import time. The dataset-backed commands
+need these values:
+
+| Variable | Used for |
+| --- | --- |
+| `PROJECT_ROOT_DIR` | Repository root. Dataset and telemetry files are resolved under this path. |
+| `ROOT_FOR_FILES` | Root directory containing decompiled file trees. |
+| `BASE_DIR_PYTHON_FILES_PYLINGUAL` | Subdirectory under `ROOT_FOR_FILES` for non-PyPi/PyLingual-style rows. |
+| `BASE_DIR_PYTHON_FILES_PYPI` | Subdirectory under `ROOT_FOR_FILES` for PyPi rows. |
+| `BASE_DATASET_NAME` | CSV filename resolved as `PROJECT_ROOT_DIR/dataset/<name>`. |
+| `MAX_EXAMPLE_RUNTIME_MIN` | Syntactic repair runtime guard used by `pipeline.runner`. |
+
+Example:
 
 ```dotenv
-PROJECT_ROOT_DIR=/absolute/path/to/this/repo
+PROJECT_ROOT_DIR=/absolute/path/to/pyllmpatch
 ROOT_FOR_FILES=/absolute/path/to/decompiled/file/root
 BASE_DIR_PYTHON_FILES_PYLINGUAL=pylingual
 BASE_DIR_PYTHON_FILES_PYPI=pypi
@@ -69,8 +105,7 @@ BASE_DATASET_NAME=your_dataset.csv
 MAX_EXAMPLE_RUNTIME_MIN=1
 ```
 
-LLM-backed repair also needs the provider key or local model paths implied by
-`utils/providers.py`:
+LLM-backed repair uses these when the selected provider requires them:
 
 ```dotenv
 OPENAI_API_KEY=
@@ -79,34 +114,34 @@ GEMINI_API_KEY=
 HUGGINGFACE_HUB_TOKEN=
 ```
 
-Compilation uses `utils/generate_bytecode.py`. Native compilation is used when
-the requested bytecode version matches the running interpreter. For Python
-3.8-3.14, the code tries `uvx --python <version>` first and falls back to
-`pyenv`; older or unavailable versions require `pyenv`.
+Local model paths are configured in `utils/providers.py` through
+`OPEN_LLM_MODELS`.
 
 ## Running
 
-Show the available commands:
+Show the command surface:
 
 ```bash
 python main.py --help
+python main.py syntactic-repair --help
+python main.py semantic-repair --help
 ```
 
 ### Syntactic Repair
 
-The default command runs the syntactic repair experiment:
+The default command runs the syntactic repair dataset experiment:
 
 ```bash
 python main.py
 ```
 
-That is equivalent to:
+Equivalent explicit command:
 
 ```bash
 python main.py syntactic-repair
 ```
 
-Useful filters:
+Filter by source or limit the selected rows:
 
 ```bash
 python main.py syntactic-repair --source PyPi --limit 25
@@ -118,8 +153,6 @@ Useful syntactic repair environment options:
 USE_LOCAL_LLM=True
 LOCAL_LLM_IDX=0
 NO_OF_MAX_RETRIES=0
-CONFIG_IDX_START=0
-CONFIG_IDX_RANGE=1
 MAX_WHOLE_FILE_BYTES=1048576
 ENABLE_SYNTAX_EXPLANATION=1
 ENABLE_WHOLE_FILE_REPAIR=1
@@ -130,22 +163,15 @@ DELETE_ONLY_BASE_WINDOW=1
 DELETE_ONLY_MAX_DELETED_RATIO=0.95
 ```
 
-Run without LLM calls by enabling delete-only mode:
+Run a non-LLM baseline by enabling delete-only mode:
 
 ```bash
-DELETE_ONLY_MODE=true python main.py syntactic-repair
-```
-
-Syntactic repair artifacts are written under:
-
-```text
-results/experiment_outputs/<timestamp>/<run_id>/
+DELETE_ONLY_MODE=true python main.py syntactic-repair --limit 10
 ```
 
 ### Semantic Repair
 
-Run semantic repair for one file by passing the ground-truth bytecode, derived
-bytecode, and derived source file:
+Run direct semantic repair for one case:
 
 ```bash
 python main.py semantic-repair \
@@ -156,9 +182,11 @@ python main.py semantic-repair \
   --json-out results/semantic_repair/manual_case/result.json
 ```
 
-By default, semantic repair uses the `oracle` fixer, which reads the
-ground-truth source fragment and is useful for validating the reattachment and
-acceptance loop. Use `--fixer llm` for generated fragment repair:
+By default, direct semantic repair uses `--fixer oracle`, which extracts the
+ground-truth source fragment. That is useful for validating mapping,
+reattachment, compilation, and acceptance mechanics.
+
+Use an LLM fixer for generated semantic fragments:
 
 ```bash
 python main.py semantic-repair \
@@ -170,7 +198,7 @@ python main.py semantic-repair \
   --llm-model gemini-2.5-flash-lite
 ```
 
-Run semantic repair over `semantic_error` rows in the configured dataset:
+Run semantic repair over dataset rows where `error_type == semantic_error`:
 
 ```bash
 python main.py semantic-repair --dataset-mode --limit 10
@@ -178,239 +206,193 @@ python main.py semantic-repair --dataset-mode --row-range 10:20
 python main.py semantic-repair --dataset-mode --source PyPi --file-hash <hash>
 ```
 
-Common semantic repair options:
+Common semantic repair controls:
 
 ```bash
 --dataset-path /path/to/dataset.csv
---row-range 10:20
---file-hash <hash>
+--max-iterations 2
 --skip-pylingual-verification
 --skip-step-verification
 --keep-non-improving
---max-iterations 2
 --sample-timeout-seconds 3600
 --sample-hard-timeout-seconds 10800
 --sample-timeout-min-improvement-delta 1
+--process-easy-cases-first
 --defer-preflight-risky-samples
 --defer-timeout-no-improvement
---process-easy-cases-first
 --output-dir /path/to/output_dir
---json-out /path/to/result.json
 ```
 
-Dataset-mode semantic repair checks each sample every 3600 seconds by default.
-If no combined-distance improvement has been made since the previous checkpoint,
-the sample is skipped or deferred. If the combined distance improved, the
-checkpoint is reset and the sample continues until the next checkpoint. The hard
-cap defaults to 10800 seconds. Set either timeout to `0` to disable it.
+Dataset-mode semantic repair has a progress-aware timeout policy. At each
+checkpoint, a sample continues only if combined bytecode distance improved by at
+least `--sample-timeout-min-improvement-delta`. The hard timeout keeps the best
+improving result or skips/deferred rows that never improved. Set either timeout
+to `0` to disable it.
 
-## Architectural Design
+## Architecture
 
-### High-Level Orchestration
+### Control Flow
 
-`main.py` is intentionally thin. It parses the command, imports the needed
-pipeline lazily, and dispatches to one of two orchestration layers:
+`main.py` is intentionally thin: it parses arguments, imports the relevant
+pipeline lazily, and dispatches.
 
 ```text
 main.py
-  syntactic-repair -> pipeline.config.load_runtime_config
-                   -> pipeline.runner.run_experiment
+  syntactic-repair
+    -> pipeline.config.load_runtime_config()
+    -> pipeline.runner.run_experiment()
+    -> pipeline.repair_engine.attempt_repair()
+    -> utils.generate_bytecode.compile_version()
 
-  semantic-repair  -> direct CodeObjectRepairLoop.run
-                   -> or pipeline.code_object_repair_loop.run_dataset_repair_loop
+  semantic-repair direct mode
+    -> pipeline.code_object_repair_loop.CodeObjectRepairLoop
+    -> utils.reattach_source_code_object.repair_mismatching_code_objects()
+
+  semantic-repair dataset mode
+    -> pipeline.code_object_repair_loop.run_dataset_repair_loop()
+    -> one CodeObjectRepairLoop per selected row
 ```
 
-The rest of the system is split by responsibility:
+The boundary between `pipeline` and `utils` is deliberate:
 
-- `pipeline/*` owns command-level orchestration, runtime configuration, dataset
-  filtering, and run output layout.
-- `utils/*` owns reusable mechanics: path resolution, bytecode compilation,
-  syntax context extraction, source/code-object mapping, distance metrics,
-  and source reattachment.
+- `pipeline/*` owns command orchestration, runtime options, dataset iteration,
+  provider selection, and run-directory layout.
+- `utils/*` owns reusable mechanics: path resolution, syntax localization,
+  bytecode compilation, source-to-code-object mapping, distance metrics, and
+  source reattachment.
 - `model/*` owns local model loading and inference.
-- `finetuning/*` and selected `utils/*` scripts build training, telemetry, and
-  prompt-refresh datasets from accepted repairs.
+- `finetuning/*` consumes accepted repair telemetry to train local models.
 
-### Configuration and Dataset Resolution
+### Dataset and Path Resolution
 
-`pipeline/config.py` loads `.env` at import time and exposes the project-wide
-paths used by both pipelines:
+Dataset-backed repair starts from a CSV row. The important columns are:
 
-- `PROJECT_ROOT_DIR` anchors dataset and telemetry files.
-- `ROOT_FOR_FILES`, `BASE_DIR_PYTHON_FILES_PYLINGUAL`, and
-  `BASE_DIR_PYTHON_FILES_PYPI` anchor decompiled file storage.
-- `BASE_DATASET_NAME` is resolved as
-  `PROJECT_ROOT_DIR / "dataset" / BASE_DATASET_NAME`.
-- `ACCEPTED_CODE_OBJECT_FILE` and `ACCEPTED_CODE_OBJECT_TELEMETRY_FILE` point to
-  JSONL stores of accepted semantic repairs.
+| Column | Meaning |
+| --- | --- |
+| `file_hash` | Stable key used to locate files under the configured roots. |
+| `source` | Chooses the expected file-tree layout, for example `PyPi`. |
+| `error_type` | Selects `syntactic_error` or `semantic_error` rows. |
+| `file_path` / `file` | Optional direct path/name used by syntactic repair. |
+| `bytecode_version` | Python version used for syntactic repair compilation. |
+| `error`, `error_message`, `error_description` | Compiler error context for syntax prompts and delete-only repair. |
 
-Dataset-backed commands expect rows with fields such as `file_hash`, `source`,
-`error_type`, `file_path`, `file`, `bytecode_version`, and compile-error
-metadata. The `utils/file_helpers.py` resolver handles the two currently
-supported storage layouts:
+`utils/file_helpers.py` resolves files from `file_hash` and `source`.
 
-- `source == "PyPi"`: original `.pyc` from `__pycache__`, derived source and
-  derived `.pyc` from `decompiled_output_pylingual`.
-- other sources: original top-level `.pyc`, derived `indented_*.py`, and derived
-  `indented_*.pyc` from `decompiler_output`.
+For `source == "PyPi"`:
 
-### Syntactic Repair Pipeline
+```text
+<BASE_DIR_PYTHON_FILES_PYPI>/<file_hash>/
+  __pycache__/*.cpython-310.pyc
+  decompiled_output_pylingual/
+    decompiled_*.py
+    __pycache__/decompiled_*.cpython-310.pyc
+```
 
-The syntactic path is optimized around compilation success.
-`pipeline.runner.run_experiment` performs the dataset-level workflow:
+For other sources:
 
-1. Load runtime config from `.env`.
-2. Read the base dataset, optionally subtract rows already present in a previous
-   run log, filter to `syntactic_error`, and apply `--source` / `--limit`.
-3. Shuffle the selected rows with a fixed seed.
-4. For each row, resolve the source file, bytecode version, decompiler name, and
-   output directory.
-5. Skip files over `MAX_WHOLE_FILE_BYTES`.
-6. Copy the input file into the run directory and repair only that copy.
-7. Compile the candidate with `utils.generate_bytecode.compile_version`.
-8. Append one JSONL record per sample to the run log.
+```text
+<BASE_DIR_PYTHON_FILES_PYLINGUAL>/<file_hash>/
+  *.pyc
+  decompiler_output/
+    indented_*.py
+    indented_*.pyc
+```
 
-There are two syntactic repair modes:
+### Syntactic Repair Design
 
-#### Delete-only mode
+The syntactic pipeline is a compile-and-retry loop around a copied input file.
+Original inputs are not mutated.
 
-When `DELETE_ONLY_MODE=true`, no LLM is called. The runner sends the copied file
-to `utils.delete_only_compilation.delete_lines_until_compilable_with_oracle`.
-That utility repeatedly uses the current compiler error to propose small source
-deletions, recompiles after each deletion, and stops when the file compiles or
-when deletion guards are reached.
+```text
+dataset row
+  -> resolve source file and bytecode version
+  -> copy source into run directory
+  -> choose repair mode
+     -> delete-only repair
+     -> or LLM repair of syntax-localized fragment / whole file
+  -> compile candidate with the requested Python version
+  -> retry with the new compiler error or write final artifact
+  -> append JSONL run record
+```
 
-This mode is useful as a non-LLM baseline and as a fallback when LLM repair
-exhausts its retry budget.
+The LLM path localizes syntax errors before prompting. `file_helpers` classifies
+the compiler message as delimiter, indentation, numeric, or generic, then tries
+line, block, or delimiter windows with bounded expansion. The selected snippet
+is dedented for the model and reattached with indentation alignment after the
+model returns code.
 
-#### LLM mode
+The delete-only path uses `utils.delete_only_compilation` to repeatedly remove
+small candidate spans guided by the latest compiler error. It can be used as the
+primary mode with `DELETE_ONLY_MODE=true`, or as a fallback after LLM retries
+with `ENABLE_DELETE_ONLY_FALLBACK=true`.
 
-When delete-only mode is disabled, the runner selects an LLM config through
-`pipeline.runner.select_llm`:
+### Semantic Repair Design
 
-- `USE_LOCAL_LLM=True` selects from `utils.providers.OPEN_LLM_MODELS`.
-- `USE_LOCAL_LLM=False` selects from `utils.providers.LLM_MODELS`.
-- `LOCAL_LLM_IDX` chooses the entry, with index `0` as fallback.
-
-`pipeline.repair_engine.attempt_repair` then tries one or more strategies:
-
-- `syntax_context`: localize a fragment around the compiler error using
-  `utils.file_helpers.segment_syntax_context`.
-- `whole_file`: optionally repair the full file on late retries when
-  `ENABLE_WHOLE_FILE_REPAIR=1`.
-
-Syntax context selection is error-aware. `file_helpers` classifies delimiter,
-indentation, numeric, and generic syntax errors, then tries line, block, or
-delimiter windows with controlled expansion. The selected fragment is
-dedented before prompting, and the returned replacement is reindented and
-reattached with `align_indentation` and `reattach_block`.
-
-For local LLMs, `repair_engine` can make a preliminary root-cause explanation
-call when `ENABLE_SYNTAX_EXPLANATION=1`, then uses that explanation in the
-repair prompt. API-backed models use the provider dispatch in
-`utils.providers.make_llm_call`.
-
-After every repair attempt, the runner recompiles the full copied source. Failed
-attempts update the current error message and retry until the configured limit
-or runtime guard is reached. If `ENABLE_DELETE_ONLY_FALLBACK=true`, the final
-LLM candidate is sent through the delete-only compiler loop before the sample is
-marked failed.
-
-### Semantic Repair Pipeline
-
-The semantic path is optimized around reducing bytecode drift between a
-ground-truth `.pyc` and a derived `.pyc`.
-
-There are two entry shapes:
-
-- Direct mode: `main.py semantic-repair <gt_pyc> <derived_pyc> <derived_source>`.
-- Dataset mode: `run_dataset_repair_loop` reads `semantic_error` rows, resolves
-  paths from `file_hash` and `source`, and runs one repair loop per row.
-
-At the center is `pipeline.code_object_repair_loop.CodeObjectRepairLoop`. It is
-a small adapter around `utils.reattach_source_code_object.repair_mismatching_code_objects`.
-The adapter supplies a `fragment_fixer` callback and collects LLM prompt/call
-records when the fixer supports them.
-
-The semantic loop follows this feedback cycle:
+Semantic repair operates on code objects rather than whole files. Each accepted
+step creates a new source file and `.pyc`; subsequent targets are recomputed
+against that current state.
 
 ```text
 ground-truth .pyc + derived .pyc + derived source
-  -> compare code-object distances
-  -> select repair targets
+  -> compare code-object distance
+  -> select mismatched, missing, extra, and module targets
   -> map target qualname back to source span
-  -> build repair context from metadata, bytecode windows, PyLingual failures,
-     rejected attempts, and prior accepted repairs
-  -> generate one or more candidate source fragments
-  -> normalize and reattach candidate into the source file
-  -> compile to a new .pyc
+  -> generate candidate fragment(s)
+  -> normalize and reattach source
+  -> compile candidate .pyc
   -> recompute distance and optionally run PyLingual verification
-  -> accept only improving candidates unless --keep-non-improving is set
-  -> repeat over newly computed targets up to --max-iterations
+  -> accept improving candidates
+  -> repeat until no targets remain or max iterations is reached
 ```
 
-#### Code-object distance and target selection
+The core loop lives in
+`utils.reattach_source_code_object.repair_mismatching_code_objects`. The
+`pipeline.code_object_repair_loop.CodeObjectRepairLoop` wrapper supplies a
+pluggable fragment fixer and captures LLM call records.
 
-`utils.pyc_code_object_distance.py` loads `.pyc` files through PyLingual bytecode
-utilities and computes:
+#### Distance and Target Selection
+
+`utils.pyc_code_object_distance.py` loads editable bytecode through the local
+PyLingual checkout and computes:
 
 - instruction edit distance,
 - control-flow distance from basic-block graphs,
-- unmatched-code-object penalties,
-- a combined distance used for ranking and timeout progress.
+- penalties for missing or extra code objects,
+- a combined distance used for candidate ranking and timeout progress.
 
-`utils.reattach_source_code_object.py` consumes those rows to select target
-sets:
+`utils.reattach_source_code_object` uses those rows to select:
 
-- mismatched existing code objects,
-- missing code objects,
-- extra derived code objects,
+- mismatched existing code-object fragments,
+- missing code objects that may need insertion,
+- extra derived code objects that may need deletion,
 - module-level mismatches,
-- expression-child mismatches that can sometimes be repaired by editing the
-  parent code object.
+- expression-child mismatches where the parent may be the practical repair
+  target.
 
-Targets are recomputed after accepted steps, so later repairs operate on the
-current best source and bytecode rather than the original derived file.
+#### Source Mapping and Reattachment
 
-#### Source mapping and reattachment
+`utils.map_source_code_objects.py` maps AST source spans to `.pyc` code objects
+using qualname, line evidence, occurrence index, sibling ordinal, and ordinal
+path. Semantic repair uses that mapping differently for each operation:
 
-Semantic repair needs to edit a precise source span without corrupting the rest
-of the file. `utils.map_source_code_objects.py` collects source code objects
-from the AST and code objects from the `.pyc`, then maps them by qualname,
-line-number evidence, occurrence index, sibling ordinal, and ordinal path.
+| Operation | Behavior |
+| --- | --- |
+| `repair_source_fragment` | Extract mapped source, replace it with a normalized candidate, then validate structure. |
+| `insert_missing` | Find nearest mapped parent and insert a normalized function, async function, or class fragment. |
+| `delete_extra` | Delete a safely mapped function/class span, falling back to `pass` when needed. |
+| `repair_module_statement` | Use PyLingual failure context to localize one top-level statement; full-file module rewrites are avoided. |
 
-For existing targets, `extract_source_segment` reads the mapped span and
-`choose_best_reattachment` normalizes candidate indentation before replacing
-the span. The loop also validates that reattaching a candidate does not damage
-the surrounding code-object structure.
+#### Fragment Fixers
 
-For missing targets, `insert_missing_source_segment` finds the nearest existing
-parent and inserts a normalized function, async function, or class fragment.
-Unsupported missing statement kinds are logged as rejected steps.
+Semantic candidates come from a `FragmentFixer`:
 
-For extra targets, the loop deletes safely mapped function/class spans. If
-plain deletion breaks syntax, it falls back to replacing the span with a `pass`
-block when that is structurally valid.
+- `OracleFragmentFixer` extracts the matching ground-truth source fragment. Use
+  it to validate the non-LLM mechanics.
+- `LLMFragmentFixer` builds bytecode-aware prompts and asks an API or local
+  model to return replacement fragments.
 
-For module-level repair, full-file rewriting is intentionally avoided. The loop
-uses PyLingual failure context to find a failed line, localizes that line to a
-top-level statement, and asks the fixer to repair only that statement.
-
-#### Fragment fixers
-
-Semantic repair is pluggable through the `FragmentFixer` interface:
-
-- `OracleFragmentFixer` extracts the corresponding source fragment from the
-  ground-truth source. This is used to validate mapping, reattachment,
-  compilation, and acceptance mechanics.
-- `LLMFragmentFixer` builds compact bytecode-aware prompts and asks an API or
-  local model for candidate fragments.
-
-The LLM fixer records every prompt under the row output directory, tracks token
-counts, and skips provider calls before dispatch when the prompt exceeds the
-configured token threshold. For normal existing-code-object repairs it can
-generate multiple candidates in one semantic step, each with a different
-strategy:
+For normal existing-fragment repairs, `LLMFragmentFixer` can generate multiple
+candidates with different strategies:
 
 - retrieval-guided,
 - control-flow residual,
@@ -418,59 +400,58 @@ strategy:
 - metadata/literal/name residual,
 - conservative minimal delta.
 
-Duplicate candidates are detected by both text hash and AST structural hash.
-Rejected attempts are summarized into future prompts so repeated candidate
-shapes are discouraged.
+Candidates are deduplicated by text hash and AST structural hash. Rejected
+attempts are summarized back into later prompts so repeated candidate shapes are
+discouraged.
 
-#### Semantic prompt inputs
+#### Prompt Inputs
 
-`LLMFragmentFixer` composes prompts from several evidence sources:
+Semantic prompts combine:
 
-- code-object metadata deltas such as names, constants, variables, argument
-  shape, and flags,
-- localized instruction diffs and fallback instruction windows,
-- source line numbers and an indentation contract,
-- PyLingual failure offsets and failed line numbers,
-- rejected candidate history for the same target,
+- source fragment with line-number display,
+- indentation and return contracts,
+- compact ground-truth and derived code-object metadata,
+- localized instruction diffs or fallback bytecode windows,
+- PyLingual failed offset and failed line information,
+- rejected-attempt feedback,
 - accepted-case telemetry from `ACCEPTED_CODE_OBJECT_TELEMETRY_FILE`,
 - mined action patterns from
   `results/semantic_repair_action_patterns/semantic_repair_action_patterns.jsonl`.
 
-This design keeps the editable surface small while giving the model enough
-bytecode evidence to prefer minimal semantic edits over broad rewrites.
+Before any provider call, the prompt is token-counted with provider/model
+settings. Oversized prompts are skipped and logged without calling the provider.
 
-#### Acceptance and verification
+### LLM Provider Boundary
 
-Every semantic candidate is evaluated by compiling the updated source and
-recomputing code-object distance. When PyLingual verification is enabled, the
-loop also runs PyLingual equality checks after each step and at finalization.
+All model selection is centralized in `utils/providers.py`.
 
-Candidates are accepted when they improve the measured state according to the
-current summary and verification results. Rejected candidates are retained in
-the step log with their replacement text, score deltas, prompt metadata, parse
-status, structural validation status, and rejection reason. Passing
-`--keep-non-improving` disables this acceptance filter and keeps generated
-candidates for analysis.
+| Config | Meaning |
+| --- | --- |
+| `LLM_MODELS` | API-backed OpenAI, DeepSeek, and Google models. |
+| `OPEN_LLM_MODELS` | Local checkpoint configs with model and tokenizer paths. |
+| `find_llm_config(provider, model)` | Validates CLI provider/model selections. |
+| `make_llm_call_from_config(...)` | Dispatches to API clients or local inference. |
 
-Accepted semantic steps are appended to the configured accepted-code-object
-JSONL stores. Those records are later used by prompt-refresh, action-pattern
-mining, and fine-tuning scripts.
+Local inference goes through `model.inference.call_llm_with_message`, which uses
+`model.loader.load_model_once` to cache model/tokenizer pairs. Local paths are
+validated before load so a typo does not silently fall back to downloading from
+the Hugging Face Hub.
 
-#### Dataset-mode controls
+## Artifacts and Logs
 
-`run_dataset_repair_loop` adds operational controls around the per-file loop:
+Syntactic repair writes under:
 
-- `--process-easy-cases-first` preflights all selected rows with initial
-  distance metrics and sorts lower-risk rows first.
-- `--defer-preflight-risky-samples` sends rows with too many initial targets,
-  high combined distance, missing targets, or extra targets to
-  `semantic_repair_deferred_*.csv`.
-- `--defer-timeout-no-improvement` records stalled rows in the deferred CSV
-  instead of the main result CSV.
-- timeout checkpoints stop rows that have made no distance progress and keep
-  the best result for rows that improved before the hard cap.
+```text
+results/experiment_outputs/<timestamp>/<run_id>/
+  run_log_<run_id>_<dataset>.jsonl
+  <decompiler>/<dataset>/<bytecode_version>/<file_hash>/
+    syntax_repaired_*.py
+    syntax_repaired_*.pyc
+    syntax_failed_repaired_*.py
+    delete_only_*.jsonl
+```
 
-Dataset-mode output includes:
+Semantic dataset mode writes under the selected output directory:
 
 ```text
 <output-dir>/
@@ -485,57 +466,40 @@ Dataset-mode output includes:
     step<N>_<source_stem>.py
 ```
 
-### LLM Provider Boundary
+Accepted semantic steps are also appended to the configured dataset JSONL files:
 
-All provider configuration lives in `utils/providers.py`.
+```text
+dataset/<ACCEPTED_CODE_OBJECT_FILE>
+dataset/<ACCEPTED_CODE_OBJECT_TELEMETRY_FILE>
+```
 
-- `LLM_MODELS` contains API-backed OpenAI, DeepSeek, and Google model configs.
-- `OPEN_LLM_MODELS` contains local checkpoint configs and tokenizer paths.
-- `find_llm_config(provider, model)` validates command-line selections.
-- `make_llm_call_from_config` dispatches to an API client or to
-  `model.inference.call_llm_with_message`.
-
-Local inference is loaded through `model.loader.load_model_once`, which caches
-model/tokenizer pairs for the process and refuses to silently fall back to the
-Hugging Face Hub when a configured local path is missing.
-
-### Logging and Artifacts
-
-Syntactic repair writes one compact JSONL record per sample plus repaired or
-failed source artifacts in the run tree.
-
-Semantic repair writes richer per-row artifacts:
-
-- `result.json` with initial/final summaries, steps, targets, final source,
-  final `.pyc`, PyLingual verification, and LLM calls,
-- prompt JSON files for LLM semantic candidates,
-- `.pyfrag` files for accepted or selected candidate fragments,
-- accepted-code-object JSONL records for downstream mining and fine-tuning,
-- result and deferred CSVs in dataset mode.
-
-The system favors append-only run records. It does not mutate the original
-dataset files or original decompiled inputs; all repair attempts are made in
-run-specific output directories.
+These accepted records feed action-pattern mining, prompt-refresh datasets, and
+fine-tuning scripts.
 
 ## Tests
 
-Run the current unit test suite:
+Run the suite:
 
 ```bash
 python -m pytest
 ```
 
-The existing tests focus on semantic token-limit behavior, timeout/improvement
-logic, and dataset-mode preflight/defer orchestration.
+Run the focused semantic orchestration tests:
+
+```bash
+python -m pytest tests/test_semantic_token_limits.py -q
+```
 
 ## Development Notes
 
-- Prefer adding new runtime flags in `pipeline/config.py` or the relevant
-  `main.py` subparser, then thread them through the orchestration layer.
-- Add a new semantic repair backend by implementing `FragmentFixer` or
+- Add CLI flags in `main.py`, then thread them through the relevant pipeline
+  layer rather than reading new environment variables deep in utility code.
+- Add semantic repair backends by implementing `FragmentFixer` or
   `generate_candidates` in `pipeline/code_object_repair_loop.py`.
-- Keep source edits localized. The semantic loop assumes candidate fragments can
-  be normalized, reattached, compiled, and scored independently.
-- When changing prompt shape, update prompt telemetry consumers such as
-  `utils/rebuild_semantic_prompt_refresh_dataset.py` and action-pattern mining
-  scripts if their reconstruction inputs change.
+- Keep semantic edits localized. The acceptance loop assumes a candidate can be
+  reattached, compiled, and scored as a small source change.
+- When changing semantic prompt shape, check consumers that reconstruct or mine
+  prompts, especially `utils/rebuild_semantic_prompt_refresh_dataset.py` and
+  `utils/mine_semantic_repair_actions.py`.
+- Avoid mutating original decompiled inputs. Repair attempts should stay inside
+  run-specific output directories.
