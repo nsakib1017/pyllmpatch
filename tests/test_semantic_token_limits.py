@@ -11,7 +11,13 @@ from unittest.mock import patch
 from finetuning.model_finetuner_qwen_codeobject_semantic import filter_samples_by_token_budget
 from pipeline import code_object_repair_loop
 from pipeline.code_object_repair_loop import LLMFragmentFixer
-from utils.reattach_source_code_object import _combined_distance_improved
+from utils.reattach_source_code_object import (
+    ReattachError,
+    _combined_distance_improved,
+    compile_source_to_pyc,
+    infer_semantic_repair_python_version,
+)
+from utils.version import PythonVersion
 
 
 class CodeObj:
@@ -102,6 +108,26 @@ class SemanticTokenLimitTest(unittest.TestCase):
         self.assertFalse(_combined_distance_improved({"combined_distance": 10}, {"combined_distance": 11}))
         self.assertTrue(_combined_distance_improved({"combined_distance": 10}, {"combined_distance": 8}, min_delta=2))
         self.assertFalse(_combined_distance_improved({"combined_distance": 10}, {"combined_distance": 9}, min_delta=2))
+
+    def test_compile_source_to_pyc_uses_target_python_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "sample.py"
+            source.write_text("value = 1\n", encoding="utf-8")
+
+            with patch("utils.reattach_source_code_object.compile_version") as mocked_compile:
+                output_pyc = compile_source_to_pyc(source, None, PythonVersion((3, 14)))
+
+            self.assertEqual(output_pyc.name, "sample.cpython-314.pyc")
+            mocked_compile.assert_called_once()
+            self.assertEqual(mocked_compile.call_args.args[2], (3, 14))
+
+    def test_infer_semantic_repair_python_version_rejects_mismatched_pyc_versions(self) -> None:
+        with patch(
+            "utils.reattach_source_code_object._pyc_python_version",
+            side_effect=[PythonVersion((3, 14)), PythonVersion((3, 13))],
+        ):
+            with self.assertRaises(ReattachError):
+                infer_semantic_repair_python_version(Path("gt.pyc"), Path("derived.pyc"))
 
     def test_dataset_loop_defers_preflight_risky_rows_and_processes_easy_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

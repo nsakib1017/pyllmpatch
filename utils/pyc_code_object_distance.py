@@ -42,6 +42,7 @@ def _load_bytecode_dependencies():
         fix_unreachable,
         remove_extended_arg,
         remove_nop,
+        replace_borrow,
         replace_firstlno,
     )
     from pylingual.editable_bytecode.control_flow_graph import bytecode_to_control_flow_graph
@@ -56,7 +57,15 @@ def _load_bytecode_dependencies():
         "bytecode_to_control_flow_graph": bytecode_to_control_flow_graph,
         "is_control_flow_equivalent": is_control_flow_equivalent,
         "matching_iter": matching_iter,
-        "patches": [remove_extended_arg, remove_nop, fix_indirect_jump, fix_unreachable, remove_extended_arg, replace_firstlno],
+        "patches": [
+            remove_extended_arg,
+            remove_nop,
+            fix_indirect_jump,
+            fix_unreachable,
+            remove_extended_arg,
+            replace_firstlno,
+            replace_borrow,
+        ],
     }
 
 

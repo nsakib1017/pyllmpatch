@@ -7,6 +7,7 @@ import platform
 import os
 import re
 import shutil
+from pathlib import Path
 
 from utils.version import PythonVersion
 
@@ -34,12 +35,19 @@ def _compile_uv(py_file: str, out_file: str, version: PythonVersion):
     # print(f"Compiling {py_file} to {out_file} using uv with Python {version.as_str()}")
     compile_cmd = f"import py_compile, sys; assert sys.version_info[:2] == {version.as_tuple()!r}; py_compile.compile({py_file!r}, cfile={out_file!r})"
 
-    cmd = ["uvx", "--python", version.as_str(), "python", "-c", compile_cmd]
+    cmd = ["uvx", "--no-config", "--python", version.as_str(), "python", "-c", compile_cmd]
 
-    output = subprocess.run(cmd, shell=False, capture_output=True, text=True, env={**os.environ, "PYTHONWARNINGS": "ignore"})
+    env = {
+        **os.environ,
+        "PYTHONWARNINGS": "ignore",
+        "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str((Path("/tmp") / "uv-cache").resolve())),
+        "UV_TOOL_DIR": os.environ.get("UV_TOOL_DIR", str((Path("/tmp") / "uv-tools").resolve())),
+    }
+    output = subprocess.run(cmd, shell=False, capture_output=True, text=True, env=env)
 
     # Ignore stderr messages from uv downloading versions on demand
-    stderr = re.sub(r'Downloading .+\n', '', output.stderr)
+    stderr = re.sub(r"\s*Download(ing|ed)\s.+\n", "", output.stderr)
+    stderr = re.sub(r"\s*Bytecode compiled \d+ files? in \d+ms\n", "", stderr)
     if stderr:
         raise CompileError(stderr)
 

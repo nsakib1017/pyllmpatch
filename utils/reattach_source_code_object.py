@@ -31,6 +31,7 @@ from utils.pyc_code_object_distance import (
     summarize_results,
     validate_input,
 )
+from utils.version import PythonVersion
 
 class ReattachError(RuntimeError):
     pass
@@ -61,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Locate a mapped source code object, optionally replace its source span, "
-            "compile with Python 3.10, and optionally compare the resulting .pyc."
+            "compile with the input .pyc Python version, and optionally compare the resulting .pyc."
         )
     )
     parser.add_argument("source_path", type=Path, help="Path to the source .py file")
@@ -1362,12 +1363,46 @@ def insert_missing_source_segment(
     return "\n".join(updated_lines) + "\n", parent_qualname, base_indent
 
 
-def compile_source_to_pyc(source_path: Path, output_pyc: Path | None) -> Path:
+def _coerce_python_version(version: Any) -> PythonVersion:
+    if isinstance(version, PythonVersion):
+        return version
+    if hasattr(version, "as_tuple"):
+        version = version.as_tuple()
+    return PythonVersion(version)
+
+
+def _python_version_tag(version: Any) -> str:
+    python_version = _coerce_python_version(version)
+    return f"{python_version.major}{python_version.minor}"
+
+
+def _compiled_pyc_path(pyc_dir: Path, source_path: Path, version: Any) -> Path:
+    return pyc_dir / f"{source_path.stem}.cpython-{_python_version_tag(version)}.pyc"
+
+
+def _pyc_python_version(pyc_path: Path) -> PythonVersion:
+    bytecode_root = load_editable_bytecode_from_pyc(validate_input(pyc_path))
+    return _coerce_python_version(bytecode_root.version)
+
+
+def infer_semantic_repair_python_version(gt_pyc: Path, derived_pyc: Path) -> PythonVersion:
+    gt_version = _pyc_python_version(gt_pyc)
+    derived_version = _pyc_python_version(derived_pyc)
+    if gt_version != derived_version:
+        raise ReattachError(
+            "Semantic repair requires matching ground-truth and derived Python bytecode versions: "
+            f"gt={gt_version}, derived={derived_version}"
+        )
+    return gt_version
+
+
+def compile_source_to_pyc(source_path: Path, output_pyc: Path | None, version: Any = (3, 10)) -> Path:
+    python_version = _coerce_python_version(version)
     source_path = source_path.expanduser().resolve()
     if output_pyc is None:
         pycache_dir = source_path.parent / "__pycache__"
         pycache_dir.mkdir(parents=True, exist_ok=True)
-        output_pyc = pycache_dir / f"{source_path.stem}.cpython-310.pyc"
+        output_pyc = _compiled_pyc_path(pycache_dir, source_path, python_version)
     output_pyc = output_pyc.expanduser().resolve()
     output_pyc.parent.mkdir(parents=True, exist_ok=True)
     prior_uv_cache_dir = os.environ.get("UV_CACHE_DIR")
@@ -1375,9 +1410,9 @@ def compile_source_to_pyc(source_path: Path, output_pyc: Path | None) -> Path:
     try:
         source_text = source_path.read_text(encoding="utf-8")
         ast.parse(source_text, filename=str(source_path))
-        compile_version(source_path, output_pyc, (3, 10))
+        compile_version(source_path, output_pyc, python_version.as_tuple())
     except CompileError as exc:
-        raise ReattachError(f"Python 3.10 compilation failed:\n{exc}") from exc
+        raise ReattachError(f"Python {python_version} compilation failed:\n{exc}") from exc
     except SyntaxError as exc:
         raise ReattachError(f"Python source parsing failed:\n{exc}") from exc
     finally:
@@ -2796,6 +2831,7 @@ def _apply_module_statement_candidate(
     derived_source_stem: str,
     step_index: int,
     iteration: int,
+    target_version: PythonVersion,
     verify_with_pylingual: bool,
     verify_each_step_with_pylingual: bool,
     reject_non_improving_candidates: bool,
@@ -2820,8 +2856,8 @@ def _apply_module_statement_candidate(
 
     next_source = output_dir / f"step{step_index}_{derived_source_stem}.py"
     next_source.write_text(updated_text, encoding="utf-8")
-    next_pyc = pyc_dir / f"{next_source.stem}.cpython-310.pyc"
-    compile_source_to_pyc(next_source, next_pyc)
+    next_pyc = _compiled_pyc_path(pyc_dir, next_source, target_version)
+    compile_source_to_pyc(next_source, next_pyc, target_version)
 
     step_rows = compare_code_object_distances(gt_pyc, next_pyc)
     step_summary = summarize_results(step_rows)
@@ -2901,6 +2937,7 @@ def repair_mismatching_code_objects(
 ) -> dict:
     gt_pyc = validate_input(gt_pyc)
     derived_pyc = validate_input(derived_pyc)
+    target_version = infer_semantic_repair_python_version(gt_pyc, derived_pyc)
     derived_source = derived_source.expanduser().resolve()
     gt_source = gt_source.expanduser().resolve() if gt_source is not None else None
     gt_source_text: str | None = None
@@ -3294,6 +3331,7 @@ def repair_mismatching_code_objects(
                         derived_source_stem=derived_source.stem,
                         step_index=step_index,
                         iteration=iteration,
+                        target_version=target_version,
                         verify_with_pylingual=verify_with_pylingual,
                         verify_each_step_with_pylingual=verify_each_step_with_pylingual,
                         reject_non_improving_candidates=reject_non_improving_candidates,
@@ -3449,8 +3487,8 @@ def repair_mismatching_code_objects(
                     candidate_updated_text = candidate_reattachment.updated_source
                     candidate_source = output_dir / f"step{step_index}_cand{candidate_index}_{derived_source.stem}.py"
                     candidate_source.write_text(candidate_updated_text, encoding="utf-8")
-                    candidate_pyc = pyc_dir / f"{candidate_source.stem}.cpython-310.pyc"
-                    compile_source_to_pyc(candidate_source, candidate_pyc)
+                    candidate_pyc = _compiled_pyc_path(pyc_dir, candidate_source, target_version)
+                    compile_source_to_pyc(candidate_source, candidate_pyc, target_version)
                     structure_ok, structure_reason = _validate_reattached_code_object_structure(
                         previous_pyc=current_pyc,
                         candidate_pyc=candidate_pyc,
@@ -3686,14 +3724,14 @@ def repair_mismatching_code_objects(
             fragment_path.write_text("", encoding="utf-8")
 
             next_source = output_dir / f"step{step_index}_{derived_source.stem}.py"
-            next_pyc = pyc_dir / f"{next_source.stem}.cpython-310.pyc"
+            next_pyc = _compiled_pyc_path(pyc_dir, next_source, target_version)
             compile_error: str | None = None
             deletion_strategy = "remove_source_span"
             replacement_text = ""
             updated_text = replace_source_segment(current_text, target_row, replacement_text)
             next_source.write_text(updated_text, encoding="utf-8")
             try:
-                compile_source_to_pyc(next_source, next_pyc)
+                compile_source_to_pyc(next_source, next_pyc, target_version)
             except ReattachError as exc:
                 compile_error = str(exc)
                 deletion_strategy = "replace_source_span_with_pass"
@@ -3701,7 +3739,7 @@ def repair_mismatching_code_objects(
                 updated_text = replace_source_segment(current_text, target_row, replacement_text)
                 next_source.write_text(updated_text, encoding="utf-8")
                 try:
-                    compile_source_to_pyc(next_source, next_pyc)
+                    compile_source_to_pyc(next_source, next_pyc, target_version)
                     compile_error = None
                     fragment_path.write_text(replacement_text, encoding="utf-8")
                 except ReattachError as fallback_exc:
@@ -3949,8 +3987,8 @@ def repair_mismatching_code_objects(
 
             next_source = output_dir / f"step{step_index}_{derived_source.stem}.py"
             next_source.write_text(updated_text, encoding="utf-8")
-            next_pyc = pyc_dir / f"{next_source.stem}.cpython-310.pyc"
-            compile_source_to_pyc(next_source, next_pyc)
+            next_pyc = _compiled_pyc_path(pyc_dir, next_source, target_version)
+            compile_source_to_pyc(next_source, next_pyc, target_version)
 
             step_rows = compare_code_object_distances(gt_pyc, next_pyc)
             step_summary = summarize_results(step_rows)
@@ -4048,6 +4086,7 @@ def repair_mismatching_code_objects(
         "gt_pyc": str(gt_pyc),
         "derived_source": str(derived_source),
         "derived_pyc": str(derived_pyc),
+        "target_python_version": target_version.as_str(),
         "repair_targets": all_repair_targets,
         "initial_missing_targets": initial_missing_targets,
         "final_missing_targets": final_missing_targets,
@@ -4126,8 +4165,9 @@ def main() -> int:
     output_source.write_text(updated_text, encoding="utf-8")
     print(f"\nUpdated source written to: {output_source}")
 
-    compiled_pyc = compile_source_to_pyc(output_source, args.output_pyc)
-    print(f"Compiled Python 3.10 .pyc: {compiled_pyc}")
+    target_version = _pyc_python_version(pyc_path)
+    compiled_pyc = compile_source_to_pyc(output_source, args.output_pyc, target_version)
+    print(f"Compiled Python {target_version} .pyc: {compiled_pyc}")
 
     if args.compare_pyc is not None:
         summary = run_comparison(compiled_pyc, args.compare_pyc.expanduser().resolve())
