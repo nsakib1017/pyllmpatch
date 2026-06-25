@@ -2343,6 +2343,48 @@ def _dataset_row_key(row) -> tuple[str, str]:
     return str(row.source), str(row.file_hash)
 
 
+def _dataset_cell(row, name: str) -> str | None:
+    if not hasattr(row, name):
+        return None
+    value = getattr(row, name)
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:
+        pass
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return None
+    return text
+
+
+def _dataset_path_cell(row, name: str, base_dir: Path) -> Path | None:
+    value = _dataset_cell(row, name)
+    if value is None:
+        return None
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = base_dir / path
+    return path.resolve()
+
+
+def _resolve_dataset_repair_paths(row, dataset_base_dir: Path) -> tuple[Path | None, Path | None, Path | None, Path | None]:
+    gt_pyc = _dataset_path_cell(row, "gt_pyc", dataset_base_dir)
+    derived_pyc = _dataset_path_cell(row, "derived_pyc", dataset_base_dir)
+    derived_source = _dataset_path_cell(row, "derived_source", dataset_base_dir)
+    if gt_pyc is not None and derived_pyc is not None and derived_source is not None:
+        gt_source = _dataset_path_cell(row, "gt_source", dataset_base_dir)
+        if gt_source is None:
+            gt_source = fetch_pyllmpatch_source_path(row.file_hash, row.source)
+        return gt_source, gt_pyc, derived_pyc, derived_source
+
+    gt_source = fetch_pyllmpatch_source_path(row.file_hash, row.source)
+    gt_pyc, derived_pyc, derived_source = fetch_pyllmpatch_repair_paths(row.file_hash, row.source)
+    return gt_source, gt_pyc, derived_pyc, derived_source
+
+
 def _preflight_easy_sort_key(preflight: dict[str, Any] | None) -> tuple[int, int, int, int]:
     if not preflight:
         return (1, 1_000_000, 1_000_000_000, 1_000_000)
@@ -2513,9 +2555,8 @@ def run_dataset_repair_loop(
         for preflight_index, row in enumerate(row_items, start=1):
             plan: dict[str, Any] = {}
             try:
-                planned_gt_source = fetch_pyllmpatch_source_path(row.file_hash, row.source)
-                planned_gt_pyc, planned_derived_pyc, planned_derived_source = fetch_pyllmpatch_repair_paths(
-                    row.file_hash, row.source
+                planned_gt_source, planned_gt_pyc, planned_derived_pyc, planned_derived_source = (
+                    _resolve_dataset_repair_paths(row, dataset_path.parent)
                 )
                 plan.update(
                     {
@@ -2577,8 +2618,10 @@ def run_dataset_repair_loop(
                 derived_pyc = plan.get("derived_pyc")
                 derived_source = plan.get("derived_source")
                 if not plan:
-                    gt_source = fetch_pyllmpatch_source_path(row.file_hash, row.source)
-                    gt_pyc, derived_pyc, derived_source = fetch_pyllmpatch_repair_paths(row.file_hash, row.source)
+                    gt_source, gt_pyc, derived_pyc, derived_source = _resolve_dataset_repair_paths(
+                        row,
+                        dataset_path.parent,
+                    )
                 preflight = plan.get("preflight")
                 if gt_source is None or gt_pyc is None or derived_pyc is None or derived_source is None:
                     error_row = _dataset_error_row(row, gt_pyc, derived_pyc, derived_source, "Could not resolve gt_source, gt_pyc, derived_pyc, and/or derived_source")
