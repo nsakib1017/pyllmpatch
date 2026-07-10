@@ -1,4 +1,4 @@
-supported_tuples = [(3, x) for x in range(6, 15)]
+supported_tuples = [(3, x) for x in range(10, 15)]  # Python 3.10–3.14 only; <3.10 unsupported
 version_str = {f"{x[0]}{x[1]}": x for x in supported_tuples} | {f"{x[0]}.{x[1]}": x for x in supported_tuples}
 
 

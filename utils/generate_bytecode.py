@@ -31,6 +31,23 @@ def _compile_native(py_file: str, out_file: str):
     return
 
 
+def _clean_compile_stderr(stderr: str) -> str:
+    """Strip HARMLESS noise from a uv/pyenv compile subprocess's stderr so a genuinely
+    successful compile is not mistaken for a failure. Removes uv download/bytecode
+    progress AND broken ``*.pth`` site-startup errors emitted by uv-managed interpreters
+    (notably a missing ``_virtualenv`` module in the 3.10 toolchain: the .pth's
+    sitecustomize import fails at startup with 'Error processing line N of <...>.pth: ...
+    Remainder of file ignored', but ``py_compile`` still writes the correct .pyc). Real
+    compile errors (SyntaxError, or the version-guard AssertionError) are preserved so a
+    true failure still raises. Without this, EVERY Python 3.10 candidate is rejected
+    despite compiling correctly -> 0 deterministic fixes on 3.10."""
+    s = re.sub(r"\s*Download(ing|ed)\s.+\n", "", stderr)
+    s = re.sub(r"\s*Bytecode compiled \d+ files? in \d+ms\n", "", s)
+    s = re.sub(r"Error processing line \d+ of [^\n]*\.pth:.*?Remainder of file ignored\n?",
+               "", s, flags=re.DOTALL)
+    return s.strip()
+
+
 def _compile_uv(py_file: str, out_file: str, version: PythonVersion):
     # print(f"Compiling {py_file} to {out_file} using uv with Python {version.as_str()}")
     compile_cmd = f"import py_compile, sys; assert sys.version_info[:2] == {version.as_tuple()!r}; py_compile.compile({py_file!r}, cfile={out_file!r})"
@@ -45,9 +62,9 @@ def _compile_uv(py_file: str, out_file: str, version: PythonVersion):
     }
     output = subprocess.run(cmd, shell=False, capture_output=True, text=True, env=env)
 
-    # Ignore stderr messages from uv downloading versions on demand
-    stderr = re.sub(r"\s*Download(ing|ed)\s.+\n", "", output.stderr)
-    stderr = re.sub(r"\s*Bytecode compiled \d+ files? in \d+ms\n", "", stderr)
+    # Ignore uv download progress AND broken .pth site-startup noise (the compile still
+    # succeeds); real errors (SyntaxError / version-guard AssertionError) survive.
+    stderr = _clean_compile_stderr(output.stderr)
     if stderr:
         raise CompileError(stderr)
 
@@ -87,8 +104,9 @@ def _compile_pyenv(py_file: str, out_file: str, version: PythonVersion):
 
     output = subprocess.run(cmd, shell=False, capture_output=True, text=True, env={**os.environ, "PYENV_VERSION": version_win if version_win else version.as_str(), "PYTHONWARNINGS": "ignore"})
 
-    if output.stderr:
-        raise CompileError(output.stderr)
+    stderr = _clean_compile_stderr(output.stderr)
+    if stderr:
+        raise CompileError(stderr)
 
 
 def compile_version(py_file, out_file, version):

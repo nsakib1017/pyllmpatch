@@ -4,6 +4,7 @@ import argparse
 import csv
 import difflib
 import hashlib
+import os
 import pickle
 import sys
 from functools import lru_cache
@@ -15,7 +16,7 @@ import pandas as pd
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PYLINGUAL_ROOT = REPO_ROOT / "pylingual"
 DISTANCE_CACHE_DIR = REPO_ROOT / "results" / "cache" / "pyc_distance"
-CACHE_FORMAT_VERSION = 1
+CACHE_FORMAT_VERSION = 2  # 2: each serialized code object carries its exception_table
 
 if str(PYLINGUAL_ROOT) not in sys.path:
     sys.path.insert(0, str(PYLINGUAL_ROOT))
@@ -30,6 +31,54 @@ CFG_EDGE_COST = 1
 CFG_META_NODE_COST = 100
 EXTRA_CODE_OBJECT_BASE_PENALTY = 2
 MISSING_CODE_OBJECT_BASE_PENALTY = 4
+EXCEPTION_TABLE_WEIGHT = 1  # per differing (start,end,target,depth) entry
+
+# Exception-table distance is a gradient for the offset-less control-flow / exc-table
+# regime (M2). It is folded into combined_distance ONLY when oracle mode is active,
+# so the historical "distance" mode is left bit-for-bit unchanged for ablation.
+# The per-object `exception_table` and `exception_table_distance` fields are always
+# populated (pure metadata); only the score contribution is gated.
+_EXC_TABLE_DISTANCE_ENABLED = (
+    os.getenv("SEMANTIC_ACCEPTANCE_MODE", "distance").strip().lower() == "oracle"
+)
+
+
+def set_exception_table_distance_enabled(enabled: bool) -> None:
+    """Toggle whether exception-table distance contributes to combined_distance."""
+    global _EXC_TABLE_DISTANCE_ENABLED
+    _EXC_TABLE_DISTANCE_ENABLED = bool(enabled)
+
+
+def _serialize_exception_table(bytecode) -> tuple:
+    """Sorted (start, end, target, depth) tuples for the named exception table.
+
+    Empty for pre-3.11 bytecode (no co_exceptiontable). Sorted with a None-safe key
+    so the result is a stable, hashable, comparable signature.
+    """
+    table = getattr(bytecode, "named_exception_table", None)
+    if not table:
+        return ()
+    entries = [
+        (
+            getattr(e, "start", None),
+            getattr(e, "end", None),
+            getattr(e, "target", None),
+            getattr(e, "depth", None),
+        )
+        for e in table
+    ]
+    return tuple(sorted(entries, key=lambda t: tuple(-1 if x is None else x for x in t)))
+
+
+def exception_table_distance(gt_table, derived_table) -> int:
+    """Symmetric-difference count between two exception-table signatures.
+
+    Counts entries that must be added or removed to turn one table into the
+    other — 0 iff the tables match exactly on (start, end, target, depth).
+    """
+    a = set(gt_table or ())
+    b = set(derived_table or ())
+    return len(a ^ b)
 
 
 def _load_bytecode_dependencies():
@@ -556,6 +605,7 @@ def _serialize_code_object(bytecode) -> dict:
         "unmatched_instruction_distance": unmatched_instruction_distance,
         "unmatched_cfg_distance": unmatched_cfg_distance,
         "unmatched_metrics": unmatched_metrics,
+        "exception_table": _serialize_exception_table(bytecode),
     }
 
 
@@ -639,6 +689,7 @@ def compare_code_object_distances(gt_pyc: Path, derived_pyc: Path):
         derived_name = derived_bc["name"] if derived_bc is not None else None
         gt_len = gt_bc["inst_count"] if gt_bc is not None else 0
         derived_len = derived_bc["inst_count"] if derived_bc is not None else 0
+        exc_table_distance = 0
 
         if gt_bc is None:
             instruction_distance = derived_bc["unmatched_instruction_distance"]
@@ -673,6 +724,13 @@ def compare_code_object_distances(gt_pyc: Path, derived_pyc: Path):
             unmatched_penalty = 0
             unmatched_metrics = None
             score, interaction_penalty = combined_distance(instruction_distance, cfg_distance)
+            exc_table_distance = exception_table_distance(
+                gt_bc.get("exception_table"), derived_bc.get("exception_table")
+            )
+            if _EXC_TABLE_DISTANCE_ENABLED:
+                # Gradient for the offset-less exc-table regime: a matched object
+                # whose only divergence is its exception table now scores > 0.
+                score += EXCEPTION_TABLE_WEIGHT * exc_table_distance
             instruction_basis = max(gt_len, derived_len, 1)
             cfg_basis = max(gt_bc["cfg_complexity_basis"], derived_bc["cfg_complexity_basis"], 1)
             status = "matched"
@@ -702,6 +760,7 @@ def compare_code_object_distances(gt_pyc: Path, derived_pyc: Path):
                 "interaction_penalty": interaction_penalty,
                 "unmatched_penalty": unmatched_penalty,
                 "unmatched_metrics": unmatched_metrics,
+                "exception_table_distance": exc_table_distance,
                 "combined_distance": score,
                 "instruction_basis": instruction_basis,
                 "cfg_basis": cfg_basis,

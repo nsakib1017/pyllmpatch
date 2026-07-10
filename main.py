@@ -53,9 +53,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     repair_loop.add_argument(
         "--fixer",
-        choices=("oracle", "llm"),
+        choices=("oracle", "llm", "none"),
         default="oracle",
-        help="Fragment fixer backend to use",
+        help="Fragment fixer backend to use ('none' = deterministic-only, no LLM)",
     )
     repair_loop.add_argument(
         "--llm-provider",
@@ -220,12 +220,13 @@ def main() -> None:
             SEMANTIC_REPAIR_TIMEOUT_MIN_IMPROVEMENT_DELTA,
             CodeObjectRepairLoop,
             LLMFragmentFixer,
+            NullFragmentFixer,
             OracleFragmentFixer,
             run_dataset_repair_loop,
         )
         from pipeline.config import BASE_DATASET_PATH
 
-        if args.fixer not in {"oracle", "llm"}:
+        if args.fixer not in {"oracle", "llm", "none"}:
             raise ValueError(f"Unsupported fixer backend: {args.fixer}")
 
         if args.dataset_mode:
@@ -267,11 +268,12 @@ def main() -> None:
         else:
             if args.gt_pyc is None or args.derived_pyc is None or args.derived_source is None:
                 raise ValueError("gt_pyc, derived_pyc, and derived_source are required unless --dataset-mode is used")
-            fixer = (
-                OracleFragmentFixer(args.gt_pyc)
-                if args.fixer == "oracle"
-                else LLMFragmentFixer(provider=args.llm_provider, model=args.llm_model)
-            )
+            if args.fixer == "none":
+                fixer = NullFragmentFixer()
+            elif args.fixer == "oracle":
+                fixer = OracleFragmentFixer(args.gt_pyc)
+            else:
+                fixer = LLMFragmentFixer(provider=args.llm_provider, model=args.llm_model)
             loop = CodeObjectRepairLoop(fixer)
             result = loop.run(
                 gt_pyc=args.gt_pyc,

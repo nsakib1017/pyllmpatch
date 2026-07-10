@@ -1,4 +1,5 @@
 from model.loader import load_model_once
+import os
 import torch
 from typing import Any
 
@@ -45,9 +46,15 @@ def call_llm_with_message(*, messages, model_path, max_tokens, tokenizer_path=No
     if getattr(tokenizer, "pad_token_id", None) is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # use_cache defaults ON (greedy output identical, far faster). But LoRA adapters on Qwen2.5
+    # under transformers 5.3 hit a KV-cache broadcast shape error during generation
+    # (output [1,H,1,D] vs [1,H,N,D]); set SEMANTIC_INFERENCE_USE_CACHE=false for the slower,
+    # correct no-cache path in that case.
+    _use_cache = os.getenv("SEMANTIC_INFERENCE_USE_CACHE", "true").strip().lower() not in ("0", "false", "no", "off")
+
     if hasattr(model, "generation_config") and model.generation_config is not None:
         model.generation_config.max_length = None
-        model.generation_config.use_cache = False
+        model.generation_config.use_cache = _use_cache  # KV cache (see SEMANTIC_INFERENCE_USE_CACHE)
         model.generation_config.pad_token_id = tokenizer.pad_token_id
         model.generation_config.eos_token_id = tokenizer.eos_token_id
 
@@ -70,7 +77,7 @@ def call_llm_with_message(*, messages, model_path, max_tokens, tokenizer_path=No
         "attention_mask": inputs.get("attention_mask"),
         "max_new_tokens": gen_max_new_tokens,
         "do_sample": do_sample,
-        "use_cache": False,
+        "use_cache": _use_cache,  # see SEMANTIC_INFERENCE_USE_CACHE (LoRA-adapter KV-cache bug)
         "pad_token_id": tokenizer.pad_token_id,
         "eos_token_id": tokenizer.eos_token_id,
     }

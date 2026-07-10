@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import argparse
 import ast
+import inspect
 import json
 import os
 import re
@@ -28,10 +29,50 @@ from utils.map_source_code_objects import MappingError, map_source_to_pyc
 from utils.pyc_code_object_distance import (
     compare_code_object_distances,
     load_editable_bytecode_from_pyc,
+    set_exception_table_distance_enabled,
     summarize_results,
     validate_input,
 )
 from utils.version import PythonVersion
+from utils.oracle_state import compare_verifications
+from utils.semantic_operators.call_shape import call_shape_candidate
+from utils.semantic_operators.comprehension_op import comprehension_op_candidate
+from utils.semantic_operators.container import container_construction_candidate
+from utils.semantic_operators.control_flow import control_flow_candidate
+from utils.semantic_operators.control_flow_renest import control_flow_renest_candidate
+from utils.semantic_operators.decorator_default import decorator_default_candidate
+from utils.semantic_operators.exc_regions import exc_regions_candidate
+from utils.semantic_operators.bool_shortcircuit import bool_shortcircuit_candidate
+from utils.semantic_operators.dropped_statement import dropped_statement_candidate
+from utils.semantic_operators.literal_form import literal_form_candidate
+from utils.semantic_operators.ternary_op import ternary_op_candidate
+from utils.semantic_operators.unary_op import unary_op_candidate
+from utils.semantic_operators.unpack_op import unpack_op_candidate
+from utils.semantic_operators.fstring import fstring_segment_candidate
+from utils.semantic_operators.jump import collapse_dead_pass_else_candidate
+from utils.semantic_operators.leaf import leaf_value_candidate, leaf_value_no_offset_candidate
+from utils.semantic_operators.structural_directive import structural_repair_directive
+from utils.semantic_operators.placeholder import dropped_assignment_candidate, line_too_long_candidate
+from utils.semantic_operators.structural import try_except_candidate
+
+# Acceptance / target-selection mode (M2). "distance" (default) preserves the
+# historical combined-distance behaviour exactly; "oracle" makes the PyLingual
+# equivalence oracle primary for BOTH target selection and candidate acceptance.
+# Settable per-run via repair_mismatching_code_objects(acceptance_mode=...) or
+# process-wide via the SEMANTIC_ACCEPTANCE_MODE environment variable.
+ACCEPTANCE_MODE = (os.getenv("SEMANTIC_ACCEPTANCE_MODE", "distance").strip().lower() or "distance")
+
+# M4: run the deterministic operators (leaf, structural) to a FIXPOINT before the
+# LLM loop, so proven fixes land without the LLM out-ranking them per step. Gated
+# by the same switch that enables the operators at the fixer seam.
+# Deterministic prepass is ALWAYS-first by default: it runs every deterministic operator to a
+# fixpoint before the LLM ever engages, self-gated on a strict oracle-state improvement (no
+# regression), so the LLM only sees what no deterministic move can fix. Kill-switch: set
+# SEMANTIC_DETERMINISTIC_OPERATORS=0 to disable.
+SEMANTIC_DETERMINISTIC_PREPASS = (
+    os.getenv("SEMANTIC_DETERMINISTIC_OPERATORS", "1").strip().lower() in ("1", "true", "yes", "on")
+)
+
 
 class ReattachError(RuntimeError):
     pass
@@ -1772,12 +1813,47 @@ def _count_pylingual_successes(verification: dict | None) -> int | None:
     return sum(1 for result in verification["results"] if result["success"])
 
 
+def _should_accept_candidate_oracle(
+    previous_summary: dict,
+    candidate_summary: dict,
+    previous_verification: dict,
+    candidate_verification: dict,
+) -> tuple[bool, str]:
+    """Oracle-primary acceptance (M2).
+
+    Accept iff the candidate's per-object oracle state multiset does not regress
+    AND either some object strictly improves in the lattice, or the multiset is
+    unchanged and the (gradient-only) combined distance strictly drops.
+    """
+    delta = compare_verifications(
+        previous_verification.get("results", []),
+        candidate_verification.get("results", []),
+    )
+    if delta.regressed:
+        return False, f"oracle: object regressed ({', '.join(delta.regressed)})"
+    if delta.improved:
+        return True, f"oracle: object improved ({', '.join(delta.improved)})"
+    previous_distance = int(previous_summary["combined_distance"])
+    candidate_distance = int(candidate_summary["combined_distance"])
+    if candidate_distance < previous_distance:
+        return True, "oracle: state held; combined distance improved (gradient)"
+    return False, "oracle: no object improved and combined distance did not drop"
+
+
 def _should_accept_candidate(
     previous_summary: dict,
     candidate_summary: dict,
     previous_verification: dict | None,
     candidate_verification: dict | None,
 ) -> tuple[bool, str]:
+    if (
+        ACCEPTANCE_MODE == "oracle"
+        and previous_verification is not None
+        and candidate_verification is not None
+    ):
+        return _should_accept_candidate_oracle(
+            previous_summary, candidate_summary, previous_verification, candidate_verification
+        )
     previous_distance = int(previous_summary["combined_distance"])
     candidate_distance = int(candidate_summary["combined_distance"])
     if candidate_distance < previous_distance:
@@ -1891,6 +1967,57 @@ def _has_retryable_pylingual_targets(verification: dict | None, targets: list[st
     return False
 
 
+def _oracle_failing_qualnames(verification: dict | None) -> list[str]:
+    """Distinct qualnames the oracle reports as not-equal (success is False)."""
+    if verification is None:
+        return []
+    failing: list[str] = []
+    seen: set[str] = set()
+    for result in verification.get("results", []):
+        if result.get("success"):
+            continue
+        name = result.get("names")
+        if name and name not in seen:
+            seen.add(str(name))
+            failing.append(str(name))
+    return failing
+
+
+def _oracle_primary_fragment_targets(
+    verification: dict | None,
+    distance_rows: list[dict],
+    attempt_counts: dict[str, int],
+    max_iterations: int,
+    *,
+    include_module: bool,
+) -> list[str]:
+    """Oracle-failing objects that the distance-based selector misses (M2).
+
+    These are ``matched`` code objects the oracle rejects even though their
+    ``combined_distance`` is 0 (e.g. an exception-table-only divergence). Without
+    this, such objects are never selected and the loop declares a false victory.
+    ``missing``/``extra`` oracle failures are intentionally left to their own
+    selectors.
+    """
+    if verification is None:
+        return []
+    matched_names = {
+        row["gt_name"]
+        for row in distance_rows
+        if row.get("status") == "matched" and row.get("gt_name")
+    }
+    targets: list[str] = []
+    for qualname in _oracle_failing_qualnames(verification):
+        if qualname not in matched_names:
+            continue
+        if not include_module and qualname == "<module>":
+            continue
+        if attempt_counts.get(qualname, 0) >= max_iterations:
+            continue
+        targets.append(qualname)
+    return targets
+
+
 def _truncated_repr(value: Any, limit: int = 160) -> str:
     if _is_code_object(value):
         return f"<code object {getattr(value, 'co_name', None)} at line {getattr(value, 'co_firstlineno', None)}>"
@@ -1982,6 +2109,435 @@ def _largest_non_equal_opcode(
             (opcode[2] - opcode[1]) + (opcode[4] - opcode[3]),
         ),
     )
+
+
+def _is_control_flow_opname(opname: str) -> bool:
+    """Opcodes that carry a jump-target offset in their arg (branch/loop test)."""
+    return (opname.startswith("POP_JUMP") or opname.startswith("JUMP")
+            or opname in ("FOR_ITER", "SEND"))
+
+
+def _instruction_run_repr(records: list[dict], lo: int, hi: int, cap: int = 8) -> str:
+    parts = []
+    for r in records[lo:hi][:cap]:
+        arg = (r.get("argrepr") or "")[:12]
+        parts.append(f"{r['opname']}{('(' + arg + ')') if arg else ''}")
+    if hi - lo > cap:
+        parts.append("…")
+    return " ".join(parts)
+
+
+def _missing_extra_statement_summary(gt_code_object: Any, derived_code_object: Any, max_runs: int = 6) -> str:
+    """Statement-level diff for the "Different bytecode, no single offset" bucket (multi-edit:
+    a dropped/added/changed STATEMENT, e.g. a local assignment the decompiler omitted and then
+    reads as a global). The localized instruction window and the control-flow skeleton do NOT
+    cover this — this frames each contiguous divergent run as a missing/spurious statement with
+    GT source-line anchors, which is the actionable signal for reconstructing it. GT bytecode
+    only (allowed), never GT source."""
+    gt = _instruction_records(gt_code_object)
+    der = _instruction_records(derived_code_object)
+    if not gt or not der:
+        return ""
+    go = [r["opname"] for r in gt]
+    do = [r["opname"] for r in der]
+    sm = __import__("difflib").SequenceMatcher(a=go, b=do, autojunk=False)
+    lines: list[str] = []
+    # No source-line anchor: the fixer only sees the (renumbered) DERIVED fragment, never GT
+    # source, so a GT absolute line number would point at a file it can't see and could
+    # misdirect it. Distinguish delete/insert/replace so a one-opcode change is not framed as
+    # adding/removing a whole statement.
+    for tag, a1, a2, b1, b2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag == "delete":  # GT produces instructions the derived fragment lacks
+            lines.append(f"- MISSING — add source that produces: {_instruction_run_repr(gt, a1, a2)}")
+        elif tag == "insert":  # derived produces instructions GT does not
+            lines.append(f"- SPURIOUS — remove the source that produces: {_instruction_run_repr(der, b1, b2)}")
+        else:  # replace — the region differs on both sides (may be one opcode or several)
+            lines.append(f"- CHANGED — ground truth produces [{_instruction_run_repr(gt, a1, a2)}] "
+                         f"where your fragment produces [{_instruction_run_repr(der, b1, b2)}]")
+        if len(lines) >= max_runs:
+            lines.append("- … (further differences)")
+            break
+    if not lines:
+        return ""
+    header = ("Statement-level bytecode difference (make your fragment compile to the ground-truth "
+              "instruction stream — add what is MISSING, remove what is SPURIOUS, adjust what is CHANGED):")
+    return header + "\n" + "\n".join(lines)
+
+
+def _control_flow_skeleton_rows(code_object: Any, max_rows: int = 80) -> list[str]:
+    """Render the CONTROL-FLOW rows (branches, jump targets, loop back-edges, exception
+    ops) of a code object with source-line anchors, from bytecode. Shared by the GT and
+    derived skeletons. Returns [] for straight-line code (no control flow to convey)."""
+    records = _instruction_records(code_object)
+    if not records:
+        return []
+    targets: set[int] = set()
+    for r in records:
+        if _is_control_flow_opname(r["opname"]):
+            try:
+                targets.add(int(str(r.get("argval", "")).strip()))
+            except (TypeError, ValueError):
+                pass
+    has_exc = any(r["opname"].startswith(("RAISE", "RERAISE", "PUSH_EXC", "CHECK_EXC", "POP_EXCEPT", "WITH_EXCEPT"))
+                  for r in records)
+    if not targets and not has_exc:
+        return []
+    rows: list[str] = []
+    for r in records:
+        opn, off = r["opname"], r["offset"]
+        is_tgt = off in targets
+        interesting = (_is_control_flow_opname(opn) or is_tgt
+                       or opn.startswith(("RETURN", "RAISE", "RERAISE", "PUSH_EXC", "CHECK_EXC",
+                                          "POP_EXCEPT", "END_FOR", "WITH_EXCEPT")))
+        if not interesting:
+            continue
+        line = r.get("starts_line")
+        marker = ">>" if is_tgt else "  "
+        tgt = ""
+        arg = (r.get("argrepr") or "")[:16]
+        if _is_control_flow_opname(opn):
+            try:
+                tgt = f" -> @{int(str(r.get('argval', '')).strip())}"
+                arg = ""  # target rendered explicitly below; drop the redundant "to N" argrepr
+            except (TypeError, ValueError):
+                tgt = ""
+        line_tag = f"L{line}" if line else ""
+        rows.append(f"  {marker} @{off:<4} {line_tag:<6} {opn}{(' ' + arg) if arg else ''}{tgt}")
+        if len(rows) >= max_rows:
+            rows.append("  ... (truncated)")
+            break
+    return rows
+
+
+def _derived_control_flow_skeleton(derived_code_object: Any, max_rows: int = 80) -> str:
+    """The CURRENT (derived) control-flow skeleton, so the LLM can diff it against GT and
+    see exactly which branches/loops/handlers to add, remove, or reshape (report lever #2:
+    structured oracle-diff feedback for the control-flow bucket)."""
+    rows = _control_flow_skeleton_rows(derived_code_object, max_rows)
+    if not rows:
+        return ""
+    header = ("Current (derived) control-flow skeleton — reshape the fragment's control flow so this "
+              "matches the ground-truth skeleton above (same offsets are illustrative, match the STRUCTURE):")
+    return header + "\n" + "\n".join(rows)
+
+
+def _gt_control_flow_skeleton(gt_code_object: Any, max_rows: int = 80) -> str:
+    """Serialize the ground-truth code object's CONTROL-FLOW structure (branches, jump
+    targets, loop headers, exception ops) with source-line anchors, from GT bytecode.
+
+    Decompilers get operands right but reconstruct loop/branch/try structure poorly, and
+    a localized instruction window can't convey whole-object control flow. Handing the LLM
+    the GT jump graph (offsets + targets + lines) lets it rewrite the fragment so its
+    control flow MATCHES ground truth (the capability lever for "Different control flow").
+    Uses only GT bytecode (allowed signal), never GT source. Returns "" for straight-line
+    code (no control flow to convey)."""
+    rows = _control_flow_skeleton_rows(gt_code_object, max_rows)
+    if not rows:
+        return ""
+    header = ("Ground-truth control-flow skeleton (rewrite the fragment so its control flow matches "
+              "this; @N = GT bytecode offset, '>>' = a branch/jump target, '-> @N' = jump destination, "
+              "LN = source line):")
+    return header + "\n" + "\n".join(rows)
+
+
+def _brief_jump_target(record: dict) -> int | None:
+    """The (GT-internal) target offset carried by a jump/FOR_ITER record, or None."""
+    try:
+        return int(str(record.get("argval", "")).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _branch_sense(opname: str) -> str:
+    """Human-readable polarity of a conditional jump, derived from the opname family so it
+    survives 3.10-3.14 drift (POP_JUMP_IF_FALSE vs POP_JUMP_FORWARD_IF_FALSE, *_IF_NONE)."""
+    if "_IF_NOT_NONE" in opname:
+        return "if the test is NOT None"
+    if "_IF_NONE" in opname:
+        return "if the test is None"
+    if "_IF_FALSE" in opname:
+        return "if the test is FALSE"
+    if "_IF_TRUE" in opname:
+        return "if the test is TRUE"
+    return "if the branch condition holds"
+
+
+def _gt_control_flow_brief(code_object: Any, max_items: int = 24) -> str:
+    """A readable pseudo-CFG reconstructed from GT bytecode ONLY (never GT source).
+
+    For each conditional jump it states the SENSE ("if the test is FALSE, jump to @N; else
+    fall through to @M") derived from the opname polarity; loop back-edges (JUMP_BACKWARD or a
+    target < the jump's own offset) are labeled as loops with a body extent and exit; FOR_ITER
+    is labeled as a for-loop with its exhaustion exit; try regions (via structural._real_try_blocks)
+    report DEPTH + the protected dotted callee + the handler shape.
+
+    Offsets are expressed only as GT-INTERNAL anchors (@N) plus source lines (LN) and relative
+    direction — never as GT-vs-derived comparable addresses. Direction/polarity use opcode-prefix
+    families + offset comparison so they work across 3.10-3.14 opname drift. Returns "" for
+    straight-line code with no try region (parity with _gt_control_flow_skeleton). Pure; no I/O."""
+    if code_object is None:
+        return ""
+    records = _instruction_records(code_object)
+    if not records:
+        return ""
+    lines: list[str] = []
+    n = len(records)
+    # FOR_ITER offsets are for-loop headers; a back-edge that targets one is the for-loop's own
+    # loop-back and must NOT also be emitted as a separate while-style loop (avoids double-labeling
+    # a single for-loop, which could nudge the model into an extra while alongside the for).
+    for_headers = {r["offset"] for r in records if r["opname"].startswith("FOR_ITER")}
+
+    def _line_tag(record: dict) -> str:
+        line = record.get("starts_line")
+        return f" L{line}" if line else ""
+
+    for idx, record in enumerate(records):
+        if len(lines) >= max_items:
+            break
+        opname = record["opname"]
+        off = record["offset"]
+        ltag = _line_tag(record)
+        fall = records[idx + 1]["offset"] if idx + 1 < n else None
+        if opname.startswith("FOR_ITER"):
+            exit_off = _brief_jump_target(record)
+            if exit_off is not None:
+                lines.append(f"- for-loop @{off}{ltag}: FOR_ITER iterates, exits to @{exit_off} when exhausted")
+            continue
+        is_conditional = opname.startswith("POP_JUMP") or opname.startswith("JUMP_IF")
+        if is_conditional:
+            tgt = _brief_jump_target(record)
+            if tgt is None:
+                continue
+            if tgt >= off:
+                fall_txt = f"; else fall through to @{fall}" if fall is not None else ""
+                lines.append(f"- branch @{off}{ltag}: {_branch_sense(opname)}, jump to @{tgt}{fall_txt}")
+            elif tgt not in for_headers:
+                exit_txt = f"; exits by falling through to @{fall}" if fall is not None else ""
+                lines.append(f"- loop @{tgt}..@{off}{ltag}: conditional back-edge {opname} @{off} -> @{tgt}{exit_txt}")
+            # else: conditional back-edge into a FOR_ITER header — already a labeled for-loop; skip.
+            continue
+        if opname.startswith("JUMP"):
+            tgt = _brief_jump_target(record)
+            if opname.startswith("JUMP_BACKWARD") or (tgt is not None and tgt < off):
+                if tgt is not None and tgt not in for_headers:
+                    exit_txt = f"; exits to @{fall}" if fall is not None else ""
+                    lines.append(f"- loop @{tgt}..@{off}{ltag}: back-edge {opname} @{off} -> @{tgt} (while-style){exit_txt}")
+            continue
+
+    from utils.semantic_operators.structural import (
+        _handler_skeleton,
+        _instructions,
+        _protected_call_parts,
+        _real_try_blocks,
+    )
+
+    insts = _instructions(code_object)
+    for (start, end, target, depth) in _real_try_blocks(code_object):
+        if len(lines) >= max_items:
+            break
+        parts = _protected_call_parts(insts, start, end)
+        trivial, exc_type = _handler_skeleton(insts, target)
+        try_line = None
+        for record in records:
+            if start is not None and record["offset"] == start:
+                try_line = record.get("starts_line")
+                break
+        ltag = f" L{try_line}" if try_line else ""
+        seg = f"- try @{start}..@{end} (depth {depth}){ltag}"
+        if parts:
+            seg += f": protects call `{'.'.join(parts)}(...)`"
+        if exc_type:
+            handler = f"except {exc_type}:" + (" pass" if trivial else "")
+            seg += f"; handler `{handler}`"
+        else:
+            # The exception type is not always recoverable from bytecode (e.g. 3.12 terminal
+            # handlers end in RETURN_CONST). Do NOT emit a bare `except:` — that would falsely
+            # imply a catch-all handler when the source may be typed. Hedge instead.
+            tail = " (body is trivial/pass)" if trivial else ""
+            seg += f"; handler present (exception type not recoverable from bytecode){tail}"
+        lines.append(seg)
+
+    if len(lines) >= max_items:
+        lines.append("- ... (further structure omitted)")
+    if not lines:
+        return ""
+    return "\n".join(lines)
+
+
+def _gt_signature_and_placement_brief(code_object: Any, qualname: str) -> str:
+    """Reconstruct a def/class signature and a placement hint from the GT code object's own
+    flags/varnames (GT bytecode only). Defaults, annotations, and base classes live in the
+    PARENT's MAKE_FUNCTION/CALL bytecode, not in this body, so they are explicitly flagged as
+    unknown. Pure; no I/O."""
+    co = getattr(code_object, "codeobj", code_object)
+    if co is None:
+        return ""
+    short_name = qualname.rsplit(".", 1)[-1]
+    name = getattr(co, "co_name", None) or short_name
+    flags = getattr(co, "co_flags", 0)
+    parent = qualname.rsplit(".", 1)[0] if "." in qualname else "<module>"
+
+    lines: list[str] = []
+    if not (flags & inspect.CO_OPTIMIZED):
+        # A class body (or module) code object is not CO_OPTIMIZED.
+        lines.append(f"class {name}:  # bases unknown from bytecode")
+    else:
+        argcount = getattr(co, "co_argcount", 0)
+        posonly = getattr(co, "co_posonlyargcount", 0)
+        kwonly = getattr(co, "co_kwonlyargcount", 0)
+        varnames = list(getattr(co, "co_varnames", ()))
+        positional = varnames[:argcount]
+        kwonly_names = varnames[argcount:argcount + kwonly]
+        cursor = argcount + kwonly
+        vararg = None
+        kwarg = None
+        if flags & inspect.CO_VARARGS and cursor < len(varnames):
+            vararg = varnames[cursor]
+            cursor += 1
+        if flags & inspect.CO_VARKEYWORDS and cursor < len(varnames):
+            kwarg = varnames[cursor]
+            cursor += 1
+        params: list[str] = []
+        for i, pname in enumerate(positional):
+            params.append(pname)
+            if posonly and i == posonly - 1:
+                params.append("/")
+        if vararg is not None:
+            params.append("*" + vararg)
+        elif kwonly_names:
+            params.append("*")
+        params.extend(kwonly_names)
+        if kwarg is not None:
+            params.append("**" + kwarg)
+        prefix = "async def" if (flags & (inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR)) else "def"
+        notes = []
+        if flags & (inspect.CO_GENERATOR | inspect.CO_ASYNC_GENERATOR):
+            notes.append("generator")
+        notes.append("defaults/annotations unknown from bytecode")
+        lines.append(f"{prefix} {name}({', '.join(params)}):  # " + "; ".join(notes))
+
+    if parent == "<module>":
+        lines.append("Placement: insert at module level.")
+    else:
+        parent_name = parent.rsplit(".", 1)[-1]
+        lines.append(
+            f"Placement: insert as a member of `{parent_name}` (parent scope {parent}); "
+            "keep the leading `self` parameter for a method."
+        )
+    return "\n".join(lines)
+
+
+def _gt_operand_inventory(code_object: Any, max_each: int = 8) -> str:
+    """Whole-object inventory of the building blocks the LLM needs to rebuild actual
+    statements (not just shape): dotted call targets (each CALL's LOAD base + LOAD_ATTR/
+    LOAD_METHOD chain), the co_names pool, literal co_consts, and nested child qualnames.
+    GT bytecode only. Pure; no I/O."""
+    if code_object is None:
+        return ""
+    from utils.semantic_operators.structural import _clean_name
+
+    records = _instruction_records(code_object)
+    attr_ops = ("LOAD_ATTR", "LOAD_METHOD")
+    # Callee chains may start from a global/name OR a local/closure base (e.g. `self.log(...)`,
+    # a dominant case for the missing-method bucket). Bare local args (`LOAD_FAST x` passed to
+    # another call) are excluded below by requiring either a global base or a dotted `.attr`
+    # chain, so locals only surface as real method-call targets, never as argument noise.
+    base_ops = ("LOAD_GLOBAL", "LOAD_NAME", "LOAD_FAST", "LOAD_DEREF")
+    global_base_ops = ("LOAD_GLOBAL", "LOAD_NAME")
+    calls: list[str] = []
+    seen: set[str] = set()
+    n = len(records)
+    for i, record in enumerate(records):
+        if record["opname"] not in base_ops:
+            continue
+        is_global_base = record["opname"] in global_base_ops
+        base = _clean_name(record.get("argrepr", ""))
+        if not base:
+            continue
+        parts = [base]
+        j = i + 1
+        while j < n and records[j]["opname"] in attr_ops:
+            attr = _clean_name(records[j].get("argrepr", ""))
+            if not attr:
+                break
+            parts.append(attr)
+            j += 1
+        # Treat this dotted chain as a call target only if a CALL consumes it before the
+        # next base-name load begins another potential callee.
+        has_call = False
+        k = j
+        while k < n:
+            opk = records[k]["opname"]
+            if opk in ("LOAD_GLOBAL", "LOAD_NAME"):
+                break
+            if opk.startswith("CALL"):
+                has_call = True
+                break
+            k += 1
+        # A global/name base is a callee on its own; a local/closure base only counts when it
+        # heads a dotted `.attr` chain (a method call like `self.log`), never as a bare arg.
+        if has_call and (is_global_base or len(parts) > 1):
+            dotted = ".".join(parts)
+            if dotted not in seen:
+                seen.add(dotted)
+                calls.append(dotted)
+
+    names = [str(x) for x in (getattr(code_object, "co_names", ()) or ())]
+    consts: list[str] = []
+    for value in (getattr(code_object, "co_consts", ()) or ()):
+        if _is_code_object(value):
+            continue
+        if _is_safe_literal(value):
+            consts.append(_truncated_repr(value, 40))
+    nested: list[str] = []
+    for child in (getattr(code_object, "child_bytecodes", ()) or ()):
+        child_name = getattr(child, "name", None)
+        if child_name:
+            nested.append(str(child_name))
+
+    out: list[str] = []
+    if calls:
+        out.append("calls: " + ", ".join(calls[:max_each]))
+    if names:
+        out.append("names: " + ", ".join(names[:max_each]))
+    if consts:
+        out.append("consts: " + ", ".join(consts[:max_each]))
+    if nested:
+        out.append("nested: " + ", ".join(nested[:max_each]))
+    return "\n".join(out)
+
+
+def _gt_reconstruction_brief(code_object: Any, qualname: str, *, is_missing: bool) -> str:
+    """Composer for the GT-bytecode reconstruction brief. Returns "" for a None object.
+
+    For a MISSING target (derived object is None) it bundles the reconstructed signature +
+    placement, the control-flow pseudo-CFG (body shape), and the operand inventory, so the
+    LLM can synthesize the whole missing object. For a present control-flow target it emits
+    just the control-flow pseudo-CFG under a reshaping header. Pure; no I/O."""
+    if code_object is None:
+        return ""
+    control_flow = _gt_control_flow_brief(code_object)
+    if is_missing:
+        parts = []
+        signature = _gt_signature_and_placement_brief(code_object, qualname)
+        if signature:
+            parts.append(signature)
+        if control_flow:
+            parts.append(control_flow)
+        inventory = _gt_operand_inventory(code_object)
+        if inventory:
+            parts.append(inventory)
+        if not parts:
+            return ""
+        header = "Reconstruct the missing ground-truth object from its bytecode:"
+        return header + "\n" + "\n".join(parts)
+    if not control_flow:
+        return ""
+    header = ("Ground-truth control-flow shape (reconstruct this branch/loop/try structure; "
+              "@N = GT offset, LN = source line):")
+    return header + "\n" + control_flow
 
 
 def _localized_instruction_context(
@@ -2347,6 +2903,127 @@ def _remember_rejected_attempt(
     del attempts[:-5]
 
 
+def _exception_table_records(code_object: Any) -> list[dict]:
+    """Structured summary of a code object's real try regions (for prompt
+    enrichment on control-flow failures). Each record describes what a try block
+    protects and its handler shape, read from GT/derived bytecode."""
+    if code_object is None:
+        return []
+    from utils.semantic_operators.structural import (
+        _handler_skeleton,
+        _instructions,
+        _protected_call_parts,
+        _real_try_blocks,
+    )
+    insts = _instructions(code_object)
+    records: list[dict] = []
+    for (start, end, target, depth) in _real_try_blocks(code_object):
+        parts = _protected_call_parts(insts, start, end)
+        trivial, exc_type = _handler_skeleton(insts, target)
+        protected_ops = [
+            i.opname for i in insts
+            if start is not None and end is not None and start <= getattr(i, "offset", -1) < end
+        ]
+        records.append({
+            "protected_offsets": [start, end],
+            "protected_call": ".".join(parts) if parts else None,
+            "protected_ops": protected_ops[:12],
+            "handler_exc_type": exc_type,
+            "handler_trivial": bool(trivial),
+        })
+    return records
+
+
+# --- deterministic diff-chunk diagnosis: the "what diverged" signal for the LLM prompt -------
+_DIFF_FAMILIES = (
+    ("call arguments", {"CALL", "CALL_KW", "KW_NAMES", "CALL_FUNCTION_EX", "PRECALL"}),
+    ("f-string interpolation", {"FORMAT_VALUE", "FORMAT_SIMPLE", "FORMAT_WITH_SPEC", "CONVERT_VALUE", "BUILD_STRING"}),
+    ("container literal", {"BUILD_MAP", "BUILD_LIST", "BUILD_SET", "BUILD_TUPLE", "BUILD_CONST_KEY_MAP", "MAP_ADD", "LIST_APPEND", "SET_ADD"}),
+    ("exception handling", {"PUSH_EXC_INFO", "CHECK_EXC_MATCH", "SETUP_WITH", "BEFORE_WITH", "WITH_EXCEPT_START", "RERAISE", "POP_EXCEPT"}),
+    ("closure variable", {"LOAD_DEREF", "STORE_DEREF", "LOAD_CLASSDEREF", "MAKE_CELL", "COPY_FREE_VARS", "LOAD_CLOSURE"}),
+    ("control flow", {"POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE", "POP_JUMP_FORWARD_IF_FALSE", "POP_JUMP_FORWARD_IF_TRUE", "JUMP_FORWARD", "JUMP_BACKWARD", "FOR_ITER", "GET_ITER"}),
+    ("import", {"IMPORT_NAME", "IMPORT_FROM"}),
+    ("nested function/decorator", {"MAKE_FUNCTION"}),
+    ("yield/await", {"YIELD_VALUE", "GET_AWAITABLE", "SEND"}),
+)
+
+
+def _obj_instructions(code_object: Any) -> list:
+    fn = getattr(code_object, "get_instructions", None)
+    if callable(fn):
+        try:
+            return list(fn())
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        return list(code_object)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _diff_family(ops: list) -> str:
+    s = set(ops)
+    for name, fam in _DIFF_FAMILIES:
+        if s & fam:
+            return name
+    if s and s <= {"LOAD_CONST", "RETURN_CONST"}:
+        return "constant value"
+    if s & {"LOAD_ATTR", "LOAD_METHOD", "STORE_ATTR"}:
+        return "attribute access"
+    if s & {"LOAD_FAST", "LOAD_GLOBAL", "LOAD_NAME", "STORE_FAST", "STORE_NAME"}:
+        return "name/expression"
+    return "statement"
+
+
+def _diff_seg_detail(insts: list) -> str:
+    bits = []
+    for i in insts[:4]:
+        ar = (getattr(i, "argrepr", "") or "").strip()
+        op = getattr(i, "opname", "")
+        bits.append(f"{op} {ar}".strip() if ar else op)
+    return ", ".join(b for b in bits if b)[:120]
+
+
+def _diff_chunk_diagnosis(gt_code_object: Any, derived_code_object: Any) -> str:
+    """Human-readable diagnosis of WHAT diverged, from the GT vs derived opcode-stream diff:
+    how many localized change chunks, and for each its kind (dropped / spurious / wrong) and
+    construct family (call arguments, f-string, container, closure variable, control flow,
+    constant, ...). This is the key per-iteration deterministic signal that tells the LLM
+    exactly what to change so the oracle accepts the candidate. Never raises."""
+    try:
+        if gt_code_object is None or derived_code_object is None:
+            return ""
+        gi = _obj_instructions(gt_code_object)
+        di = _obj_instructions(derived_code_object)
+        if not gi or not di:
+            return ""
+        gops = [getattr(i, "opname", "") for i in gi]
+        dops = [getattr(i, "opname", "") for i in di]
+        from difflib import SequenceMatcher
+        chunks = [(t, i1, i2, j1, j2) for t, i1, i2, j1, j2 in
+                  SequenceMatcher(a=gops, b=dops, autojunk=False).get_opcodes() if t != "equal"]
+        if not chunks:
+            return ""
+        parts = []
+        for t, i1, i2, j1, j2 in chunks[:3]:
+            fam = _diff_family(gops[i1:i2] + dops[j1:j2])
+            if t == "delete":
+                phrase = f"the ground truth has a {fam} your version dropped"
+                detail = _diff_seg_detail(gi[i1:i2])
+            elif t == "insert":
+                phrase = f"your version has a spurious {fam} the ground truth lacks"
+                detail = _diff_seg_detail(di[j1:j2])
+            else:
+                phrase = f"your {fam} differs from the ground truth"
+                detail = _diff_seg_detail(gi[i1:i2])
+            parts.append(phrase + (f" [GT bytecode: {detail}]" if detail else ""))
+        n = len(chunks)
+        head = "1 localized change" if n == 1 else f"{n} localized changes"
+        return f"Bytecode divergence diagnosis ({head}): " + "; ".join(parts) + "."
+    except Exception:  # noqa: BLE001 - advisory signal; never break the caller.
+        return ""
+
+
 def _build_target_repair_context(
     *,
     qualname: str,
@@ -2377,6 +3054,23 @@ def _build_target_repair_context(
         "alignment_tag": instruction_context.get("alignment_tag"),
         "retry_count_for_target": retry_count,
         "pylingual_failed_result": failed_result,
+        "gt_control_flow_skeleton": _gt_control_flow_skeleton(gt_code_object),
+        # deterministic signals for the LLM prompt (part 2 of the pipeline contract): a short
+        # imperative structural directive (bc_to_cft skeleton diff) + a per-object diff-chunk
+        # diagnosis naming exactly what diverged. Both guarded (never raise).
+        "structural_repair_directive": (
+            structural_repair_directive(gt_code_object, derived_code_object)
+            if derived_code_object is not None else None),
+        "diff_chunk_diagnosis": (
+            _diff_chunk_diagnosis(gt_code_object, derived_code_object)
+            if derived_code_object is not None else ""),
+        "target_is_missing": derived_code_object is None,
+        "gt_reconstruction_brief": _gt_reconstruction_brief(
+            gt_code_object, qualname, is_missing=(derived_code_object is None)),
+        "derived_control_flow_skeleton": _derived_control_flow_skeleton(derived_code_object),
+        "missing_extra_statement_summary": (
+            _missing_extra_statement_summary(gt_code_object, derived_code_object)
+            if failed_offset is None else ""),
         "instruction_diff": instruction_context.get("instruction_diff"),
         "gt_instruction_range": instruction_context.get("gt_instruction_range"),
         "derived_instruction_range": instruction_context.get("derived_instruction_range"),
@@ -2387,6 +3081,8 @@ def _build_target_repair_context(
         "bytecode_window_truncated": instruction_context.get("bytecode_window_truncated"),
         "instruction_renderer_version": instruction_context.get("instruction_renderer_version"),
         "rejected_attempts": _compact_rejected_attempts_for_prompt(rejected_attempts),
+        "gt_exception_table": _exception_table_records(gt_code_object),
+        "derived_exception_table": _exception_table_records(derived_code_object),
     }
 
 
@@ -2934,7 +3630,13 @@ def repair_mismatching_code_objects(
     sample_timeout_seconds: int | None = None,
     sample_hard_timeout_seconds: int | None = None,
     sample_timeout_min_improvement_delta: int = 1,
+    acceptance_mode: str | None = None,
 ) -> dict:
+    global ACCEPTANCE_MODE
+    if acceptance_mode is not None:
+        ACCEPTANCE_MODE = acceptance_mode.strip().lower() or "distance"
+    # Keep the distance module's exception-table gradient in sync with the mode.
+    set_exception_table_distance_enabled(ACCEPTANCE_MODE == "oracle")
     gt_pyc = validate_input(gt_pyc)
     derived_pyc = validate_input(derived_pyc)
     target_version = infer_semantic_repair_python_version(gt_pyc, derived_pyc)
@@ -3096,9 +3798,200 @@ def repair_mismatching_code_objects(
             sample_timeout_deadline = None
         return False
 
+    def run_deterministic_prepass() -> None:
+        """M4: apply deterministic operators to a FIXPOINT before the LLM loop.
+
+        Every edit reads the correct value from GT bytecode, is spliced into the
+        source, recompiled, and accepted only if the oracle-state lattice strictly
+        improves with no regression. Runs no LLM and does not consume the per-target
+        attempt cap, so proven operator fixes land instead of losing the per-step
+        candidate rank to the LLM.
+        """
+        nonlocal current_source, current_pyc, current_summary
+        nonlocal current_pylingual_verification, step_index
+        # Runs regardless of the global ACCEPTANCE_MODE: each candidate is accepted only on a
+        # strict oracle-state improvement with no regression (compare_verifications below), so
+        # the deterministic layer can always run first without weakening any acceptance gate.
+        if not SEMANTIC_DETERMINISTIC_PREPASS:
+            return
+        if current_pylingual_verification is None:
+            return
+        from pylingual.equivalence_check import compare_pyc
+
+        prepass_dir = output_dir / "prepass"
+        prepass_pyc_dir = prepass_dir / "__pycache__"
+        prepass_pyc_dir.mkdir(parents=True, exist_ok=True)
+
+        text = _load_text(current_source)
+        # Stable base stem: filenames are prepass{step_index}_{base_stem}.py. Using
+        # current_source.stem here would compound each accept (prepass2_prepass1_...)
+        # and eventually blow past NAME_MAX, so capture the original stem once.
+        base_stem = current_source.stem
+        max_prepass_edits = 200
+        applied = 0
+        while applied < max_prepass_edits:
+            if sample_hard_timeout_deadline is not None and time.monotonic() > sample_hard_timeout_deadline:
+                return
+            results = compare_pyc(validate_input(gt_pyc), validate_input(current_pyc))
+            progressed = False
+            for tr in results:
+                if tr.success:
+                    continue
+                is_leaf = tr.message == "Different bytecode" and tr.failed_offset is not None
+                is_struct = tr.message == "Different control flow"
+                # "Different bytecode" with no single offset (e.g. a PyLingual "line too long"
+                # placeholder statement) is also deterministically recoverable in some cases.
+                is_diffbc = tr.message == "Different bytecode"
+                if not (is_leaf or is_struct or is_diffbc):
+                    continue
+                qualname = tr.names()
+                # The <module> object has no extractable code-object span (its row span is
+                # degenerate/empty), so feed the WHOLE source as its fragment and write the
+                # operator's full output back directly. This lets the deterministic operators
+                # repair module-level statements (where most constant globals live). Every
+                # candidate still passes the recompile + oracle-distance gate below.
+                is_module_target = qualname == "<module>"
+                if is_module_target:
+                    target_row = None
+                    fragment = text
+                else:
+                    try:
+                        target_row = _find_target_row(current_source, current_pyc, qualname, False)
+                        fragment = extract_source_segment(text, target_row)
+                    except ReattachError:
+                        continue
+                repair_context = {
+                    "pylingual_failed_result": {"message": tr.message},
+                    "failed_offset": tr.failed_offset,
+                }
+                candidate = None
+                operation = strategy = None
+                if is_leaf:
+                    candidate = leaf_value_candidate(tr.bc_a, tr.bc_b, fragment, repair_context)
+                    if candidate is not None:
+                        operation, strategy = "deterministic_prepass_leaf", "deterministic_leaf"
+                    else:
+                        # jump-sense inversion: collapse `if C: pass else: BODY` -> `if C: BODY`
+                        candidate = collapse_dead_pass_else_candidate(tr.bc_a, tr.bc_b, fragment, repair_context)
+                        if candidate is not None:
+                            operation, strategy = "deterministic_prepass_jump", "deterministic_jump"
+                elif is_struct:
+                    # ordered deterministic control-flow reconstructions, each reading verbatim
+                    # from GT bytecode metadata (exception table, bc_to_cft skeleton, co_positions
+                    # columns) and deferring on ambiguity/content-loss: narrow try/except -> the
+                    # generalized exception-region (N-stmt try/except/finally/with) -> dropped
+                    # simple-if -> co_positions-driven re-nesting (re-parenting). Content-missing
+                    # cases (wiped bodies, real handler bodies) defer to the LLM.
+                    for _fn, _op, _strat in (
+                        (try_except_candidate, "deterministic_prepass_try_except", "deterministic_try_except"),
+                        (exc_regions_candidate, "deterministic_prepass_exc_regions", "deterministic_exc_regions"),
+                        (control_flow_candidate, "deterministic_prepass_control_flow", "deterministic_control_flow"),
+                        (control_flow_renest_candidate, "deterministic_prepass_control_flow_renest", "deterministic_control_flow_renest"),
+                        # dropped `assert` and value-producing short-circuit booleans surface as
+                        # "Different control flow" too — both guard their own regime internally.
+                        (dropped_statement_candidate, "deterministic_prepass_dropped_statement", "deterministic_dropped_statement"),
+                        (bool_shortcircuit_candidate, "deterministic_prepass_bool_shortcircuit", "deterministic_bool_shortcircuit"),
+                        (ternary_op_candidate, "deterministic_prepass_ternary", "deterministic_ternary"),
+                    ):
+                        candidate = _fn(tr.bc_a, tr.bc_b, fragment, repair_context)
+                        if candidate is not None:
+                            operation, strategy = _op, _strat
+                            break
+                if candidate is None and is_diffbc:
+                    # ordered deterministic reconstructions for "Different bytecode" (no single
+                    # operand offset): spurious f-string segment -> line-too-long placeholder ->
+                    # dropped scalar-literal assignment -> mangled all-constant container literal.
+                    # Each reads verbatim from GT, defers on ambiguity.
+                    for _fn, _op, _strat in (
+                        # offset-independent leaf operand swap: PyLingual reports "Different
+                        # bytecode" with no single failed_offset (~84% of residual objects),
+                        # so the offset-based leaf path above never fires. Infer the lone
+                        # diverging operand from the GT/derived stream diff. Oracle-gated.
+                        (leaf_value_no_offset_candidate, "deterministic_prepass_leaf_no_offset", "deterministic_leaf_no_offset"),
+                        (fstring_segment_candidate, "deterministic_prepass_fstring", "deterministic_fstring"),
+                        (line_too_long_candidate, "deterministic_prepass_placeholder", "deterministic_placeholder"),
+                        (dropped_assignment_candidate, "deterministic_prepass_dropped_assign", "deterministic_dropped_assign"),
+                        (container_construction_candidate, "deterministic_prepass_container", "deterministic_container"),
+                        (literal_form_candidate, "deterministic_prepass_literal_form", "deterministic_literal_form"),
+                        (call_shape_candidate, "deterministic_prepass_call_shape", "deterministic_call_shape"),
+                        (unary_op_candidate, "deterministic_prepass_unary", "deterministic_unary"),
+                        (decorator_default_candidate, "deterministic_prepass_decorator_default", "deterministic_decorator_default"),
+                        (unpack_op_candidate, "deterministic_prepass_unpack", "deterministic_unpack"),
+                        (dropped_statement_candidate, "deterministic_prepass_dropped_statement", "deterministic_dropped_statement"),
+                        (bool_shortcircuit_candidate, "deterministic_prepass_bool_shortcircuit", "deterministic_bool_shortcircuit"),
+                        (ternary_op_candidate, "deterministic_prepass_ternary", "deterministic_ternary"),
+                        (comprehension_op_candidate, "deterministic_prepass_comprehension", "deterministic_comprehension"),
+                    ):
+                        candidate = _fn(tr.bc_a, tr.bc_b, fragment, repair_context)
+                        if candidate is not None:
+                            operation, strategy = _op, _strat
+                            break
+                if candidate is None:
+                    continue
+                new_text = candidate["text"] if is_module_target else replace_source_segment(
+                    text, target_row, candidate["text"]
+                )
+                if new_text == text:
+                    continue
+                step_index += 1
+                next_source = prepass_dir / f"prepass{step_index}_{base_stem}.py"
+                next_source.write_text(new_text, encoding="utf-8")
+                try:
+                    next_pyc = compile_source_to_pyc(
+                        next_source, prepass_pyc_dir / f"prepass{step_index}.pyc", target_version
+                    )
+                except (ReattachError, CompileError):
+                    step_index -= 1
+                    continue
+                candidate_verification = run_pylingual_verification(gt_pyc, next_pyc)
+                delta = compare_verifications(
+                    current_pylingual_verification["results"], candidate_verification["results"]
+                )
+                if delta.regressed or not delta.improved:
+                    step_index -= 1
+                    continue
+                candidate_rows = compare_code_object_distances(gt_pyc, next_pyc)
+                candidate_summary = summarize_results(candidate_rows)
+                target_score_after = _score_snapshot(_find_distance_row(candidate_rows, qualname))
+                _store_semantic_step(
+                    steps,
+                    {
+                        "step": step_index,
+                        "iteration": 0,
+                        "qualname": qualname,
+                        "repair_operation": operation,
+                        "selected_candidate_strategy": strategy,
+                        "operator": candidate.get("operator") or candidate.get("detail"),
+                        "confidence": candidate.get("confidence"),
+                        "output_source": str(next_source),
+                        "output_pyc": str(next_pyc),
+                        "target_score_after": target_score_after,
+                        "summary": candidate_summary,
+                        "pylingual_verification": candidate_verification,
+                        "accepted": True,
+                        "acceptance_reason": f"deterministic prepass improved {', '.join(delta.improved)}",
+                    },
+                    log_file=log_file,
+                    run_id=run_id,
+                    file_hash=file_hash,
+                )
+                text = new_text
+                current_source = next_source
+                current_pyc = next_pyc
+                current_summary = candidate_summary
+                current_pylingual_verification = candidate_verification
+                record_best_state_if_improved("deterministic prepass leaf fix")
+                applied += 1
+                progressed = True
+                break
+            if not progressed:
+                break
+
     preprocessing_rows = compare_code_object_distances(gt_pyc, current_pyc)
     if _module_needs_repair(preprocessing_rows) and "<module>" not in all_repair_targets:
         all_repair_targets.append("<module>")
+
+    run_deterministic_prepass()
 
     target_attempt_counts: dict[str, int] = {}
     iteration = 0
@@ -3146,8 +4039,19 @@ def repair_mismatching_code_objects(
                     ),
                 }
             )
+        oracle_failing_targets = (
+            _oracle_primary_fragment_targets(
+                current_pylingual_verification,
+                iteration_rows,
+                target_attempt_counts,
+                max_iterations,
+                include_module=fragment_fixer is not None,
+            )
+            if ACCEPTANCE_MODE == "oracle"
+            else []
+        )
         iteration_targets = sorted(
-            set(iteration_targets + expression_child_parent_targets),
+            set(iteration_targets + expression_child_parent_targets + oracle_failing_targets),
             key=lambda name: (_qualname_depth(name), name),
         )
         iteration_missing_targets = [

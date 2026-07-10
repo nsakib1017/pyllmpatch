@@ -21,7 +21,7 @@ DEFAULT_DATASET_PATH = "dataset/accepted_codeobject_mining_prompt_refresh.jsonl"
 DEFAULT_MAX_SEQ_LENGTH = 16384
 DEFAULT_VALIDATION_RATIO = 0.05
 DEFAULT_RANDOM_SEED = 42
-DEFAULT_RESPONSE_TEMPLATE = ""
+DEFAULT_RESPONSE_TEMPLATE = "<|im_start|>assistant"
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -220,6 +220,10 @@ def load_model_and_tokenizer(args: argparse.Namespace):
 
 def create_completion_data_collator(tokenizer: Any, args: argparse.Namespace) -> Any | None:
     if not args.assistant_only_loss:
+        print(
+            "[completion-only-loss] --assistant-only-loss is OFF; training with "
+            "FULL-SEQUENCE loss (loss on prompt + completion)."
+        )
         return None
     if not args.response_template:
         warnings.warn(
@@ -228,19 +232,31 @@ def create_completion_data_collator(tokenizer: Any, args: argparse.Namespace) ->
             stacklevel=2,
         )
         return None
+
+    # trl 0.24.0 removed DataCollatorForCompletionOnlyLM, so we use a
+    # self-contained, version-independent completion-only collator instead.
+    # Robust to both run-as-module (finetuning.completion_masking) and
+    # run-as-script (python finetuning/model_finetuner_...py -> completion_masking on sys.path).
     try:
-        from trl import DataCollatorForCompletionOnlyLM
-    except (ImportError, AttributeError):
+        from finetuning.completion_masking import build_completion_only_collator
+    except ModuleNotFoundError:
+        from completion_masking import build_completion_only_collator
+
+    collator = build_completion_only_collator(tokenizer, args.response_template)
+    if collator is None:
         warnings.warn(
-            "TRL DataCollatorForCompletionOnlyLM is unavailable; falling back to full-sequence loss.",
+            f"Response template {args.response_template!r} tokenized to no ids; "
+            "falling back to full-sequence loss.",
             RuntimeWarning,
             stacklevel=2,
         )
         return None
-    return DataCollatorForCompletionOnlyLM(
-        response_template=args.response_template,
-        tokenizer=tokenizer,
+    print(
+        "[completion-only-loss] enabled: masking prompt tokens through response "
+        f"template {args.response_template!r} "
+        f"({len(collator.response_template_ids)} token ids); loss on completion only."
     )
+    return collator
 
 
 def create_training_arguments(training_arguments_cls: Any, args: argparse.Namespace, output_dir: Path, *, bf16_supported: bool) -> Any:
@@ -250,7 +266,14 @@ def create_training_arguments(training_arguments_cls: Any, args: argparse.Namesp
         "warmup_steps": args.warmup_steps,
         "warmup_ratio": args.warmup_ratio,
         "num_train_epochs": args.num_train_epochs,
-        "eval_strategy": "steps",
+        # GB10 unified-memory crash guard: the GPU shares the 121 GB system RAM, so a
+        # transient allocation spike is a *system* OOM that hangs the whole box (kernel
+        # freeze -> reboot), not a recoverable CUDA OOM. The step-100 in-loop eval (full
+        # forward at max_seq_length materializing a seq x vocab logits tensor per example)
+        # is what wedged the machine on 2026-07-08, before any checkpoint could be saved.
+        # Disable in-loop eval entirely (quality is judged by the end-to-end hybrid-100
+        # bake-off, not eval_loss) and save early/often so a durable checkpoint lands fast.
+        "eval_strategy": args.eval_strategy,
         "eval_steps": args.eval_steps,
         "save_strategy": "steps",
         "save_steps": args.save_steps,
@@ -266,12 +289,22 @@ def create_training_arguments(training_arguments_cls: Any, args: argparse.Namesp
         "logging_strategy": "steps",
         "logging_steps": args.logging_steps,
         "logging_first_step": True,
-        "load_best_model_at_end": True,
+        # load_best_model_at_end requires eval; keep it only when eval is on.
+        "load_best_model_at_end": args.eval_strategy != "no",
         "metric_for_best_model": "eval_loss",
         "greater_is_better": False,
         "save_total_limit": args.save_total_limit,
         "report_to": args.report_to,
         "group_by_length": args.group_by_length,
+        # CRITICAL: trl 0.24 renamed SFTTrainer's max_seq_length -> SFTConfig.max_length
+        # (default 1024). Passing max_seq_length= to SFTTrainer is silently DROPPED, so every
+        # prior run truncated to 1024 tokens and lost the answer for ~90% of examples. Set
+        # max_length here so long brief-ON prompts + their GT-source answer survive. Also keep
+        # max_seq_length for any older trl; the signature filter below keeps whichever exists.
+        "max_length": args.max_seq_length,
+        "max_seq_length": args.max_seq_length,
+        "packing": args.packing,
+        "dataset_num_proc": args.dataset_num_proc,
     }
 
     supported = set(inspect.signature(training_arguments_cls.__init__).parameters)
@@ -299,10 +332,13 @@ def create_trainer(
 ):
     from functools import partial
 
-    from transformers import EarlyStoppingCallback, TrainingArguments
-    from trl import SFTTrainer
+    from transformers import EarlyStoppingCallback
+    from trl import SFTConfig, SFTTrainer
     from unsloth import is_bfloat16_supported
     bf16_supported = is_bfloat16_supported()
+    # Use SFTConfig (a superset of TrainingArguments) so max_length / packing actually take
+    # effect in trl 0.24 — TrainingArguments has no max_length, so the value was being dropped.
+    training_arguments_cls = SFTConfig
 
     trainer_kwargs = {
         "model": model,
@@ -314,17 +350,21 @@ def create_trainer(
             tokenizer=tokenizer,
             enable_thinking_template=args.enable_thinking_template,
         ),
-        "max_seq_length": args.max_seq_length,
-        "dataset_num_proc": args.dataset_num_proc,
-        "packing": args.packing,
-        "callbacks": [
-            EarlyStoppingCallback(
+        # EarlyStoppingCallback asserts eval_strategy != "no" in on_train_begin (transformers
+        # 5.3.0), so it MUST be omitted when in-loop eval is disabled (the GB10 unified-memory
+        # crash guard) — otherwise trainer.train() AssertionErrors after the full model load.
+        "callbacks": (
+            [EarlyStoppingCallback(
                 early_stopping_patience=args.early_stopping_patience,
                 early_stopping_threshold=1e-3,
-            )
-        ],
+            )]
+            if args.eval_strategy != "no"
+            else []
+        ),
+        # max_length / packing / dataset_num_proc now live in the SFTConfig (args) so they
+        # actually take effect in trl 0.24; do not also pass them as direct SFTTrainer kwargs.
         "args": create_training_arguments(
-            TrainingArguments,
+            training_arguments_cls,
             args,
             output_dir,
             bf16_supported=bf16_supported,
@@ -368,6 +408,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=0)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
     parser.add_argument("--eval-steps", type=int, default=100)
+    # Default eval OFF: in-loop eval spikes unified memory and hard-crashes the GB10 (see
+    # create_training_arguments). Pass --eval-strategy steps to re-enable at your own risk.
+    parser.add_argument("--eval-strategy", choices=["no", "steps", "epoch"], default="no")
     parser.add_argument("--save-steps", type=int, default=100)
     parser.add_argument("--logging-steps", type=int, default=50)
     parser.add_argument("--save-total-limit", type=int, default=3)
@@ -388,6 +431,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-dropout", type=float, default=0.0)
     parser.add_argument("--use-rslora", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--merge", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--run-dir", default=None,
+                        help="Reuse this exact run dir and resume from its latest checkpoint (teardown-safe).")
     return parser.parse_args()
 
 
@@ -514,11 +559,21 @@ def main() -> None:
     train_dataset = Dataset.from_list(train_samples)
     val_dataset = Dataset.from_list(val_samples)
 
-    run_id = int(time.time())
     model_slug = args.model_name.strip("/").replace("/", "__")
-    output_dir = repo_root() / "finetuning" / "finetuned_models" / model_slug / f"run_{run_id}"
+    if getattr(args, "run_dir", None):
+        output_dir = Path(args.run_dir)
+        run_id = output_dir.name.replace("run_", "")
+    else:
+        run_id = int(time.time())
+        output_dir = repo_root() / "finetuning" / "finetuned_models" / model_slug / f"run_{run_id}"
     merged_dir = repo_root() / "finetuning" / "merged_models" / model_slug / f"run_{run_id}"
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Teardown-safe resume: if the run dir already holds checkpoints, continue from the latest.
+    _ckpts = sorted(output_dir.glob("checkpoint-*"),
+                    key=lambda p: int(p.name.split("-")[-1]) if p.name.split("-")[-1].isdigit() else -1)
+    resume_ckpt = str(_ckpts[-1]) if _ckpts else None
+    if resume_ckpt:
+        print("RESUMING from checkpoint:", resume_ckpt)
 
     trainer = create_trainer(
         model=model,
@@ -532,7 +587,7 @@ def main() -> None:
     torch.cuda.empty_cache()
     gc.collect()
 
-    trainer_stats = trainer.train()
+    trainer_stats = trainer.train(resume_from_checkpoint=resume_ckpt)
     pprint(trainer_stats)
 
     trainer.save_model(str(output_dir))

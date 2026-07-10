@@ -57,7 +57,29 @@ OPEN_LLM_MODELS =  [
         'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/Qwen3-Coder-30B-A3B-Instruct_run_1778647681/run_1778696366",
         'tokenizer_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/Qwen3-Coder-30B-A3B-Instruct_run_1778647681/run_1778696366",
         'generation_config': {
-            'max_new_tokens': 8192,
+            # Repair fragments are small; a lower cap bounds runaway greedy decoding
+            # (greedy still stops at EOS well before this) for faster inference.
+            'max_new_tokens': 2048,
+            'do_sample': False,
+            'temperature': 0.0,
+            'top_p': 1.0,
+        },
+    },
+    {
+        # Fine-tuned Qwen2.5-Coder-32B (LoRA adapter, --no-merge) on the corrected
+        # completion-only + max_length dataset (finetune_corpus_sub.jsonl). Loader resolves
+        # base=unsloth/Qwen2.5-Coder-32B-Instruct-bnb-4bit from adapter_config.json.
+        'provider': 'Alibaba',
+        'name': 'qwen25-coder-32b-ft',
+        # Merged 16-bit model (LoRA merged into base) — the adapter path crashes generation with
+        # use_cache=True (KV-cache broadcast bug on transformers 5.3); the merged model runs fast
+        # with use_cache=True like any full model. token_for_completion=8192 + eval headroom 2048
+        # keeps the prompt gate at 6144 so only in-distribution (<=8192) samples are processed.
+        'token_for_completion': 8192,
+        'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/qwen25-coder-32b-ft-merged",
+        'tokenizer_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/qwen25-coder-32b-ft-merged",
+        'generation_config': {
+            'max_new_tokens': 2048,
             'do_sample': False,
             'temperature': 0.0,
             'top_p': 1.0,

@@ -83,22 +83,41 @@ def load_model_once(
     hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
     auth_kwargs = {"token": hf_token} if hf_token else {}
 
+    # unsloth's for_inference patched attention crashes generation for some architectures
+    # (e.g. Qwen2.5-Coder-32B) with a KV-cache broadcast shape error on transformers 5.3.
+    # SEMANTIC_INFERENCE_BACKEND=transformers loads a full/merged model via plain transformers
+    # + sdpa attention (verified fast + correct with use_cache=True). Default stays unsloth.
+    _backend = os.getenv("SEMANTIC_INFERENCE_BACKEND", "unsloth").strip().lower()
+
     try:
         _validate_model_location(model_path, label="model_path")
         if tokenizer_path:
             _validate_model_location(tokenizer_path, label="tokenizer_path")
 
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=model_path,
-            max_seq_length=max_seq_length,
-            dtype=None,
-            load_in_4bit=LOAD_IN_4BIT if "LOAD_IN_4BIT" in globals() else True,
-            device_map={"": 0},
-            **auth_kwargs,
-        )
-
-        if tokenizer_path:
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=False, **auth_kwargs)
+        if _backend == "transformers":
+            import torch as _torch
+            from transformers import AutoModelForCausalLM as _AutoModelForCausalLM
+            model = _AutoModelForCausalLM.from_pretrained(
+                model_path,
+                dtype=_torch.bfloat16,
+                device_map={"": 0},
+                attn_implementation="sdpa",
+                **auth_kwargs,
+            )
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_path or model_path, trust_remote_code=False, **auth_kwargs
+            )
+        else:
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                model_name=model_path,
+                max_seq_length=max_seq_length,
+                dtype=None,
+                load_in_4bit=LOAD_IN_4BIT if "LOAD_IN_4BIT" in globals() else True,
+                device_map={"": 0},
+                **auth_kwargs,
+            )
+            if tokenizer_path:
+                tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=False, **auth_kwargs)
     except Exception as exc:
         _MODEL_LOAD_FAILURES[cache_key] = exc
         raise
@@ -106,12 +125,16 @@ def load_model_once(
     if getattr(tokenizer, "pad_token_id", None) is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    FastLanguageModel.for_inference(model)
+    if _backend != "transformers":
+        FastLanguageModel.for_inference(model)
     model.eval()
 
     if hasattr(model, "generation_config") and model.generation_config is not None:
         model.generation_config.max_length = None
-        model.generation_config.use_cache = False
+        # KV cache ON for inference: greedy decoding is identical with the cache
+        # but O(n) instead of O(n^2). FastLanguageModel.for_inference(model) above
+        # sets up cached fast inference — disabling the cache defeated it.
+        model.generation_config.use_cache = True
         model.generation_config.pad_token_id = tokenizer.pad_token_id
         model.generation_config.eos_token_id = tokenizer.eos_token_id
 

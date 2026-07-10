@@ -46,6 +46,7 @@ from utils.reattach_source_code_object import (
     select_unreattachable_missing_targets,
     summarize_results,
 )
+from utils.semantic_operators.leaf import leaf_value_candidate
 
 PYLINGUAL_ROOT = REPO_ROOT / "pylingual"
 if str(PYLINGUAL_ROOT) not in sys.path:
@@ -75,6 +76,12 @@ def _bounded_int_env(name: str, default: int, *, minimum: int, maximum: int) -> 
 
 SEMANTIC_REPAIR_CANDIDATE_COUNT = _bounded_int_env("SEMANTIC_REPAIR_CANDIDATE_COUNT", 3, minimum=1, maximum=5)
 SEMANTIC_REPAIR_TOKEN_HEADROOM = _bounded_int_env("SEMANTIC_REPAIR_TOKEN_HEADROOM", 5000, minimum=0, maximum=200000)
+# M3: try deterministic, no-LLM leaf operators before the LLM. When one fires it
+# short-circuits the LLM for that target attempt (the candidate still passes the
+# loop's compile + oracle accept gate). Off by default to preserve the baseline.
+SEMANTIC_DETERMINISTIC_OPERATORS = (
+    os.getenv("SEMANTIC_DETERMINISTIC_OPERATORS", "0").strip().lower() in ("1", "true", "yes", "on")
+)
 SEMANTIC_REPAIR_SAMPLE_TIMEOUT_SECONDS = _bounded_int_env(
     "SEMANTIC_REPAIR_SAMPLE_TIMEOUT_SECONDS",
     60 * 60,
@@ -487,6 +494,42 @@ def _format_repair_context(repair_context: dict | None, *, module_mode: bool = F
 {instruction_diff}
 ```
 """
+
+
+def _render_exception_table_context(repair_context: dict | None) -> str:
+    """Render the ground-truth try/except structure so the LLM can reconstruct
+    control flow. Shown only when the exception structure differs (or a
+    control-flow failure needs the shape) — the dominant, previously-unserved regime."""
+    if not repair_context:
+        return ""
+    gt = repair_context.get("gt_exception_table") or []
+    der = repair_context.get("derived_exception_table") or []
+    if not gt and not der:
+        return ""
+    message = (repair_context.get("pylingual_failed_result") or {}).get("message")
+    if len(gt) == len(der) and message != "Different control flow":
+        return ""
+    lines = [
+        "Ground-truth exception structure — the repaired fragment MUST reproduce this "
+        "try/except/finally shape so the recompiled exception table matches:",
+        f"  ground-truth try regions: {len(gt)}; current derived try regions: {len(der)}",
+    ]
+    for i, rec in enumerate(gt, 1):
+        call = rec.get("protected_call")
+        if call:
+            body = f"protects the call `{call}(...)`"
+        else:
+            ops = ", ".join(rec.get("protected_ops") or [])
+            body = f"protects a block [{ops}]"
+        exc_type = rec.get("handler_exc_type")
+        handler = f"except {exc_type}:" if exc_type else "except:"
+        handler_body = "pass (no handler body)" if rec.get("handler_trivial") else "a non-trivial handler body"
+        lines.append(f"  - try region {i}: {body}; handler `{handler}` with {handler_body}")
+    if len(gt) > len(der):
+        lines.append("  => The candidate is MISSING try/except structure the ground truth has; add it.")
+    elif len(der) > len(gt):
+        lines.append("  => The candidate has EXTRA try/except structure; remove/flatten it.")
+    return "\n".join(lines)
 
 
 def _prompt_feature_flags(user_prompt: str, repair_context: dict | None) -> dict[str, bool]:
@@ -1453,6 +1496,123 @@ def _format_rejected_replacement_delta(delta: Any) -> str:
     return "; ".join(parts[:6])
 
 
+def _format_gt_control_flow_skeleton(repair_context: dict | None) -> str:
+    """Include the GT control-flow skeleton (built in reattach from GT bytecode) when the
+    failure is STRUCTURAL — "Different control flow", or any diff with no single failed
+    offset (exception-table / multi-block). This is the capability lever for the dominant
+    control-flow failure bucket: it lets the LLM reconstruct loops/branches/try to match GT."""
+    if not repair_context:
+        return ""
+    skeleton = str(repair_context.get("gt_control_flow_skeleton") or "").strip()
+    if not skeleton:
+        return ""
+    failed = repair_context.get("pylingual_failed_result") or {}
+    message = failed.get("message") if isinstance(failed, dict) else None
+    # Require a GENUINE structural failure message. Do NOT trigger merely on
+    # `failed_offset is None`: that is also None when PyLingual reports the object as
+    # success (an operand divergence it tolerates) or under --skip-pylingual-verification,
+    # where injecting a "reshape your control flow to match this" skeleton would mislead
+    # the LLM toward unnecessary control-flow rewrites and could lower the repair rate.
+    structural = message == "Different control flow" or (
+        message == "Different bytecode" and repair_context.get("failed_offset") is None)
+    if not structural:
+        return ""
+    return skeleton
+
+
+def _structural_directive_enabled() -> bool:
+    """Feature flag for the deterministic-signal prompt enrichment (structural directive +
+    diff-chunk diagnosis). Default OFF so the enrichment can be A/B'd on/off."""
+    return os.getenv("SEMANTIC_STRUCTURAL_DIRECTIVE", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _format_structural_repair_directive(repair_context: dict | None) -> str:
+    """Deterministic structural directive (bc_to_cft skeleton diff): a short imperative
+    instruction naming the control-flow construct(s) GT has that the derived source is missing
+    or mis-nesting. Behind SEMANTIC_STRUCTURAL_DIRECTIVE (default off). Structural failures
+    only (mirror _format_gt_control_flow_skeleton's gate)."""
+    if not repair_context or not _structural_directive_enabled():
+        return ""
+    directive = str(repair_context.get("structural_repair_directive") or "").strip()
+    if not directive:
+        return ""
+    failed = repair_context.get("pylingual_failed_result") or {}
+    message = failed.get("message") if isinstance(failed, dict) else None
+    structural = message == "Different control flow" or (
+        message == "Different bytecode" and repair_context.get("failed_offset") is None)
+    if not structural:
+        return ""
+    return directive
+
+
+def _format_diff_chunk_diagnosis(repair_context: dict | None) -> str:
+    """Deterministic diff-chunk diagnosis naming exactly WHAT diverged (dropped / spurious /
+    wrong call arguments, f-string, container, closure variable, control flow, constant, ...),
+    read from the GT-vs-derived opcode-stream diff. This is the key per-iteration signal that
+    tells the LLM what to change so the oracle accepts. Behind SEMANTIC_STRUCTURAL_DIRECTIVE
+    (default off). Applies to any failing object with a computed diagnosis."""
+    if not repair_context or not _structural_directive_enabled():
+        return ""
+    return str(repair_context.get("diff_chunk_diagnosis") or "").strip()
+
+
+def _format_gt_reconstruction_brief(repair_context: dict | None) -> str:
+    """Include the GT-bytecode-derived reconstruction brief (readable pseudo-CFG for a
+    control-flow target; signature + placement + shape + operand inventory for a MISSING
+    target). Built in reattach from GT bytecode only.
+
+    For a MISSING target the brief is shown UNCONDITIONALLY: missing objects carry a
+    'Missing bytecode'/None failure message that the structural gate below would otherwise
+    suppress, yet the brief is exactly what the LLM needs to synthesize the dropped object.
+    For a present (matched) target it obeys the SAME structural gate as
+    _format_gt_control_flow_skeleton.
+
+    Toggle: set SEMANTIC_RECONSTRUCTION_BRIEF to a truthy value (1/true/yes/on) to include the
+    brief. Default OFF: a controlled greedy A/B on the hard control_flow/missing subset (2026-07-03)
+    showed NO file-perfect gain from the brief (identical 23% object-level, distance a wash, and one
+    3.10 file regressed), so it is not worth the extra prompt tokens by default. Kept toggleable for
+    future fine-tuned models trained to exploit the GT-bytecode signals."""
+    if os.getenv("SEMANTIC_RECONSTRUCTION_BRIEF", "false").strip().lower() not in ("1", "true", "yes", "on"):
+        return ""
+    if not repair_context:
+        return ""
+    brief = str(repair_context.get("gt_reconstruction_brief") or "").strip()
+    if not brief:
+        return ""
+    if repair_context.get("target_is_missing"):
+        return brief
+    failed = repair_context.get("pylingual_failed_result") or {}
+    message = failed.get("message") if isinstance(failed, dict) else None
+    structural = message == "Different control flow" or (
+        message == "Different bytecode" and repair_context.get("failed_offset") is None)
+    if not structural:
+        return ""
+    return brief
+
+
+def _format_missing_extra_statement_summary(repair_context: dict | None) -> str:
+    """Statement-level missing/spurious diff for the multi-edit bucket ("Different bytecode"
+    with no single failed offset — e.g. a dropped assignment read as a global). This is where
+    the localized window + CFG skeleton don't help; frame the delta as add/remove-a-statement."""
+    if not repair_context:
+        return ""
+    failed = repair_context.get("pylingual_failed_result") or {}
+    message = failed.get("message") if isinstance(failed, dict) else None
+    if message != "Different bytecode" or repair_context.get("failed_offset") is not None:
+        return ""
+    return str(repair_context.get("missing_extra_statement_summary") or "").strip()
+
+
+def _format_derived_control_flow_skeleton(repair_context: dict | None) -> str:
+    """The current derived control-flow skeleton, shown right after the GT one so the LLM
+    can diff GT-vs-current and reshape only what's wrong (report lever #2). Same structural
+    gate as the GT skeleton; only shown when the GT skeleton is also present (a diff needs
+    both sides)."""
+    if not _format_gt_control_flow_skeleton(repair_context):
+        return ""
+    return str((repair_context or {}).get("derived_control_flow_skeleton") or "").strip()
+
+
 def build_semantic_prompt_summaries(
     *,
     qualname: str,
@@ -1466,6 +1626,12 @@ def build_semantic_prompt_summaries(
         _format_target_context_summary(repair_context),
         _format_current_mismatch_summary(repair_context),
         _format_jump_target_diagnosis(repair_context),
+        _format_gt_reconstruction_brief(repair_context),
+        _format_gt_control_flow_skeleton(repair_context),
+        _format_structural_repair_directive(repair_context),
+        _format_diff_chunk_diagnosis(repair_context),
+        _format_derived_control_flow_skeleton(repair_context),
+        _format_missing_extra_statement_summary(repair_context),
         _format_code_shape_summary(gt_code_object=gt_code_object, derived_code_object=derived_code_object),
         _format_rejected_attempt_summary(repair_context),
         _format_duplicate_retry_summary(repair_context),
@@ -1593,6 +1759,8 @@ def build_semantic_repair_messages(
     action_pattern_section = f"\n\n{action_pattern_guidance}" if action_pattern_guidance else ""
     numbered_fragment = payload["line_numbered_source_fragment"]
     repair_context_section = _format_repair_context(repair_context, module_mode=qualname == "<module>")
+    exception_table_section = _render_exception_table_context(repair_context)
+    exception_table_block = f"\n{exception_table_section}\n" if exception_table_section else ""
 
     user_prompt = f"""Task: {task_text}
 
@@ -1608,7 +1776,7 @@ Target qualname: {qualname}
 {summary_section}
 
 {repair_context_section}
-
+{exception_table_block}
 Code object metadata:
 {metadata_text}{bytecode_section}{action_pattern_section}{telemetry_section}
 
@@ -1752,6 +1920,25 @@ def _candidate_strategy_specs(count: int, repair_context: dict | None) -> list[t
         ]
         return strategies[: max(1, min(count, len(strategies)))]
     return SEMANTIC_CANDIDATE_STRATEGIES[: max(1, min(count, len(SEMANTIC_CANDIDATE_STRATEGIES)))]
+
+
+class NullFragmentFixer(FragmentFixer):
+    """No-op backend: returns the fragment unchanged, so the fixer never lands an
+    edit. Combined with ``SEMANTIC_DETERMINISTIC_OPERATORS=true`` it runs ONLY the
+    deterministic pre-pass + operator seam (no LLM, no network), which is exactly
+    what the exhaustiveness measurement needs to isolate mechanical coverage."""
+
+    def generate_candidate(
+        self,
+        *,
+        qualname: str,
+        gt_code_object: Any,
+        derived_code_object: Any,
+        derived_source_fragment: str,
+        repair_context: dict | None = None,
+    ) -> str:
+        del qualname, gt_code_object, derived_code_object, repair_context
+        return derived_source_fragment
 
 
 class LLMFragmentFixer(FragmentFixer):
@@ -2128,6 +2315,34 @@ class CodeObjectRepairLoop:
         repair_context: dict | None = None,
     ) -> Any:
         if qualname != "<module>" and derived_code_object is not None and hasattr(self.fixer, "generate_candidates"):
+            if SEMANTIC_DETERMINISTIC_OPERATORS:
+                deterministic = leaf_value_candidate(
+                    gt_code_object, derived_code_object, derived_source_fragment, repair_context
+                )
+                if deterministic is not None:
+                    det_candidate = {
+                        "candidate_index": 0,
+                        "strategy": "deterministic_leaf",
+                        "resolved_by": "leaf",
+                        "operator": deterministic.get("operator"),
+                        "opname": deterministic.get("opname"),
+                        "confidence": deterministic.get("confidence"),
+                        "text": deterministic["text"],
+                        "deterministic": True,
+                    }
+                    if deterministic.get("confidence") == "unique":
+                        # High confidence (single matching operator): skip the LLM.
+                        return [det_candidate]
+                    # Lower confidence (ordinal pick): try it first but keep the LLM
+                    # candidates as a fallback so we can never do worse than today.
+                    llm_candidates = list(getattr(self.fixer, "generate_candidates")(
+                        qualname=qualname,
+                        gt_code_object=gt_code_object,
+                        derived_code_object=derived_code_object,
+                        derived_source_fragment=derived_source_fragment,
+                        repair_context=repair_context,
+                    ))
+                    return [det_candidate, *llm_candidates]
             return getattr(self.fixer, "generate_candidates")(
                 qualname=qualname,
                 gt_code_object=gt_code_object,
@@ -2686,13 +2901,14 @@ def run_dataset_repair_loop(
                 row_output_dir = log_base / "semantic_repair" / str(row.source) / str(row.file_hash)
                 row_output_dir.mkdir(parents=True, exist_ok=True)
                 result_json_path = row_output_dir / "result.json"
-                if fixer_name not in {"oracle", "llm"}:
+                if fixer_name not in {"oracle", "llm", "none"}:
                     raise ValueError(f"Unsupported fixer backend: {fixer_name}")
-                fixer = (
-                    OracleFragmentFixer(gt_pyc, gt_source)
-                    if fixer_name == "oracle"
-                    else LLMFragmentFixer(provider=llm_provider, model=llm_model)
-                )
+                if fixer_name == "none":
+                    fixer = NullFragmentFixer()
+                elif fixer_name == "oracle":
+                    fixer = OracleFragmentFixer(gt_pyc, gt_source)
+                else:
+                    fixer = LLMFragmentFixer(provider=llm_provider, model=llm_model)
                 loop = CodeObjectRepairLoop(fixer)
                 print(f"[semantic_repair] file_hash={row.file_hash}", flush=True)
                 result = loop.run(
@@ -2882,9 +3098,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--fixer",
-        choices=("oracle", "llm"),
+        choices=("oracle", "llm", "none"),
         default="oracle",
-        help="Fragment fixer backend to use",
+        help="Fragment fixer backend to use ('none' = deterministic-only, no LLM)",
     )
     parser.add_argument(
         "--llm-provider",
@@ -3033,7 +3249,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
 
-    if args.fixer not in {"oracle", "llm"}:
+    if args.fixer not in {"oracle", "llm", "none"}:
         raise ValueError(f"Unsupported fixer backend: {args.fixer}")
 
     if args.dataset_mode:
@@ -3067,11 +3283,12 @@ def main() -> int:
     else:
         if args.gt_pyc is None or args.derived_pyc is None or args.derived_source is None:
             raise ValueError("gt_pyc, derived_pyc, and derived_source are required unless --dataset-mode is used")
-        fixer = (
-            OracleFragmentFixer(args.gt_pyc)
-            if args.fixer == "oracle"
-            else LLMFragmentFixer(provider=args.llm_provider, model=args.llm_model)
-        )
+        if args.fixer == "none":
+            fixer = NullFragmentFixer()
+        elif args.fixer == "oracle":
+            fixer = OracleFragmentFixer(args.gt_pyc)
+        else:
+            fixer = LLMFragmentFixer(provider=args.llm_provider, model=args.llm_model)
         loop = CodeObjectRepairLoop(fixer)
         result = loop.run(
             gt_pyc=args.gt_pyc,
