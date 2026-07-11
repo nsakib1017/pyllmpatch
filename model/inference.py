@@ -1,4 +1,5 @@
 from model.loader import load_model_once
+from model.vllm_backend import select_inference_backend, vllm_generate, VllmUnavailable
 import os
 import torch
 from typing import Any
@@ -33,6 +34,30 @@ def _float_generation_value(config: dict[str, Any], key: str) -> float | None:
 
 
 def call_llm_with_message(*, messages, model_path, max_tokens, tokenizer_path=None, generation_config=None) -> str:
+    """Dispatch to the selected inference backend. vLLM (offline, in-process, same local model)
+    when SEMANTIC_INFERENCE_BACKEND=vllm, else the HF path. vLLM unavailability falls back to HF,
+    so enabling the flag can only speed a run up, never break it."""
+    if select_inference_backend() == "vllm":
+        try:
+            return vllm_generate(
+                messages=messages,
+                model_path=model_path,
+                max_tokens=max_tokens,
+                tokenizer_path=tokenizer_path,
+                generation_config=generation_config,
+            )
+        except VllmUnavailable:
+            pass  # fall back to the HF path below
+    return _hf_generate(
+        messages=messages,
+        model_path=model_path,
+        max_tokens=max_tokens,
+        tokenizer_path=tokenizer_path,
+        generation_config=generation_config,
+    )
+
+
+def _hf_generate(*, messages, model_path, max_tokens, tokenizer_path=None, generation_config=None) -> str:
     generation_config = dict(generation_config or {})
     model, tokenizer = load_model_once(
         model_path=model_path,

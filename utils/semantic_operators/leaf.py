@@ -30,6 +30,8 @@ import re
 import textwrap
 from keyword import iskeyword
 
+from utils.semantic_operators import opcode_families
+
 # ---- operator symbol <-> AST node class -----------------------------------
 
 _AST_BINOP_SYMBOL: dict[type, str] = {
@@ -69,13 +71,16 @@ _SYMBOL_TO_AST_ISCONTAINS: dict[str, type] = {
 _FORMAT_CONV_FROM_ARGREPR: dict[str, int] = {"": -1, "!s": 115, "!r": 114, "!a": 97}
 
 _OPERATOR_OPCODES = {"BINARY_OP"}
-_CONST_OPCODES = {"LOAD_CONST", "RETURN_CONST"}
-_NAME_OPCODES = {"LOAD_FAST", "LOAD_GLOBAL", "LOAD_NAME", "LOAD_DEREF"}  # value loads (Load ctx)
-# only LOAD_FAST is safe for a whole-scope consistent rename: FAST locals are private
-# to one code object. LOAD_DEREF (closure) is shared with nested code objects, and
-# LOAD_GLOBAL/LOAD_NAME reference module-level bindings defined elsewhere — renaming
-# any of those from a single fragment would desync the other object(s).
-_RENAMABLE_LOCAL_OPCODES = {"LOAD_FAST"}
+# Unioning the version-agnostic families is additive: the 3.14/3.15-only opcodes never appear in
+# 3.10-3.13 bytecode, so this cannot change existing behaviour, but it lets these swaps fire on
+# 3.14's LOAD_SMALL_INT (const) and LOAD_FAST_BORROW (local value load).
+_CONST_OPCODES = {"LOAD_CONST", "RETURN_CONST"} | opcode_families.CONST_LOAD_OPS
+_NAME_OPCODES = {"LOAD_FAST", "LOAD_GLOBAL", "LOAD_NAME", "LOAD_DEREF"} | opcode_families.LOCAL_LOAD_OPS  # value loads (Load ctx)
+# only FAST locals are safe for a whole-scope consistent rename: they're private to one code
+# object. LOAD_DEREF (closure) is shared with nested code objects, and LOAD_GLOBAL/LOAD_NAME
+# reference module-level bindings defined elsewhere — renaming any of those from a single fragment
+# would desync the other object(s). LOAD_FAST_BORROW (3.14+) is the same private-local load.
+_RENAMABLE_LOCAL_OPCODES = {"LOAD_FAST", "LOAD_FAST_BORROW"}
 _ATTR_OPCODES = {"LOAD_ATTR", "LOAD_METHOD"}
 _SIMPLE_LITERAL_TYPES = (type(None), bool, int, float, str, bytes)
 _MISSING = object()  # sentinel so a genuine `argval is None` is distinct from a missing attr

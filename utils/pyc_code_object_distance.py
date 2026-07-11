@@ -21,6 +21,15 @@ CACHE_FORMAT_VERSION = 2  # 2: each serialized code object carries its exception
 if str(PYLINGUAL_ROOT) not in sys.path:
     sys.path.insert(0, str(PYLINGUAL_ROOT))
 
+# Teach xdis to parse CPython 3.15 bytecode (magic 3666 + opcode table) so the oracle can score
+# 3.15 .pyc files. Guarded: a failure here must never break 3.10-3.14 scoring.
+try:
+    import utils.py315_support as _py315_support
+
+    _py315_support.install()
+except Exception:
+    pass
+
 from utils.file_helpers import fetch_pyllmpatch_pyc_paths
 
 

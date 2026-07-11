@@ -5,8 +5,12 @@ import warnings
 from pathlib import Path
 
 from dotenv import load_dotenv
-from unsloth import FastLanguageModel
 from transformers import AutoTokenizer
+
+# NOTE: unsloth is imported LAZILY inside load_model_once (only for the unsloth HF path). This
+# keeps `import model.loader` / `model.inference` working in environments that don't have (or
+# can't import) unsloth — e.g. the isolated vLLM engine env with a newer transformers — where
+# generation goes through vLLM and unsloth is never used.
 
 _MODEL_CACHE: dict[tuple[str, str | None], tuple[object, object]] = {}
 _MODEL_LOAD_FAILURES: dict[tuple[str, str | None], BaseException] = {}
@@ -88,6 +92,10 @@ def load_model_once(
     # SEMANTIC_INFERENCE_BACKEND=transformers loads a full/merged model via plain transformers
     # + sdpa attention (verified fast + correct with use_cache=True). Default stays unsloth.
     _backend = os.getenv("SEMANTIC_INFERENCE_BACKEND", "unsloth").strip().lower()
+
+    FastLanguageModel = None
+    if _backend != "transformers":
+        from unsloth import FastLanguageModel  # lazy: only the unsloth HF path needs it
 
     try:
         _validate_model_location(model_path, label="model_path")

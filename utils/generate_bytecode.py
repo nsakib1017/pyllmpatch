@@ -11,7 +11,7 @@ from pathlib import Path
 
 from utils.version import PythonVersion
 
-UV_VERSIONS = {PythonVersion((3, x)) for x in range(8, 15)}
+UV_VERSIONS = {PythonVersion((3, x)) for x in range(8, 16)}  # 3.8–3.15 have uv-managed builds
 
 
 class CompileError(Exception):
@@ -21,6 +21,79 @@ class CompileError(Exception):
 
 class PyenvError(Exception):
     pass
+
+
+class WorkerUnavailable(Exception):
+    """The persistent compile worker could not be used (failed to start, or died); the
+    caller should fall back to the legacy per-compile subprocess path."""
+
+
+# --- Persistent per-version compile worker pool -------------------------------------------
+# A cross-version compile normally spawns a fresh `uvx --python <ver> python` subprocess per
+# call. In the semantic-repair hot loop that is dozens-to-hundreds of spawns per file. When
+# SEMANTIC_COMPILE_WORKER is enabled, compile_version routes those compiles through one
+# long-lived interpreter per version (see utils.compile_worker) whose output is byte-identical
+# to the subprocess path. Any worker failure falls back to the exact legacy uv/pyenv behaviour,
+# so the flag is a pure optimisation and never changes what gets compiled.
+_WORKER_POOL: dict = {}  # version tuple -> CompileWorker | None (None == negative cache)
+
+
+def _worker_enabled() -> bool:
+    return os.getenv("SEMANTIC_COMPILE_WORKER", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _worker_launch_cmd(version: "PythonVersion") -> list:
+    return ["uvx", "--no-config", "--python", version.as_str(), "python"]
+
+
+def _worker_env() -> dict:
+    return {
+        **os.environ,
+        "PYTHONWARNINGS": "ignore",
+        "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str((Path("/tmp") / "uv-cache").resolve())),
+        "UV_TOOL_DIR": os.environ.get("UV_TOOL_DIR", str((Path("/tmp") / "uv-tools").resolve())),
+    }
+
+
+def _get_compile_worker(version):
+    from utils.compile_worker import CompileWorker, WorkerStartError
+
+    version = PythonVersion(version)
+    key = version.as_tuple()
+    if key in _WORKER_POOL:
+        existing = _WORKER_POOL[key]
+        if existing is None:
+            raise WorkerUnavailable(f"compile worker for {version} previously failed to start")
+        if existing.alive:
+            return existing
+        # died between files -> respawn below
+    try:
+        worker = CompileWorker(_worker_launch_cmd(version), version, env=_worker_env()).start()
+    except (WorkerStartError, OSError) as exc:
+        _WORKER_POOL[key] = None  # negative cache: don't retry for the rest of the process
+        raise WorkerUnavailable(str(exc)) from exc
+    _WORKER_POOL[key] = worker
+    return worker
+
+
+def _drop_worker(version) -> None:
+    key = PythonVersion(version).as_tuple()
+    worker = _WORKER_POOL.pop(key, None)
+    if worker is not None and hasattr(worker, "close"):
+        worker.close()
+
+
+def _compile_worker(py_file: str, out_file: str, version: "PythonVersion") -> None:
+    worker = _get_compile_worker(version)
+    try:
+        worker.compile(py_file, out_file)
+    except CompileError:
+        if not worker.alive:
+            # the worker process died mid-request (not a genuine compile failure); drop it so
+            # the next file respawns, and signal a fallback for this compile.
+            _drop_worker(version)
+            raise WorkerUnavailable(f"compile worker for {version} died mid-request")
+        raise
 
 
 def _compile_native(py_file: str, out_file: str):
@@ -117,6 +190,14 @@ def compile_version(py_file, out_file, version):
     if version == sys.version_info:
         _compile_native(py_file=py_file, out_file=out_file)
     elif version in UV_VERSIONS:
+        if _worker_enabled():
+            try:
+                _compile_worker(py_file, out_file, version)
+                return
+            except WorkerUnavailable:
+                pass  # worker can't be used -> legacy path (and negative-cached for the run)
+            except CompileError:
+                pass  # worker reported a failure -> re-verify through the legacy uv/pyenv path
         try:
             _compile_uv(py_file=py_file, out_file=out_file, version=version)
         except CompileError:

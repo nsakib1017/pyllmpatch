@@ -46,6 +46,7 @@ from __future__ import annotations
 import ast
 import textwrap
 
+from utils.semantic_operators import opcode_families
 from utils.semantic_operators.leaf import _instructions, _round_trips
 
 # MAKE_FUNCTION oparg flag bits (CPython 3.10-3.12).
@@ -56,7 +57,8 @@ _FLAG_CLOSURE = 0x08       # a tuple of cells (closure)
 
 _STORE_OPCODES = {"STORE_NAME", "STORE_FAST", "STORE_GLOBAL", "STORE_DEREF"}
 _CALL_OPCODES = {"CALL", "CALL_FUNCTION", "CALL_METHOD", "CALL_FUNCTION_EX"}
-_NAME_LOAD_OPCODES = {"LOAD_NAME", "LOAD_GLOBAL", "LOAD_DEREF", "LOAD_FAST", "LOAD_CLASSDEREF"}
+# additive union with the version-agnostic local-load family (adds 3.14+ LOAD_FAST_BORROW etc.)
+_NAME_LOAD_OPCODES = {"LOAD_NAME", "LOAD_GLOBAL", "LOAD_DEREF", "LOAD_FAST", "LOAD_CLASSDEREF"} | opcode_families.LOCAL_LOAD_OPS
 _ATTR_LOAD_OPCODES = {"LOAD_ATTR", "LOAD_METHOD"}
 
 
