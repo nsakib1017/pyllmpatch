@@ -72,6 +72,37 @@ ACCEPTANCE_MODE = (os.getenv("SEMANTIC_ACCEPTANCE_MODE", "distance").strip().low
 SEMANTIC_DETERMINISTIC_PREPASS = (
     os.getenv("SEMANTIC_DETERMINISTIC_OPERATORS", "1").strip().lower() in ("1", "true", "yes", "on")
 )
+# Post-LLM deterministic reconciliation: after EACH LLM iteration, if the file is not yet perfect,
+# re-run the oracle-gated deterministic operators on the residual (a structural LLM edit can expose
+# a leaf divergence the pre-LLM prepass couldn't reach). Flow: pre-LLM det -> LLM -> if not perfect
+# -> post-LLM det -> test perfect -> repeat. Off by default (opt-in for A/B measurement).
+SEMANTIC_POST_LLM_DETERMINISTIC = (
+    os.getenv("SEMANTIC_POST_LLM_DETERMINISTIC", "0").strip().lower() in ("1", "true", "yes", "on")
+)
+# Corrective residual feedback (#54): when a fragment LLM candidate is rejected, capture the
+# GT-vs-candidate bytecode residual (what the model's own edit still got wrong) and feed it into
+# the next retry prompt, instead of only an abstract distance. Prompt-only (never touches the
+# oracle gate). Off by default (opt-in for A/B measurement); off ⇒ no capture, prompt unchanged.
+SEMANTIC_CORRECTIVE_FEEDBACK = (
+    os.getenv("SEMANTIC_CORRECTIVE_FEEDBACK", "0").strip().lower() in ("1", "true", "yes", "on")
+)
+
+
+def _tail_deadline_seconds() -> float:
+    """Lever B (speedup): stop a file whose BEST state has not improved for this many seconds
+    (0/unset/garbage = disabled). The hard tail (files grinding to the wall-clock cap without
+    converging) is where most run-time is spent; cutting it early is quality-neutral because the
+    engine always rolls back to the best state it found."""
+    try:
+        return float(os.getenv("SEMANTIC_TAIL_DEADLINE", "0") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _should_tail_abort(*, now: float, last_improvement: float, tail_deadline: float) -> bool:
+    """True iff the tail deadline is enabled (>0) and the best state has been stagnant for at
+    least that many seconds. Pure so it is unit-tested without the engine/GPU."""
+    return tail_deadline > 0 and (now - last_improvement) >= tail_deadline
 
 
 class ReattachError(RuntimeError):
@@ -2091,6 +2122,88 @@ def _format_instruction_window(records: list[dict], focus_offsets: set[int]) -> 
     return "\n".join(lines) if lines else "<instruction window unavailable>"
 
 
+def _candidate_residual_snapshot(
+    gt_bytecode: Any,
+    candidate_bytecode: Any,
+    *,
+    message: str | None,
+    failed_offset: int | None,
+    radius: int = 4,
+) -> dict | None:
+    """Compact GT-vs-candidate instruction residual for corrective retry feedback (#54).
+
+    Given the ground-truth and *rejected-candidate* bytecode for one target object, produce a
+    short window showing what the candidate's own edit still gets wrong versus GT — so the next
+    prompt can say "your last edit still differs here" instead of only a distance number.
+    Windowed around ``failed_offset`` when present, else the largest diverging opcode region
+    (the dominant "Different bytecode, no single offset" case). Returns a compact
+    ``{"message", "failed_offset", "window"}`` dict, or None when bytecode is unavailable.
+    Never raises — this only shapes a prompt, so any failure must defer silently."""
+    try:
+        gt_records = _instruction_records(gt_bytecode)
+        cand_records = _instruction_records(candidate_bytecode)
+        if not gt_records or not cand_records:
+            return None
+        if failed_offset is not None:
+            focus = {int(failed_offset)}
+            cand_idx = next((r["index"] for r in cand_records if r["offset"] == failed_offset), None)
+            gt_idx = next((r["index"] for r in gt_records if r["offset"] == failed_offset), cand_idx)
+            if cand_idx is None:
+                cand_idx = 0
+            if gt_idx is None:
+                gt_idx = cand_idx
+        else:
+            focus = set()
+            _tag, a1, a2, b1, b2 = _largest_non_equal_opcode(gt_records, cand_records)
+            gt_idx, cand_idx = a1, b1
+            gt_end, cand_end = max(a2, a1 + 1), max(b2, b1 + 1)
+        if failed_offset is not None:
+            gt_win = _bounded_instruction_window(gt_records, gt_idx, gt_idx + 1, radius)
+            cand_win = _bounded_instruction_window(cand_records, cand_idx, cand_idx + 1, radius)
+        else:
+            gt_win = _bounded_instruction_window(gt_records, gt_idx, gt_end, radius)
+            cand_win = _bounded_instruction_window(cand_records, cand_idx, cand_end, radius)
+        window = (
+            "ground truth:\n" + _format_instruction_window(gt_win, focus)
+            + "\nyour last edit produced:\n" + _format_instruction_window(cand_win, focus)
+        )
+        return {"message": message, "failed_offset": failed_offset, "window": window}
+    except Exception:  # noqa: BLE001 - prompt-shaping only; never crash the repair loop
+        return None
+
+
+def _capture_candidate_residual(
+    best_candidate: dict, qualname: str, gt_bytecodes: dict
+) -> dict | None:
+    """Build the corrective residual (#54) for a rejected fragment candidate: index the
+    candidate's compiled bytecode for ``qualname``, pull the failure message/offset from its
+    already-computed pylingual verification, and snapshot the GT-vs-candidate divergence.
+    Returns None (defer) if the candidate did not compile, the object already matches GT, or
+    anything is unavailable. Never raises."""
+    try:
+        output_pyc = best_candidate.get("output_pyc")
+        if not output_pyc:
+            return None
+        cand_bc = index_bytecodes_by_qualname(validate_input(Path(output_pyc))).get(qualname)
+        gt_bc = gt_bytecodes.get(qualname)
+        if cand_bc is None or gt_bc is None:
+            return None
+        message = failed_offset = None
+        results = (best_candidate.get("pylingual_verification") or {}).get("results")
+        if results:
+            target = next((r for r in results if r.get("names") == qualname), None)
+            if target is not None:
+                if target.get("success"):
+                    return None  # target already matches GT; the rejection was for another object
+                message = target.get("message")
+                failed_offset = target.get("failed_offset")
+        return _candidate_residual_snapshot(
+            gt_bc, cand_bc, message=message, failed_offset=failed_offset
+        )
+    except Exception:  # noqa: BLE001 - prompt-shaping only; never crash the repair loop
+        return None
+
+
 def _largest_non_equal_opcode(
     gt_records: list[dict],
     derived_records: list[dict],
@@ -2759,6 +2872,7 @@ def _compact_rejected_attempts_for_prompt(rejected_attempts: list[dict], *, limi
                 "replacement_structural_hash": attempt.get("replacement_structural_hash"),
                 "replacement_fingerprint": attempt.get("replacement_fingerprint"),
                 "replacement_delta": attempt.get("replacement_delta"),
+                "candidate_residual": attempt.get("candidate_residual"),
             }
         )
     return compact
@@ -2885,6 +2999,7 @@ def _remember_rejected_attempt(
     target_score_before: dict | None,
     target_score_after: dict | None,
     repair_context: dict | None,
+    candidate_residual: dict | None = None,
 ) -> None:
     attempts = rejected_attempts_by_qualname.setdefault(qualname, [])
     attempts.append(
@@ -2898,6 +3013,7 @@ def _remember_rejected_attempt(
             "replacement_structural_hash": _replacement_structural_hash(replacement_text),
             "replacement_fingerprint": _fragment_feature_snapshot(replacement_text),
             "replacement_delta": _replacement_delta_for_attempt(source_text_before, replacement_text),
+            "candidate_residual": candidate_residual,
         }
     )
     del attempts[:-5]
@@ -3684,6 +3800,7 @@ def repair_mismatching_code_objects(
     timeout_checkpoint_summary = current_summary
     timeout_checkpoint_count = 0
     steps: list[dict] = []
+    post_llm_det_edits_total = 0  # attribution: total edits accepted by the post-LLM det passes
 
     all_repair_targets = list(repair_targets)
     all_extra_targets = list(initial_extra_targets)
@@ -3699,21 +3816,44 @@ def repair_mismatching_code_objects(
     sample_hard_timeout_reached = False
     sample_timeout_reason: str | None = None
     sample_timeout_action: str | None = None
+    # Lever B (speedup): stop a file whose BEST state has been stagnant for this long — an earlier
+    # hard-timeout, so it reuses the exact restore-best / raise-no-improvement semantics below.
+    # 0 (default) => disabled => byte-identical to today. last_improvement clock starts at sample
+    # start and is reset on every best-state promotion (see record_best_state_if_improved).
+    sample_tail_deadline_seconds = _tail_deadline_seconds()
+    last_improvement_monotonic = time.monotonic()
 
     def record_best_state_if_improved(reason: str) -> None:
         nonlocal best_source, best_pyc, best_summary, best_pylingual_verification
-        nonlocal best_improvement_reason
-        if not _combined_distance_improved(
+        nonlocal best_improvement_reason, last_improvement_monotonic
+        promote = _combined_distance_improved(
             best_summary,
             current_summary,
             min_delta=sample_timeout_min_improvement_delta,
+        )
+        if (
+            not promote
+            and SEMANTIC_POST_LLM_DETERMINISTIC
+            and ACCEPTANCE_MODE == "oracle"
+            and best_pylingual_verification is not None
+            and current_pylingual_verification is not None
         ):
+            # A post-LLM deterministic accept can be an oracle-lattice win with combined distance
+            # flat (e.g. an exception-table / regime flip). Promote it so it survives timeout
+            # rollback and is visible to the timeout accountant. Gated on the flag + oracle mode,
+            # so the default distance path (and the 680-test suite) is unaffected.
+            _bd = compare_verifications(
+                best_pylingual_verification["results"], current_pylingual_verification["results"]
+            )
+            promote = _bd.improved and not _bd.regressed
+        if not promote:
             return
         best_source = current_source
         best_pyc = current_pyc
         best_summary = current_summary
         best_pylingual_verification = current_pylingual_verification
         best_improvement_reason = reason
+        last_improvement_monotonic = time.monotonic()  # reset the Lever-B stagnation clock
 
     def restore_best_state_if_needed() -> None:
         nonlocal current_source, current_pyc, current_summary, current_pylingual_verification
@@ -3730,6 +3870,41 @@ def repair_mismatching_code_objects(
         nonlocal sample_hard_timeout_reached
         nonlocal timeout_checkpoint_summary, timeout_checkpoint_count
         if sample_hard_timeout_reached:
+            return True
+        # Lever B (speedup): tail early-abort. If enabled and the BEST state has been stagnant for
+        # the tail deadline, stop now — an EARLIER hard timeout, reusing the exact restore-best /
+        # raise-no-improvement semantics of the hard-timeout branch below (so it is quality-neutral
+        # and recorded identically). Disabled by default (deadline 0) => this is a no-op.
+        if sample_tail_deadline_seconds > 0 and _should_tail_abort(
+            now=time.monotonic(),
+            last_improvement=last_improvement_monotonic,
+            tail_deadline=sample_tail_deadline_seconds,
+        ):
+            initial_distance = _summary_combined_distance(initial_summary)
+            current_distance = _summary_combined_distance(current_summary)
+            best_distance = _summary_combined_distance(best_summary)
+            tail_label = f"{sample_tail_deadline_seconds:.0f}s tail deadline"
+            if not _combined_distance_improved(
+                initial_summary,
+                best_summary,
+                min_delta=sample_timeout_min_improvement_delta,
+            ):
+                raise SemanticRepairHardTimeoutNoImprovement(
+                    f"sample stalled past {tail_label} at {location} without combined distance improvement "
+                    f"({initial_distance} -> {current_distance})"
+                )
+            restore_best_state_if_needed()
+            sample_timed_out = True
+            sample_timeout_reached = True
+            sample_hard_timeout_reached = True
+            sample_timeout_action = "stopped_at_tail_deadline_kept_best_result"
+            sample_timeout_reason = (
+                f"sample stalled past {tail_label} at {location}; keeping best result "
+                f"({initial_distance} -> {best_distance})"
+            )
+            if best_improvement_reason:
+                sample_timeout_reason += f"; best improvement: {best_improvement_reason}"
+            _semantic_print(f"-> tail deadline reached: {sample_timeout_reason}", indent=1)
             return True
         if sample_hard_timeout_deadline is not None and time.monotonic() >= sample_hard_timeout_deadline:
             initial_distance = _summary_combined_distance(initial_summary)
@@ -3798,25 +3973,37 @@ def repair_mismatching_code_objects(
             sample_timeout_deadline = None
         return False
 
-    def run_deterministic_prepass() -> None:
-        """M4: apply deterministic operators to a FIXPOINT before the LLM loop.
+    def run_deterministic_prepass(*, phase: str = "pre_llm", iteration_label: int = 0) -> int:
+        """Apply deterministic operators to a FIXPOINT and return the number of accepted edits.
 
-        Every edit reads the correct value from GT bytecode, is spliced into the
-        source, recompiled, and accepted only if the oracle-state lattice strictly
-        improves with no regression. Runs no LLM and does not consume the per-target
-        attempt cap, so proven operator fixes land instead of losing the per-step
-        candidate rank to the LLM.
+        Every edit reads the correct value from GT bytecode, is spliced into the source,
+        recompiled, and accepted only if the oracle-state lattice strictly improves with no
+        regression. Runs no LLM and does not consume the per-target attempt cap.
+
+        phase="pre_llm" (default): the pre-LLM leg. phase="post_llm": re-invoked after an LLM
+        iteration on the residual (a structural LLM edit can expose a leaf the pre-LLM pass could
+        not reach). The post phase is hard-gated on SEMANTIC_POST_LLM_DETERMINISTIC AND oracle
+        acceptance mode so both legs stay lattice-non-regressing (never undo each other).
         """
         nonlocal current_source, current_pyc, current_summary
         nonlocal current_pylingual_verification, step_index
-        # Runs regardless of the global ACCEPTANCE_MODE: each candidate is accepted only on a
-        # strict oracle-state improvement with no regression (compare_verifications below), so
-        # the deterministic layer can always run first without weakening any acceptance gate.
-        if not SEMANTIC_DETERMINISTIC_PREPASS:
-            return
+        # Each candidate is accepted only on a strict oracle-state improvement with no regression
+        # (compare_verifications below), so the deterministic layer never weakens any gate.
+        enabled = SEMANTIC_DETERMINISTIC_PREPASS if phase == "pre_llm" else (
+            SEMANTIC_POST_LLM_DETERMINISTIC and ACCEPTANCE_MODE == "oracle"
+        )
+        if not enabled:
+            return 0
         if current_pylingual_verification is None:
-            return
+            return 0
         from pylingual.equivalence_check import compare_pyc
+
+        if phase == "post_llm":
+            # Refresh the baseline against the LLM-advanced current_pyc so non-regression is judged
+            # vs the true current state (closes the stale-baseline hole when per-step verify is off).
+            current_pylingual_verification = run_pylingual_verification(gt_pyc, current_pyc)
+            if current_pylingual_verification is None:
+                return 0
 
         prepass_dir = output_dir / "prepass"
         prepass_pyc_dir = prepass_dir / "__pycache__"
@@ -3824,14 +4011,15 @@ def repair_mismatching_code_objects(
 
         text = _load_text(current_source)
         # Stable base stem: filenames are prepass{step_index}_{base_stem}.py. Using
-        # current_source.stem here would compound each accept (prepass2_prepass1_...)
-        # and eventually blow past NAME_MAX, so capture the original stem once.
-        base_stem = current_source.stem
+        # current_source.stem would compound each accept (prepass2_prepass1_...) and eventually
+        # blow past NAME_MAX; derived_source is the stable clean stem, so re-invocation across the
+        # post-LLM phase never nests the stem.
+        base_stem = derived_source.stem
         max_prepass_edits = 200
         applied = 0
         while applied < max_prepass_edits:
             if sample_hard_timeout_deadline is not None and time.monotonic() > sample_hard_timeout_deadline:
-                return
+                return applied
             results = compare_pyc(validate_input(gt_pyc), validate_input(current_pyc))
             progressed = False
             for tr in results:
@@ -3935,12 +4123,12 @@ def repair_mismatching_code_objects(
                     continue
                 step_index += 1
                 next_source = prepass_dir / f"prepass{step_index}_{base_stem}.py"
-                next_source.write_text(new_text, encoding="utf-8")
                 try:
+                    next_source.write_text(new_text, encoding="utf-8")
                     next_pyc = compile_source_to_pyc(
                         next_source, prepass_pyc_dir / f"prepass{step_index}.pyc", target_version
                     )
-                except (ReattachError, CompileError):
+                except (ReattachError, CompileError, OSError):
                     step_index -= 1
                     continue
                 candidate_verification = run_pylingual_verification(gt_pyc, next_pyc)
@@ -3957,7 +4145,8 @@ def repair_mismatching_code_objects(
                     steps,
                     {
                         "step": step_index,
-                        "iteration": 0,
+                        "iteration": iteration_label,
+                        "phase": phase,
                         "qualname": qualname,
                         "repair_operation": operation,
                         "selected_candidate_strategy": strategy,
@@ -3986,6 +4175,7 @@ def repair_mismatching_code_objects(
                 break
             if not progressed:
                 break
+        return applied
 
     preprocessing_rows = compare_code_object_distances(gt_pyc, current_pyc)
     if _module_needs_repair(preprocessing_rows) and "<module>" not in all_repair_targets:
@@ -4546,6 +4736,10 @@ def repair_mismatching_code_objects(
                     repair_context["_selected_action_pattern_types"] = best_candidate.get("selected_action_types") or []
                 skipped_due_to_token_limit = bool(best_candidate.get("skipped_due_to_token_limit"))
                 rejected_attempt = target_attempt_counts[qualname]
+                candidate_residual = (
+                    _capture_candidate_residual(best_candidate, qualname, gt_bytecodes)
+                    if SEMANTIC_CORRECTIVE_FEEDBACK else None
+                )
                 _remember_rejected_attempt(
                     rejected_attempts_by_qualname,
                     qualname,
@@ -4556,6 +4750,7 @@ def repair_mismatching_code_objects(
                     target_score_before=target_score_before,
                     target_score_after=target_score_after,
                     repair_context=repair_context,
+                    candidate_residual=candidate_residual,
                 )
                 if skipped_due_to_token_limit:
                     target_attempt_counts[qualname] = max_iterations
@@ -4968,6 +5163,29 @@ def repair_mismatching_code_objects(
                     repair_context=repair_context if fragment_fixer is not None else None,
                 )
 
+        # POST-LLM DETERMINISTIC RECONCILIATION (the "if not perfect -> post-llm det -> test perfect
+        # -> repeat" leg). After this iteration's LLM accepts, a structural edit may have exposed a
+        # leaf divergence the pre-LLM prepass could not reach; re-run the oracle-gated operators on
+        # the residual. Fires only when something was accepted (else the residual is byte-identical
+        # to what the last pass already drove to fixpoint) and the file is not yet perfect. Wrapped
+        # so an error on exotic LLM-restructured bytecode can never discard the LLM's accepted state.
+        if (
+            SEMANTIC_POST_LLM_DETERMINISTIC
+            and ACCEPTANCE_MODE == "oracle"
+            and accepted_this_iteration > 0
+            and current_pylingual_verification is not None
+            and not current_pylingual_verification.get("all_equal")
+        ):
+            try:
+                _post_applied = run_deterministic_prepass(phase="post_llm", iteration_label=iteration)
+            except Exception as exc:  # keep the LLM's already-accepted state on any post-pass error
+                _semantic_print(f"-> post-LLM deterministic pass errored; keeping LLM state: {exc}", indent=1)
+                _post_applied = 0
+            post_llm_det_edits_total += _post_applied
+            accepted_this_iteration += _post_applied
+            if current_pylingual_verification is not None and current_pylingual_verification.get("all_equal"):
+                break
+
         if handle_sample_timeout_if_needed(location=f"iteration {iteration} end"):
             break
 
@@ -5023,6 +5241,8 @@ def repair_mismatching_code_objects(
             else None
         ),
         "target_attempt_counts": target_attempt_counts,
+        "post_llm_deterministic_enabled": SEMANTIC_POST_LLM_DETERMINISTIC and ACCEPTANCE_MODE == "oracle",
+        "post_llm_deterministic_edits": post_llm_det_edits_total,
         "module_rejected_attempts": module_rejected_attempts,
         "initial_summary": initial_summary,
         "initial_pylingual_verification": initial_pylingual_verification,

@@ -143,6 +143,70 @@ def make_openai_call(prompt, model: str = "gpt-5.5-1", provider: str = "OpenAI")
             return None
 
 
+# --- Local vLLM server seam (speedup step 3) -------------------------------------------------
+# When SEMANTIC_VLLM_SERVER_URL is set, a local-Qwen config routes generation to a LOCAL
+# ``vllm serve`` OpenAI-compatible endpoint on localhost instead of building the in-process
+# engine. This lets N stateless worker processes share ONE server so vLLM continuous-batches
+# independent files on the one GPU. It is transport-only: localhost, same merged weights + same
+# tokenizer/chat-template as the offline path, greedy -> temperature 0.0, so decoding matches and
+# the local-Qwen-only rule holds (nothing leaves the box). Unset env == the old in-process path.
+_LOCAL_VLLM_CLIENTS: dict[str, Any] = {}
+
+
+def _local_vllm_client(base_url: str):
+    """Build (once, cached per base_url) an OpenAI client pointed at a LOCAL vllm-serve endpoint.
+    Distinct from the Azure/DeepSeek clients; the api_key is a placeholder vLLM ignores."""
+    client = _LOCAL_VLLM_CLIENTS.get(base_url)
+    if client is None:
+        client = OpenAI(api_key=os.getenv("SEMANTIC_VLLM_SERVER_API_KEY", "EMPTY"), base_url=base_url)
+        _LOCAL_VLLM_CLIENTS[base_url] = client
+    return client
+
+
+def call_local_vllm_server(
+    messages: List[dict],
+    *,
+    base_url: str,
+    model: str,
+    max_tokens: int,
+    generation_config: dict | None = None,
+) -> Optional[dict]:
+    """OpenAI-compatible /v1/chat/completions call to a LOCAL vllm-serve endpoint. The server
+    applies the same model dir's chat template, so with greedy (temperature 0.0) the output
+    matches the offline ``vllm_generate`` path up to vLLM's batch-invariance."""
+    from model.vllm_backend import build_sampling_params
+
+    sampling = build_sampling_params(generation_config, max_tokens)
+    params: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "max_tokens": sampling["max_tokens"],
+        "temperature": sampling.get("temperature", 0.0),
+    }
+    extra_body: dict[str, Any] = {}
+    if "top_p" in sampling:
+        params["top_p"] = sampling["top_p"]
+    if sampling.get("top_k", -1) != -1:
+        extra_body["top_k"] = sampling["top_k"]
+    if "repetition_penalty" in sampling:
+        extra_body["repetition_penalty"] = sampling["repetition_penalty"]
+    if extra_body:
+        params["extra_body"] = extra_body
+
+    client = _local_vllm_client(base_url)
+    try:
+        completion = client.chat.completions.create(**params)
+    except Exception as e:  # noqa: BLE001 - surface, let caller record a failed attempt
+        print(f"An error occurred during the local vLLM server call: {e}")
+        return None
+    usage = getattr(completion, "usage", None)
+    if completion and getattr(completion, "choices", None):
+        content = getattr(completion.choices[0].message, "content", None)
+        return {"content": content.strip() if isinstance(content, str) else content, "usage": usage}
+    return None
+
+
 async def make_gemini_call(system_text: str, user_text: str, model: str = "gemini-2.5-flash-lite"):
     try:
         if google_client is None or types is None:
@@ -257,6 +321,19 @@ def make_llm_call_from_config(messages: List[dict], llm_config: dict[str, Any]) 
         return make_llm_call(messages, model=model, provider=provider)
 
     if "model_path" in llm_config:
+        # Transport swap: a running LOCAL vllm-serve endpoint short-circuits the in-process
+        # engine so N worker processes can share one server (cross-file batching). localhost
+        # only; unset env falls through to the unchanged in-process path.
+        server_url = os.getenv("SEMANTIC_VLLM_SERVER_URL", "").strip()
+        if server_url:
+            return call_local_vllm_server(
+                messages,
+                base_url=server_url,
+                model=os.getenv("SEMANTIC_VLLM_SERVER_MODEL", "repair-model"),
+                max_tokens=llm_config["token_for_completion"],
+                generation_config=llm_config.get("generation_config"),
+            )
+
         from model.inference import call_llm_with_message
 
         content = call_llm_with_message(

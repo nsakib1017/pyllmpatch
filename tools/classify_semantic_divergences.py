@@ -228,7 +228,8 @@ def classify_row(row):
     finally:
         if have_alarm:
             signal.alarm(0)
-    fh = (row.get("file_hash") or row.get("hash") or "?")[:12]
+    full_fh = row.get("file_hash") or row.get("hash") or "?"
+    fh = full_fh[:12]
     ver = row.get("bytecode_version") or row.get("python_version") or "?"
     obj_verdicts = []
     class_counts = Counter()
@@ -252,7 +253,7 @@ def classify_row(row):
         fv = "mixed_needs_llm"
     else:
         fv = "llm_only"
-    return {"status": "ok", "file": fh, "ver": ver, "file_verdict": fv,
+    return {"status": "ok", "file": fh, "file_hash": full_fh, "ver": ver, "file_verdict": fv,
             "obj_verdicts": obj_verdicts, "class_counts": dict(class_counts), "objs": objs}
 
 
@@ -325,7 +326,7 @@ def main():
             if len(examples[key]) < 3:
                 examples[key].append({"file": res["file"], "ver": res["ver"],
                                       "obj": o["obj"], "verdict": o["verdict"], "cd": o["cd"]})
-        per_file.append({"file": res["file"], "ver": res["ver"],
+        per_file.append({"file": res["file"], "file_hash": res.get("file_hash"), "ver": res["ver"],
                          "file_verdict": res["file_verdict"], "objs": res["obj_verdicts"]})
 
     print(f"rows to classify: {len(rows)}  workers={args.workers}  source={args.source}", flush=True)
@@ -354,6 +355,7 @@ def main():
         "file_verdicts_by_version": {k: dict(v) for k, v in sorted(ver_file_verdict.items())},
         "examples_by_class": {", ".join(k) if k else "(none)": v for k, v in
                               sorted(examples.items(), key=lambda kv: -len(kv[1]))[:40]},
+        "per_file": per_file,  # [{file, ver, file_verdict, ...}] for downstream subset selection
     }
     if args.out:
         Path(args.out).write_text(json.dumps(out, indent=2))

@@ -36,6 +36,7 @@ sys.path.insert(0, str(R))
 
 # --- Quality-neutral speed levers ---------------------------------------------------------
 os.environ["SEMANTIC_COMPILE_WORKER"] = os.getenv("SEMANTIC_COMPILE_WORKER", "1")  # Lever A (safe)
+os.environ["SEMANTIC_RESUME"] = os.getenv("SEMANTIC_RESUME", "1")  # skip files with a result.json (crash-safe)
 if os.getenv("VLLM", "0").strip().lower() in ("1", "true", "yes", "on"):
     os.environ["SEMANTIC_LLM_ENGINE"] = "vllm"  # Lever B (opt-in, HF fallback). Distinct from
     # loader's SEMANTIC_INFERENCE_BACKEND (unsloth|transformers) — do NOT set that one here.
@@ -58,13 +59,22 @@ if not Path(MODEL_PATH).exists():
     print(f"!! MODEL_PATH does not exist: {MODEL_PATH}", flush=True)
     sys.exit(2)
 
+# Decoding is env-driven so we can A/B greedy (default, parity-passed) vs stochastic sampling
+# (SEMANTIC_DO_SAMPLE=1) — sampling gives the per-strategy candidates real diversity.
+_do_sample = os.getenv("SEMANTIC_DO_SAMPLE", "0").strip().lower() in ("1", "true", "yes", "on")
+_gen_cfg = {"max_new_tokens": 2048, "do_sample": _do_sample}
+if _do_sample:
+    _gen_cfg["temperature"] = float(os.getenv("SEMANTIC_TEMPERATURE", "0.7"))
+    _gen_cfg["top_p"] = float(os.getenv("SEMANTIC_TOP_P", "0.95"))
+else:
+    _gen_cfg.update({"temperature": 0.0, "top_p": 1.0})
 providers.OPEN_LLM_MODELS.append({
     "provider": "Alibaba",
     "name": MODEL_NAME,
     "token_for_completion": 16384,
     "model_path": MODEL_PATH,
     "tokenizer_path": MODEL_PATH,
-    "generation_config": {"max_new_tokens": 2048, "do_sample": False, "temperature": 0.0, "top_p": 1.0},
+    "generation_config": _gen_cfg,
 })
 
 from pipeline.code_object_repair_loop import run_dataset_repair_loop  # noqa: E402

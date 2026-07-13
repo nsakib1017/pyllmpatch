@@ -412,5 +412,172 @@ class SyntheticNonConstDefaultDefersTest(unittest.TestCase):
             self.assertIsNone(out)
 
 
+# ---------------------------------------------------------------------------
+# EXTENSION (task #35): annotation-entangled defaults, SET_FUNCTION_ATTRIBUTE form,
+# and multiple diverging functions. See docs/superpowers/specs/
+# 2026-07-12-deterministic-module-operator-coverage-design.md.
+# ---------------------------------------------------------------------------
+class AnnotationEntangledDefaultMockTest(unittest.TestCase):
+    """3.11/3.12 flag form: a function with BOTH defaults and annotations
+    (``MAKE_FUNCTION 5``) whose derived dropped only the defaults (``MAKE_FUNCTION 4``).
+    The defaults tuple must be recovered even though it is not immediately before the
+    code load (the annotations const sits between)."""
+
+    def _sites_flags5(self):
+        code_f = _code("def f(a, b): return a")
+        # stack order (bit order): defaults(0x01), annotations(0x04), code.
+        gt = _BC([
+            _Inst("LOAD_CONST", argval=(5,)),                 # defaults
+            _Inst("LOAD_CONST", argval=("return", "int")),    # annotations tuple
+            _Inst("LOAD_CONST", argval=code_f),
+            _Inst("MAKE_FUNCTION", arg=5, argrepr="defaults, annotations"),
+            _Inst("STORE_NAME", argval="f", argrepr="f"),
+        ])
+        der = _BC([
+            _Inst("LOAD_CONST", argval=("return", "int")),    # annotations only
+            _Inst("LOAD_CONST", argval=code_f),
+            _Inst("MAKE_FUNCTION", arg=4, argrepr="annotations"),
+            _Inst("STORE_NAME", argval="f", argrepr="f"),
+        ])
+        return gt, der
+
+    def test_def_sites_recovers_defaults_under_annotations(self):
+        gt, _der = self._sites_flags5()
+        sites = _def_sites(list(gt))
+        self.assertIn("f", sites)
+        self.assertTrue(sites["f"].defaults_ok, "defaults must be recovered when flags & 0x01 with other bits set")
+        self.assertEqual(sites["f"].defaults, (5,))
+
+    def test_candidate_restores_default_under_annotation(self):
+        gt, der = self._sites_flags5()
+        out = decorator_default_candidate(gt, der, "def f(a, b) -> int:\n    return a\n", _ctx())
+        self.assertIsNotNone(out)
+        self.assertEqual(out["text"], "def f(a, b=5) -> int:\n    return a\n")
+
+
+class SetFunctionAttributeDefaultMockTest(unittest.TestCase):
+    """3.13-3.15 form: ``MAKE_FUNCTION`` takes no flags; defaults are applied by a
+    trailing ``SET_FUNCTION_ATTRIBUTE 1``. Derived dropped the whole thing."""
+
+    def _sites_sfa(self, with_annotation=False):
+        code_f = _code("def f(a, b): return a")
+        gt_ins = [_Inst("LOAD_CONST", argval=(5,))]           # defaults value
+        if with_annotation:
+            gt_ins.append(_Inst("LOAD_CONST", argval=("return", "int")))
+        gt_ins += [
+            _Inst("LOAD_CONST", argval=code_f),
+            _Inst("MAKE_FUNCTION", arg=None),
+        ]
+        if with_annotation:
+            gt_ins.append(_Inst("SET_FUNCTION_ATTRIBUTE", arg=4, argrepr="annotations"))
+        gt_ins += [
+            _Inst("SET_FUNCTION_ATTRIBUTE", arg=1, argrepr="defaults"),
+            _Inst("STORE_NAME", argval="f", argrepr="f"),
+        ]
+        der = _BC([
+            _Inst("LOAD_CONST", argval=code_f), _Inst("MAKE_FUNCTION", arg=None),
+            _Inst("STORE_NAME", argval="f", argrepr="f"),
+        ])
+        return _BC(gt_ins), der
+
+    def test_def_sites_recovers_defaults_from_sfa(self):
+        gt, _der = self._sites_sfa()
+        sites = _def_sites(list(gt))
+        self.assertIn("f", sites)
+        self.assertTrue(sites["f"].defaults_ok, "SET_FUNCTION_ATTRIBUTE 1 defaults must be recovered (3.13+)")
+        self.assertEqual(sites["f"].defaults, (5,))
+
+    def test_candidate_restores_default_sfa(self):
+        gt, der = self._sites_sfa()
+        out = decorator_default_candidate(gt, der, "def f(a, b):\n    return a\n", _ctx())
+        self.assertIsNotNone(out)
+        self.assertEqual(out["text"], "def f(a, b=5):\n    return a\n")
+
+
+class MultiFunctionDefaultTest(unittest.TestCase):
+    """Multiple functions dropped their defaults: the operator fixes ONE (deterministically
+    the first by source order) and defers the rest to the next prepass iteration, rather than
+    deferring everything because more than one candidate applies."""
+
+    def test_fixes_one_of_many(self):
+        code_f = _code("def f(a, b): return a")
+        code_g = _code("def g(c, d): return c")
+        gt = _BC([
+            _Inst("LOAD_CONST", argval=(5,)), _Inst("LOAD_CONST", argval=code_f),
+            _Inst("MAKE_FUNCTION", arg=1), _Inst("STORE_NAME", argval="f", argrepr="f"),
+            _Inst("LOAD_CONST", argval=(9,)), _Inst("LOAD_CONST", argval=code_g),
+            _Inst("MAKE_FUNCTION", arg=1), _Inst("STORE_NAME", argval="g", argrepr="g"),
+        ])
+        der = _BC([
+            _Inst("LOAD_CONST", argval=code_f), _Inst("MAKE_FUNCTION", arg=0),
+            _Inst("STORE_NAME", argval="f", argrepr="f"),
+            _Inst("LOAD_CONST", argval=code_g), _Inst("MAKE_FUNCTION", arg=0),
+            _Inst("STORE_NAME", argval="g", argrepr="g"),
+        ])
+        frag = "def f(a, b):\n    return a\n\ndef g(c, d):\n    return c\n"
+        out = decorator_default_candidate(gt, der, frag, _ctx())
+        self.assertIsNotNone(out, "must fix one function rather than defer on multiple")
+        # deterministically the first (f); exactly one edit applied, still valid source.
+        self.assertEqual(out["text"], "def f(a, b=5):\n    return a\n\ndef g(c, d):\n    return c\n")
+        compile(out["text"], "<m>", "exec")
+
+
+@unittest.skipUnless(_pylingual_available(), "pylingual unavailable")
+@unittest.skipUnless(sys.version_info[:2] >= (3, 10), "requires CPython 3.10+")
+class SyntheticAnnotationEntangledDefaultTest(unittest.TestCase):
+    """End-to-end on the host interpreter, mirroring the real target 8eedb5648e (pandas):
+    ``from __future__ import annotations`` makes annotations const strings, so a function with
+    BOTH defaults and a return annotation compiles to two const tuples before the code load
+    (``MAKE_FUNCTION 5`` on 3.11/3.12, ``SET_FUNCTION_ATTRIBUTE`` on 3.13+). The derived source
+    dropped only the defaults. The operator restores ``=5`` and recompiles to distance 0."""
+
+    GT_SRC = "from __future__ import annotations\n\ndef f(a, b=5) -> int:\n    return a + b\n\nprint(f(1))\n"
+    DER_SRC = "from __future__ import annotations\n\ndef f(a, b) -> int:\n    return a + b\n\nprint(f(1))\n"
+
+    def test_recompiles_to_distance_zero(self):
+        with tempfile.TemporaryDirectory() as d:
+            gt_py, der_py = os.path.join(d, "gt.py"), os.path.join(d, "der.py")
+            Path(gt_py).write_text(self.GT_SRC, encoding="utf-8")
+            Path(der_py).write_text(self.DER_SRC, encoding="utf-8")
+            gt_pyc = Path(py_compile.compile(gt_py, cfile=os.path.join(d, "gt.pyc"), doraise=True))
+            der_pyc = Path(py_compile.compile(der_py, cfile=os.path.join(d, "der.pyc"), doraise=True))
+            self.assertNotEqual(_combined_distance(gt_pyc, der_pyc), 0)
+            tr = _module_divergence(gt_pyc, der_pyc)
+            self.assertIsNotNone(tr)
+            out = decorator_default_candidate(
+                tr.bc_a, tr.bc_b, self.DER_SRC, {"pylingual_failed_result": {"message": tr.message}})
+            self.assertIsNotNone(out)
+            self.assertEqual(out["text"], self.GT_SRC)
+            fixed_py = os.path.join(d, "fixed.py")
+            Path(fixed_py).write_text(out["text"], encoding="utf-8")
+            fixed_pyc = Path(py_compile.compile(fixed_py, cfile=os.path.join(d, "fixed.pyc"), doraise=True))
+            self.assertEqual(_combined_distance(gt_pyc, fixed_pyc), 0)
+
+
+@unittest.skipUnless(_pylingual_available(), "pylingual unavailable")
+@unittest.skipUnless(sys.version_info[:2] >= (3, 10), "requires CPython 3.10+")
+class SyntheticComputedAnnotationDefersTest(unittest.TestCase):
+    """Safety boundary: a *computed* return annotation (``-> int`` with NO
+    ``from __future__ import annotations``) builds the annotation via ``LOAD_NAME int;
+    BUILD_TUPLE`` — a multi-instruction attribute slot the defaults localizer cannot positively
+    separate — so the operator DEFERS rather than guess. The oracle gate / LLM handle it."""
+
+    GT_SRC = "def f(a, b=5) -> int:\n    return a + b\n\nprint(f(1))\n"
+    DER_SRC = "def f(a, b) -> int:\n    return a + b\n\nprint(f(1))\n"
+
+    def test_defers(self):
+        with tempfile.TemporaryDirectory() as d:
+            gt_py, der_py = os.path.join(d, "gt.py"), os.path.join(d, "der.py")
+            Path(gt_py).write_text(self.GT_SRC, encoding="utf-8")
+            Path(der_py).write_text(self.DER_SRC, encoding="utf-8")
+            gt_pyc = Path(py_compile.compile(gt_py, cfile=os.path.join(d, "gt.pyc"), doraise=True))
+            der_pyc = Path(py_compile.compile(der_py, cfile=os.path.join(d, "der.pyc"), doraise=True))
+            tr = _module_divergence(gt_pyc, der_pyc)
+            self.assertIsNotNone(tr)
+            out = decorator_default_candidate(
+                tr.bc_a, tr.bc_b, self.DER_SRC, {"pylingual_failed_result": {"message": tr.message}})
+            self.assertIsNone(out)
+
+
 if __name__ == "__main__":
     unittest.main()

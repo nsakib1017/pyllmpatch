@@ -82,6 +82,9 @@ SEMANTIC_REPAIR_TOKEN_HEADROOM = _bounded_int_env("SEMANTIC_REPAIR_TOKEN_HEADROO
 SEMANTIC_DETERMINISTIC_OPERATORS = (
     os.getenv("SEMANTIC_DETERMINISTIC_OPERATORS", "0").strip().lower() in ("1", "true", "yes", "on")
 )
+# Resume: skip any dataset row whose result.json already exists (re-emit its CSV row from cache).
+# Makes a multi-day 3000-file run crash-safe — a reboot resumes instead of restarting from scratch.
+SEMANTIC_RESUME = os.getenv("SEMANTIC_RESUME", "0").strip().lower() in ("1", "true", "yes", "on")
 SEMANTIC_REPAIR_SAMPLE_TIMEOUT_SECONDS = _bounded_int_env(
     "SEMANTIC_REPAIR_SAMPLE_TIMEOUT_SECONDS",
     60 * 60,
@@ -1310,6 +1313,25 @@ def _format_code_shape_summary(*, gt_code_object: Any, derived_code_object: Any)
     return "\n".join(lines)
 
 
+def _corrective_residual_block(rejected_attempts: list[dict]) -> str:
+    """Corrective feedback (#54): surface, from the most recent rejected attempt that carries
+    one, the concrete GT-vs-candidate residual — what the model's OWN last edit still gets
+    wrong — instead of only an abstract distance. Present only when the loop captured a residual
+    (SEMANTIC_CORRECTIVE_FEEDBACK on); absent otherwise, so the prompt is unchanged by default."""
+    for attempt in reversed(rejected_attempts):
+        residual = attempt.get("candidate_residual")
+        if isinstance(residual, dict) and residual.get("window"):
+            offset = residual.get("failed_offset")
+            message = residual.get("message") or "different bytecode"
+            where = f"offset {offset}" if offset is not None else "the diverging region"
+            return (
+                f"- your last edit still differs from ground truth at {where} ({message}):\n"
+                f"{residual['window']}\n"
+                "  Make the smallest change that resolves THIS divergence."
+            )
+    return ""
+
+
 def _format_rejected_attempt_summary(repair_context: dict | None) -> str:
     rejected_attempts = [] if not repair_context else repair_context.get("rejected_attempts") or []
     rejected_attempts = [item for item in rejected_attempts[-3:] if isinstance(item, dict)]
@@ -1342,6 +1364,9 @@ def _format_rejected_attempt_summary(repair_context: dict | None) -> str:
     recent_after_scores = [score for score in recent_after_scores if score is not None]
     if recent_after_scores:
         lines.append(f"- recent rejected after-distances: {', '.join(str(score) for score in recent_after_scores[-3:])}")
+    corrective = _corrective_residual_block(rejected_attempts)
+    if corrective:
+        lines.append(corrective)
     lines.append("- Prefer a different minimal edit unless the current bytecode evidence strongly supports the rejected action.")
     return "\n".join(lines)
 
@@ -2901,6 +2926,17 @@ def run_dataset_repair_loop(
                 row_output_dir = log_base / "semantic_repair" / str(row.source) / str(row.file_hash)
                 row_output_dir.mkdir(parents=True, exist_ok=True)
                 result_json_path = row_output_dir / "result.json"
+                if SEMANTIC_RESUME and result_json_path.exists():
+                    # already processed in a prior (possibly crashed) run: re-emit its CSV row
+                    # from the cached result.json and skip the expensive repair.
+                    try:
+                        _cached = json.loads(result_json_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        _cached = None
+                    if isinstance(_cached, dict) and _cached.get("final_summary") is not None:
+                        print(f"[semantic_repair] file_hash={row.file_hash} -> RESUME (cached result.json)", flush=True)
+                        writer.writerow(_dataset_result_row(row, _cached, result_json_path))
+                        continue
                 if fixer_name not in {"oracle", "llm", "none"}:
                     raise ValueError(f"Unsupported fixer backend: {fixer_name}")
                 if fixer_name == "none":

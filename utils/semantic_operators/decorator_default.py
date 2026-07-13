@@ -162,14 +162,20 @@ def _def_sites(insts: list) -> dict[str, _DefSite]:
             continue
         flags = _argint(ins)
 
-        # Walk MAKE_FUNCTION -> STORE, counting decorator-application CALLs. Anything else in
-        # between (a nested expr, a def used as an argument) makes this site un-interpretable.
+        # Walk MAKE_FUNCTION -> STORE, counting decorator-application CALLs and folding in any
+        # SET_FUNCTION_ATTRIBUTE bits (3.13+ applies defaults/annotations/etc. via these ops
+        # AFTER make_function instead of via the flags arg). Anything else in between (a nested
+        # expr, a def used as an argument) makes this site un-interpretable.
         j = idx + 1
         store_name = None
         decorator_count = 0
         clean = True
         while j < len(seq):
             op = getattr(seq[j], "opname", None)
+            if op == "SET_FUNCTION_ATTRIBUTE":
+                flags |= _argint(seq[j])   # unify 3.13+ form into the same flag bits
+                j += 1
+                continue
             if op in _CALL_OPCODES:
                 decorator_count += 1
                 j += 1
@@ -186,15 +192,26 @@ def _def_sites(insts: list) -> dict[str, _DefSite]:
         site.decorator_count = decorator_count
         site.clean = clean
 
-        # DEFAULTS recovery: only the simple, dominant case where positional defaults are the
-        # *only* MAKE_FUNCTION attribute (flags == 0x01) so the const tuple sits immediately
-        # before the code load. Any other flag combination is left unrecovered (defers later).
-        if flags == _FLAG_DEFAULTS and idx >= 2:
-            defaults_ins = seq[idx - 2]
-            if (getattr(defaults_ins, "opname", None) == "LOAD_CONST"
-                    and isinstance(getattr(defaults_ins, "argval", None), tuple)):
-                site.defaults = defaults_ins.argval
-                site.defaults_ok = True
+        # DEFAULTS recovery. Function attributes are pushed below the code load in bit order
+        # (defaults 0x01, kwdefaults 0x02, annotations 0x04, closure 0x08), so the positional
+        # defaults tuple — when present — is the BOTTOM-most attribute slot, at
+        # ``code_idx - popcount(flags)``. This holds for BOTH the <=3.12 flags-arg form and the
+        # 3.13+ SET_FUNCTION_ATTRIBUTE form (values are still loaded before the code). Recover
+        # only when every attribute slot is a plain LOAD_CONST and the defaults slot is a tuple;
+        # any multi-instruction attribute (e.g. a BUILD_TUPLE annotation) can't be positively
+        # located, so we defer. The oracle gate is the final backstop.
+        if flags & _FLAG_DEFAULTS:
+            n_attrs = bin(flags & 0x0F).count("1")
+            code_idx = idx - 1
+            first = code_idx - n_attrs
+            if first >= 0 and all(
+                getattr(seq[k], "opname", None) == "LOAD_CONST"
+                for k in range(first, code_idx)
+            ):
+                defaults_val = getattr(seq[first], "argval", None)
+                if isinstance(defaults_val, tuple):
+                    site.defaults = defaults_val
+                    site.defaults_ok = True
 
         # DECORATOR recovery: a single decorator, no other MAKE_FUNCTION attributes (flags == 0)
         # so the pre-code region is purely the decorator load(s).
@@ -416,8 +433,13 @@ def decorator_default_candidate(gt_code_object, derived_code_object, fragment: s
             if cand is not None:
                 candidates.append(cand)
 
-        if len(candidates) != 1:
+        if not candidates:
             return None
+        # Multiple diverging functions: fix ONE — the first in bytecode/source order (gt_sites is
+        # insertion-ordered, candidates appended in that order) — and defer the rest. The prepass
+        # loops to a fixpoint and re-invokes on the residual, so all get restored across
+        # iterations, each independently oracle-gated. (Previously any multi-divergence deferred
+        # entirely, so files where several functions dropped defaults were never repaired.)
         return candidates[0]
     except Exception:  # noqa: BLE001 - a bad candidate is rejected by the oracle gate; a
         # raised exception would crash the repair loop, so swallow everything.
