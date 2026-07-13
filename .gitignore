@@ -28,3 +28,5 @@ test
 .agents
 CLAUDE.md
 plans
+docs
+tools

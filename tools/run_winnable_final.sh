@@ -54,7 +54,10 @@ export SEMANTIC_POST_LLM_DETERMINISTIC=1
 export SEMANTIC_TAIL_DEADLINE="${SEMANTIC_TAIL_DEADLINE:-400}"
 export MAX_ITER="${MAX_ITER:-5}" CAND_COUNT="${CAND_COUNT:-5}"
 export SOFT_TIMEOUT="${SOFT_TIMEOUT:-900}" HARD_TIMEOUT="${HARD_TIMEOUT:-1200}"
-export SEMANTIC_DO_SAMPLE=0
+# decoding: greedy by default; sampling (SEMANTIC_DO_SAMPLE=1) gives diverse oracle-gated
+# best-of-N candidates for higher yield. temp/top_p propagate to workers by env inheritance.
+export SEMANTIC_DO_SAMPLE="${SEMANTIC_DO_SAMPLE:-0}"
+export SEMANTIC_TEMPERATURE="${SEMANTIC_TEMPERATURE:-0.7}" SEMANTIC_TOP_P="${SEMANTIC_TOP_P:-0.95}"
 SPEC_CONFIG="${SPEC_CONFIG:-{\"method\":\"ngram\",\"num_speculative_tokens\":5,\"prompt_lookup_max\":4,\"prompt_lookup_min\":2}}"
 
 mkdir -p "$OUTDIR"
@@ -62,6 +65,8 @@ LOG="$OUTDIR/supervisor.log"
 [ -f "$OUTDIR/t0.txt" ] || date +%s > "$OUTDIR/t0.txt"   # persist run start across restarts
 T0=$(cat "$OUTDIR/t0.txt")
 log(){ echo "$(date -u '+%F %T') $*" | tee -a "$LOG"; }
+
+TOTAL="${TOTAL:-$(( $(wc -l < "$DATASET") - 1 ))}"   # denominator (defined before metadata uses it)
 
 # --- self-documenting metadata: exact code version + full config (written once) ---
 export SPEC_CONFIG N_WORKERS DATASET ADAPTER
