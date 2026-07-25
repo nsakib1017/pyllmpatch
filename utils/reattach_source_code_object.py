@@ -4802,7 +4802,30 @@ def repair_mismatching_code_objects(
                         file_hash=file_hash,
                     )
                 continue
-            target_row = _find_target_row(current_source, current_pyc, qualname, strict_map=strict_map)
+            try:
+                target_row = _find_target_row(current_source, current_pyc, qualname, strict_map=strict_map)
+            except ReattachError as exc:
+                # Unmappable target (e.g. a PEP-695 synthetic type-param/alias object with no
+                # source span): skip it and keep repairing the rest of the file instead of
+                # aborting the whole-file loop (mirrors the graceful extra-target-deletion
+                # pattern below and the deterministic-prepass skip above).
+                _store_semantic_step(
+                    steps,
+                    {
+                        "step": step_index,
+                        "iteration": iteration,
+                        "qualname": qualname,
+                        "repair_operation": "repair_source_fragment",
+                        "target_score_before": target_score_before,
+                        "target_score_after": None,
+                        "accepted": False,
+                        "acceptance_reason": f"target could not be mapped: {exc}",
+                    },
+                    log_file=log_file,
+                    run_id=run_id,
+                    file_hash=file_hash,
+                )
+                continue
             current_text = _load_text(current_source)
             extracted_before = extract_source_segment(current_text, target_row)
             current_code_objects = index_code_objects_by_qualname(current_pyc)
