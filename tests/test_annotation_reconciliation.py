@@ -1,5 +1,14 @@
+import tempfile
 import unittest
-from utils.reattach_source_code_object import _annotate_enclosing_qualname, _gt_def_source_by_qualname
+from pathlib import Path
+from unittest import mock
+
+import utils.reattach_source_code_object as R
+from utils.reattach_source_code_object import (
+    _annotate_enclosing_qualname,
+    _gt_def_source_by_qualname,
+    repair_mismatching_code_objects,
+)
 
 class AnnotateEnclosingQualnameTest(unittest.TestCase):
     def test_maps_annotate_child_to_enclosing_def(self):
@@ -35,3 +44,54 @@ class GtDefSourceTest(unittest.TestCase):
         self.assertTrue(seg.startswith("def top(")); self.assertIn("-> str", seg)
     def test_missing_returns_none(self):
         self.assertIsNone(_gt_def_source_by_qualname(SRC, "<module>.Nope"))
+
+
+FX = Path(__file__).parent / "fixtures" / "annotation" / "settings"
+
+
+class AnnotationReconcileEngineTest(unittest.TestCase):
+    """Two adjustments vs. the plan's literal pseudocode, both "verify against real code" fixes
+    (the plan itself flags the result-key name as needing this kind of check):
+
+    1. `SEMANTIC_ANNOTATION_RECONCILE` (like its sibling `SEMANTIC_*` flags in this module) is
+       read from `os.environ` once at IMPORT time into a module-level constant, so mutating
+       `os.environ` from inside a test has no effect on an already-imported module. The
+       established pattern for exercising these flags at test time (see
+       `tests/test_post_llm_deterministic.py::_ModeIsolatedTest`) is
+       `mock.patch.object(R, "FLAG_NAME", True/False)`, used below.
+    2. `acceptance_mode="distance"` (not "oracle"): the deterministic-prepass accept gate this
+       feature reuses (`run_deterministic_prepass`'s `compare_verifications` check) is ALWAYS
+       oracle-verification-based, regardless of the global `ACCEPTANCE_MODE` -- so it validates
+       the feature identically either way. `acceptance_mode="oracle"` additionally activates
+       `_oracle_primary_fragment_targets` in the main iteration loop, which has a pre-existing gap
+       (unrelated to this feature: it lacks the `_is_synthetic_annotation_qualname` guard its
+       sibling selectors `select_repair_targets` / `select_missing_repair_targets` already carry)
+       that raises an uncaught `ReattachError` for any unresolved `__annotate__` divergence.
+       Pinning "distance" avoids that orthogonal, pre-existing bug so this test isolates Task 3's
+       behavior. Restoring the module global in `tearDown` follows the existing
+       `_ModeIsolatedTest` pattern in tests/test_prepass_reject_instrumentation.py."""
+
+    def setUp(self):
+        self._prev_mode = R.ACCEPTANCE_MODE
+
+    def tearDown(self):
+        R.ACCEPTANCE_MODE = self._prev_mode
+
+    def test_flag_on_converts_pure_annotation_file(self):
+        with mock.patch.object(R, "SEMANTIC_ANNOTATION_RECONCILE", True):
+            with tempfile.TemporaryDirectory() as td:
+                res = repair_mismatching_code_objects(
+                    FX/"gt.pyc", FX/"derived.pyc", FX/"derived.py",
+                    gt_source=FX/"gt.py", output_dir=Path(td),
+                    fragment_fixer=None, acceptance_mode="distance",
+                    verify_with_pylingual=True, verify_each_step_with_pylingual=True)
+        self.assertEqual(res["final_summary"]["combined_distance"], 0)
+
+    def test_flag_off_leaves_distance_unchanged(self):
+        with mock.patch.object(R, "SEMANTIC_ANNOTATION_RECONCILE", False):
+            with tempfile.TemporaryDirectory() as td:
+                res = repair_mismatching_code_objects(
+                    FX/"gt.pyc", FX/"derived.pyc", FX/"derived.py",
+                    gt_source=FX/"gt.py", output_dir=Path(td),
+                    fragment_fixer=None, acceptance_mode="distance")
+        self.assertGreater(res["final_summary"]["combined_distance"], 0)  # unchanged: still diverges

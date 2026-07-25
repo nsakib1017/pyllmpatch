@@ -4134,6 +4134,20 @@ def repair_mismatching_code_objects(
                 if not (is_leaf or is_struct or is_diffbc):
                     continue
                 qualname = tr.names()
+                # Annotation reconciliation (Stage 1, oracle-source backend, flag-gated): a
+                # diverged/missing synthetic `__annotate__` object has no source representation
+                # of its own, so remap the target to the ENCLOSING def/class whose annotations
+                # produced it and repair that instead, using the verbatim GT source segment as
+                # the deterministic candidate. Falls through to the SAME recompile + oracle gate
+                # below; never fires when the flag is off, there is no GT source, or the qualname
+                # isn't a `__annotate__` leaf (defer, never a guessed annotation).
+                annotate_enclosing = (
+                    _annotate_enclosing_qualname(qualname)
+                    if (SEMANTIC_ANNOTATION_RECONCILE and gt_source is not None)
+                    else None
+                )
+                if annotate_enclosing is not None:
+                    qualname = annotate_enclosing
                 # The <module> object has no extractable code-object span (its row span is
                 # degenerate/empty), so feed the WHOLE source as its fragment and write the
                 # operator's full output back directly. This lets the deterministic operators
@@ -4155,7 +4169,18 @@ def repair_mismatching_code_objects(
                 }
                 candidate = None
                 operation = strategy = None
-                if is_leaf:
+                if annotate_enclosing is not None:
+                    annotation_candidate_text = _gt_def_source_by_qualname(_load_text(gt_source), qualname)
+                    if annotation_candidate_text is not None and annotation_candidate_text != fragment:
+                        candidate = {
+                            "text": annotation_candidate_text,
+                            "operator": "annotation_reconcile",
+                            "confidence": "high",
+                        }
+                        operation, strategy = "deterministic_prepass_annotation", "deterministic_annotation"
+                    if candidate is None:
+                        continue
+                elif is_leaf:
                     candidate = leaf_value_candidate(tr.bc_a, tr.bc_b, fragment, repair_context)
                     if candidate is not None:
                         operation, strategy = "deterministic_prepass_leaf", "deterministic_leaf"
