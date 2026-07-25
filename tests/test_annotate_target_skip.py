@@ -11,6 +11,7 @@ from utils.reattach_source_code_object import (
     select_missing_repair_targets,
     select_repair_targets,
     _is_synthetic_annotation_qualname,
+    _oracle_primary_fragment_targets,
 )
 
 
@@ -46,6 +47,38 @@ class SyntheticAnnotationSkipTest(unittest.TestCase):
             },
         ]
         targets = select_repair_targets(rows)
+        self.assertIn("<module>.real_function", targets)
+        self.assertNotIn("<module>.Config.__annotate__", targets)
+
+    def test_oracle_primary_fragment_target_skips_annotate(self):
+        # Oracle-acceptance-mode target selection (`_oracle_primary_fragment_targets`)
+        # must apply the same synthetic-annotation guard as `select_repair_targets`:
+        # a matched-but-diverged `__annotate__` qualname has no source span and
+        # would otherwise be handed to `_find_target_row`, which raises an
+        # uncaught ReattachError and crashes the whole call.
+        verification = {
+            "results": [
+                {"success": False, "names": "<module>.Config.__annotate__"},
+                {"success": False, "names": "<module>.real_function"},
+            ]
+        }
+        distance_rows = [
+            {
+                "status": "matched",
+                "gt_name": "<module>.Config.__annotate__",
+                "derived_name": "<module>.Config.__annotate__",
+                "combined_distance": 0,
+            },
+            {
+                "status": "matched",
+                "gt_name": "<module>.real_function",
+                "derived_name": "<module>.real_function",
+                "combined_distance": 0,
+            },
+        ]
+        targets = _oracle_primary_fragment_targets(
+            verification, distance_rows, {}, 1, include_module=False
+        )
         self.assertIn("<module>.real_function", targets)
         self.assertNotIn("<module>.Config.__annotate__", targets)
 

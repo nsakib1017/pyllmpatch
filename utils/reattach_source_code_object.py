@@ -2141,6 +2141,8 @@ def _oracle_primary_fragment_targets(
             continue
         if attempt_counts.get(qualname, 0) >= max_iterations:
             continue
+        if _is_synthetic_annotation_qualname(qualname):
+            continue
         targets.append(qualname)
     return targets
 
