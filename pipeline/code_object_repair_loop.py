@@ -2305,12 +2305,15 @@ class CodeObjectRepairLoop:
         sample_timeout_seconds: int | None = None,
         sample_hard_timeout_seconds: int | None = None,
         sample_timeout_min_improvement_delta: int = SEMANTIC_REPAIR_TIMEOUT_MIN_IMPROVEMENT_DELTA,
+        gt_source: Path | None = None,
     ) -> dict:
         self._set_prompt_output_dir(output_dir, derived_source)
+        effective_gt_source = gt_source if gt_source is not None else getattr(self.fixer, "gt_source", None)
         result = repair_mismatching_code_objects(
             gt_pyc=gt_pyc,
             derived_pyc=derived_pyc,
             derived_source=derived_source,
+            gt_source=effective_gt_source,
             output_dir=output_dir,
             log_file=log_file,
             run_id=run_id,
