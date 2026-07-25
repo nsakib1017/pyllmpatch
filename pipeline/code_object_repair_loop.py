@@ -2966,6 +2966,7 @@ def run_dataset_repair_loop(
                     gt_pyc=gt_pyc,
                     derived_pyc=derived_pyc,
                     derived_source=derived_source,
+                    gt_source=gt_source,
                     output_dir=row_output_dir,
                     log_file=log_file,
                     run_id=run_id,
