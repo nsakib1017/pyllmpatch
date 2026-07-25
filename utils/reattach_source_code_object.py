@@ -1621,6 +1621,36 @@ def _annotate_enclosing_qualname(qualname: str | None) -> str | None:
     return enclosing if enclosing and enclosing != "<module>" else None
 
 
+def _gt_def_source_by_qualname(gt_source_text: str, qualname: str) -> str | None:
+    """Return the exact GT source segment of the class/func at ``qualname``
+    (dotted, rooted at ``<module>``), or None on any ambiguity (parse failure,
+    qualname not rooted at ``<module>``, or any path segment not found)."""
+    import ast as _ast
+    parts = str(qualname).split(".")
+    if not parts or parts[0] != "<module>":
+        return None
+    names = parts[1:]
+    if not names:
+        return None
+    try:
+        tree = _ast.parse(gt_source_text)
+    except SyntaxError:
+        return None
+    node = tree
+    for name in names:
+        body = getattr(node, "body", None)
+        if body is None:
+            return None
+        match = next((c for c in body
+                      if isinstance(c, (_ast.ClassDef, _ast.FunctionDef, _ast.AsyncFunctionDef))
+                      and c.name == name), None)
+        if match is None:
+            return None
+        node = match
+    seg = _ast.get_source_segment(gt_source_text, node)
+    return seg
+
+
 def _expression_child_parent_qualname(qualname: str | None) -> str | None:
     if not qualname:
         return None
