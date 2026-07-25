@@ -1542,6 +1542,7 @@ def select_repair_targets(distance_rows: list[dict], *, include_module: bool = F
         and row["derived_name"]
         and row["gt_name"] == row["derived_name"]
         and (include_module or row["gt_name"] != "<module>")
+        and not _is_synthetic_annotation_qualname(row["gt_name"])
     ]
     ordered = sorted(set(candidates), key=lambda name: (_qualname_depth(name), name))
     selected: list[str] = []
@@ -1570,6 +1571,7 @@ def select_missing_repair_targets(distance_rows: list[dict]) -> list[str]:
         and row["gt_name"]
         and row["gt_name"] != "<module>"
         and not _is_expression_child_qualname(row["gt_name"])
+        and not _is_synthetic_annotation_qualname(row["gt_name"])
     ]
 
 
@@ -1584,6 +1586,20 @@ EXPRESSION_CHILD_QUALNAME_PARTS = (
 
 def _is_expression_child_qualname(qualname: str | None) -> bool:
     return bool(qualname and any(part in qualname for part in EXPRESSION_CHILD_QUALNAME_PARTS))
+
+
+SYNTHETIC_ANNOTATION_LEAF = "__annotate__"
+
+
+def _is_synthetic_annotation_qualname(qualname: str | None) -> bool:
+    """PEP-649/749 deferred-annotation code objects (leaf ``__annotate__``) are
+    compiler-generated and have no source representation — the decompiled source
+    lost the annotations, so the recompiled derived object has no ``__annotate__``
+    child and it surfaces as an unreattachable *missing* target. Skip it like an
+    expression-level child so one synthetic object can't abort the whole file."""
+    if not qualname:
+        return False
+    return str(qualname).rsplit(".", 1)[-1] == SYNTHETIC_ANNOTATION_LEAF
 
 
 def _expression_child_parent_qualname(qualname: str | None) -> str | None:
@@ -1804,6 +1820,37 @@ def _pylingual_code_object_metadata(bytecode: Any) -> dict:
         "co_qualname": getattr(code_object, "co_qualname", None),
         "co_firstlineno": getattr(code_object, "co_firstlineno", None),
         "instruction_count": len(bytecode) if bytecode is not None else None,
+    }
+
+
+def _prepass_rejection_record(
+    *,
+    qualname: str,
+    phase: str,
+    iteration: int,
+    operation: str | None,
+    strategy: str | None,
+    candidate: dict | None,
+    reason: str,
+    detail: str,
+) -> dict:
+    """Attribution record for a deterministic-prepass candidate that fired and was rejected.
+
+    ``reason`` is one of ``compile_error`` / ``regressed`` / ``no_improvement``. Acceptance is
+    NOT affected by this record: it exists so a null result can be attributed between "the
+    operator never fired" and "the operator fired and the gate discarded it".
+    """
+    candidate = candidate or {}
+    return {
+        "qualname": qualname,
+        "phase": phase,
+        "iteration": iteration,
+        "repair_operation": operation,
+        "strategy": strategy,
+        "operator": candidate.get("operator") or candidate.get("detail"),
+        "confidence": candidate.get("confidence"),
+        "reason": reason,
+        "detail": detail,
     }
 
 
@@ -3811,6 +3858,11 @@ def repair_mismatching_code_objects(
     unsupported_module_body_repair = False
     module_rejected_attempts: list[dict] = []
     rejected_attempts_by_qualname: dict[str, list[dict]] = {}
+    # Deterministic-prepass candidates that FIRED and then lost. `_store_semantic_step` runs only
+    # once the gate has passed, so without this both rejection paths vanish and "did the operator
+    # fire?" is unanswerable: a builder that deferred and a builder that was correct-but-rejected
+    # look identical from accepted-step counts alone.
+    prepass_rejected_attempts: list[dict] = []
     sample_timed_out = False
     sample_timeout_reached = False
     sample_hard_timeout_reached = False
@@ -4128,8 +4180,13 @@ def repair_mismatching_code_objects(
                     next_pyc = compile_source_to_pyc(
                         next_source, prepass_pyc_dir / f"prepass{step_index}.pyc", target_version
                     )
-                except (ReattachError, CompileError, OSError):
+                except (ReattachError, CompileError, OSError) as exc:
                     step_index -= 1
+                    prepass_rejected_attempts.append(_prepass_rejection_record(
+                        qualname=qualname, phase=phase, iteration=iteration_label,
+                        operation=operation, strategy=strategy, candidate=candidate,
+                        reason="compile_error", detail=f"{type(exc).__name__}: {exc}",
+                    ))
                     continue
                 candidate_verification = run_pylingual_verification(gt_pyc, next_pyc)
                 delta = compare_verifications(
@@ -4137,6 +4194,13 @@ def repair_mismatching_code_objects(
                 )
                 if delta.regressed or not delta.improved:
                     step_index -= 1
+                    prepass_rejected_attempts.append(_prepass_rejection_record(
+                        qualname=qualname, phase=phase, iteration=iteration_label,
+                        operation=operation, strategy=strategy, candidate=candidate,
+                        reason="regressed" if delta.regressed else "no_improvement",
+                        detail=(f"regressed: {', '.join(delta.regressed)}" if delta.regressed
+                                else "no object improved in the oracle lattice"),
+                    ))
                     continue
                 candidate_rows = compare_code_object_distances(gt_pyc, next_pyc)
                 candidate_summary = summarize_results(candidate_rows)
@@ -4361,12 +4425,22 @@ def repair_mismatching_code_objects(
                         repair_operation="repair_module_statement",
                         file_hash=file_hash,
                     )
-                    replacement_text = fragment_fixer(
+                    raw_module_candidates = fragment_fixer(
                         qualname,
                         gt_bytecode,
                         derived_bytecode,
                         extracted_before,
                         repair_context,
+                    )
+                    # The fixer may hand back a bare string (the historical module contract) or a
+                    # list of candidates (the fragment contract). `_normalize_fragment_candidates`
+                    # accepts both -- a string normalizes to a single-candidate list -- so this is
+                    # backward compatible while letting module repair be best-of-N. Single-shot is
+                    # why 27% of module rejections on the module-only cohort are purely mechanical:
+                    # one unparseable generation used to lose the whole file.
+                    module_candidate_inputs = _normalize_fragment_candidates(raw_module_candidates)
+                    replacement_text = str(
+                        (module_candidate_inputs[0].get("text") if module_candidate_inputs else "") or ""
                     )
                     prompt_record = repair_context.get("_llm_prompt_record") if isinstance(repair_context, dict) else {}
                     if isinstance(prompt_record, dict) and prompt_record.get("skipped_due_to_token_limit"):
@@ -4411,51 +4485,101 @@ def repair_mismatching_code_objects(
                         )
                         target_attempt_counts[qualname] = max_iterations
                         continue
-                    accepted, _, next_source, next_pyc, step_summary, step_pylingual_verification, step, _ = _apply_module_statement_candidate(
-                        gt_pyc=gt_pyc,
-                        current_source=current_source,
-                        current_pyc=current_pyc,
-                        current_summary=current_summary,
-                        current_pylingual_verification=current_pylingual_verification,
-                        candidate_text=replacement_text,
-                        line_number=line_number,
-                        output_dir=output_dir,
-                        pyc_dir=pyc_dir,
-                        fragments_dir=fragments_dir,
-                        derived_source_stem=derived_source.stem,
-                        step_index=step_index,
-                        iteration=iteration,
-                        target_version=target_version,
-                        verify_with_pylingual=verify_with_pylingual,
-                        verify_each_step_with_pylingual=verify_each_step_with_pylingual,
-                        reject_non_improving_candidates=reject_non_improving_candidates,
-                    )
-                    step["repair_context"] = repair_context
-                    _store_semantic_step(steps, step, log_file=log_file, run_id=run_id, file_hash=file_hash)
-                    if accepted:
-                        accepted_this_iteration += 1
-                        current_source = next_source
-                        current_pyc = next_pyc
-                        current_summary = step_summary
-                        if step_pylingual_verification is not None:
-                            current_pylingual_verification = step_pylingual_verification
-                        record_best_state_if_improved(f"accepted {qualname} at step {step_index}")
-                    else:
+                    # Best-of-N: give every candidate a turn and stop at the first the ORACLE
+                    # accepts. A candidate that cannot parse or compile now costs one candidate
+                    # instead of the file. Acceptance itself is unchanged -- the same gate decides.
+                    accepted = False
+                    module_candidate_results: list[dict[str, Any]] = []
+                    for module_candidate in module_candidate_inputs:
+                        candidate_text = str(module_candidate.get("text") or "")
+                        if not candidate_text:
+                            continue
+                        replacement_text = candidate_text
+                        try:
+                            (
+                                accepted, _, next_source, next_pyc, step_summary,
+                                step_pylingual_verification, step, _,
+                            ) = _apply_module_statement_candidate(
+                                gt_pyc=gt_pyc,
+                                current_source=current_source,
+                                current_pyc=current_pyc,
+                                current_summary=current_summary,
+                                current_pylingual_verification=current_pylingual_verification,
+                                candidate_text=candidate_text,
+                                line_number=line_number,
+                                output_dir=output_dir,
+                                pyc_dir=pyc_dir,
+                                fragments_dir=fragments_dir,
+                                derived_source_stem=derived_source.stem,
+                                step_index=step_index,
+                                iteration=iteration,
+                                target_version=target_version,
+                                verify_with_pylingual=verify_with_pylingual,
+                                verify_each_step_with_pylingual=verify_each_step_with_pylingual,
+                                reject_non_improving_candidates=reject_non_improving_candidates,
+                            )
+                        except (ReattachError, CompileError) as candidate_exc:
+                            # A single unparseable/uncompilable candidate must not abort the
+                            # remaining ones -- that is the mechanical loss we are here to remove.
+                            module_candidate_results.append({
+                                "candidate_index": module_candidate.get("candidate_index"),
+                                "strategy": module_candidate.get("strategy"),
+                                "accepted": False,
+                                "acceptance_reason": f"module repair candidate unavailable: {candidate_exc}",
+                            })
+                            continue
+                        module_candidate_results.append({
+                            "candidate_index": module_candidate.get("candidate_index"),
+                            "strategy": module_candidate.get("strategy"),
+                            "accepted": bool(accepted),
+                            "acceptance_reason": step.get("acceptance_reason"),
+                        })
+                        step["repair_context"] = repair_context
+                        step["candidate_results"] = list(module_candidate_results)
+                        step["candidate_count"] = len(module_candidate_inputs)
+                        step["selected_candidate_index"] = module_candidate.get("candidate_index")
+                        step["selected_candidate_strategy"] = module_candidate.get("strategy")
+                        _store_semantic_step(steps, step, log_file=log_file, run_id=run_id, file_hash=file_hash)
+                        if accepted:
+                            accepted_this_iteration += 1
+                            current_source = next_source
+                            current_pyc = next_pyc
+                            current_summary = step_summary
+                            if step_pylingual_verification is not None:
+                                current_pylingual_verification = step_pylingual_verification
+                            record_best_state_if_improved(f"accepted {qualname} at step {step_index}")
+                            break
                         module_rejected_attempts.append(
                             {
                                 "attempt": target_attempt_counts[qualname],
                                 "localized_line_number": line_number,
-                                "replacement_text": replacement_text,
+                                "replacement_text": candidate_text,
                                 "acceptance_reason": step["acceptance_reason"],
                                 "selected_action_types": _selected_action_types_from_repair_context(repair_context),
                                 "target_score_before": step.get("target_score_before"),
                                 "target_score_after": step.get("target_score_after"),
-                                "replacement_hash": _replacement_hash(replacement_text),
-                                "replacement_structural_hash": _replacement_structural_hash(replacement_text),
-                                "replacement_fingerprint": _fragment_feature_snapshot(replacement_text),
-                                "replacement_delta": _replacement_delta_for_attempt(extracted_before, replacement_text),
+                                "replacement_hash": _replacement_hash(candidate_text),
+                                "replacement_structural_hash": _replacement_structural_hash(candidate_text),
+                                "replacement_fingerprint": _fragment_feature_snapshot(candidate_text),
+                                "replacement_delta": _replacement_delta_for_attempt(extracted_before, candidate_text),
                             }
                         )
+                    if not accepted and not module_candidate_results:
+                        # Every candidate was empty/unusable: keep the historical ReattachError
+                        # surface so the outer handler records it exactly as before.
+                        raise ReattachError("module repair produced no usable candidate")
+                    if not accepted and all(
+                        str(r.get("acceptance_reason") or "").startswith("module repair candidate unavailable")
+                        for r in module_candidate_results
+                    ):
+                        module_rejected_attempts.append(
+                            {
+                                "attempt": target_attempt_counts[qualname],
+                                "localized_line_number": line_number,
+                                "acceptance_reason": module_candidate_results[0]["acceptance_reason"],
+                            }
+                        )
+                        unsupported_module_body_repair = True
                 except ReattachError as exc:
                     unsupported_module_body_repair = True
                     module_rejected_attempts.append(
@@ -5219,6 +5343,7 @@ def repair_mismatching_code_objects(
         "final_unreattachable_missing_targets": final_missing_targets,
         "unsupported_extra_targets": sorted(unsupported_extra_targets),
         "unsupported_module_body_repair": unsupported_module_body_repair,
+        "prepass_rejected_attempts": prepass_rejected_attempts,
         "max_iterations": max_iterations,
         "sample_timed_out": sample_timed_out,
         "sample_timeout_reached": sample_timeout_reached,

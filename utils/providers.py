@@ -116,6 +116,16 @@ OPEN_LLM_MODELS =  [
     # {'provider': 'OpenAI', 'name': 'gpt-oss-20b', 'token_for_completion': 32768, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth/gpt-oss-20b/run_1769125385/checkpoint-800"},
     # {'provider': 'Meta', 'name': 'codellama-34b', 'token_for_completion': 16384, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth/codellama-34b-bnb-4bit/run_1769663638/checkpoint-200"},
     # {'provider': 'Google', 'name': 'gemma-3-12b-it-unsloth-bnb-4bit', 'token_for_completion': 32768, 'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/finetuned_models/unsloth/gemma-3-12b-it-unsloth-bnb-4bit/run_1769095208/checkpoint-200"}
+    {
+        # index 8 (appended): the from-base control-flow fine-tune (run_1784336416), for the
+        # syntactic-repair pipeline test. Added 2026-07-22. Appended at END to preserve indices 0-7.
+        'provider': 'Alibaba',
+        'name': 'qwen3-coder-30b-frombase-gtbroad',
+        'token_for_completion': 16384,
+        'model_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/unsloth__qwen3-coder-30b-a3b-instruct/run_1784336416",
+        'tokenizer_path': f"{os.getenv('PROJECT_ROOT_DIR')}/finetuning/merged_models/unsloth__qwen3-coder-30b-a3b-instruct/run_1784336416",
+        'generation_config': {'max_new_tokens': 2048, 'do_sample': False, 'temperature': 0.0, 'top_p': 1.0},
+    },
 ]
 
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY") , base_url="https://ai-for-cybersecurity-east2-resou.services.ai.azure.com/openai/v1")

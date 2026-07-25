@@ -200,7 +200,10 @@ def compile_version(py_file, out_file, version):
                 pass  # worker reported a failure -> re-verify through the legacy uv/pyenv path
         try:
             _compile_uv(py_file=py_file, out_file=out_file, version=version)
-        except CompileError:
-            _compile_pyenv(py_file=py_file, out_file=out_file, version=version)
+        except CompileError as uv_err:
+            try:
+                _compile_pyenv(py_file=py_file, out_file=out_file, version=version)
+            except Exception:
+                raise uv_err  # preserve the genuine uv compile diagnostic; pyenv could not help
     else:
         _compile_pyenv(py_file=py_file, out_file=out_file, version=version)

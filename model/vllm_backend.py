@@ -70,6 +70,12 @@ def build_sampling_params(generation_config: dict[str, Any] | None, max_tokens: 
     do_sample = bool(config.get("do_sample", False))
     if not do_sample:
         params["temperature"] = 0.0
+        # Forward repetition_penalty for greedy too (temperature 0.0 + penalty stays
+        # deterministic but breaks decode repetition loops) -- the server transport
+        # otherwise silently drops it on the greedy candidate.
+        greedy_rep = _float_or_none(config, "repetition_penalty")
+        if greedy_rep is not None:
+            params["repetition_penalty"] = greedy_rep
         return params
 
     temperature = _float_or_none(config, "temperature")

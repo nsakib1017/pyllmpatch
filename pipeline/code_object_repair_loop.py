@@ -2339,8 +2339,14 @@ class CodeObjectRepairLoop:
         derived_source_fragment: str,
         repair_context: dict | None = None,
     ) -> Any:
-        if qualname != "<module>" and derived_code_object is not None and hasattr(self.fixer, "generate_candidates"):
-            if SEMANTIC_DETERMINISTIC_OPERATORS:
+        # `<module>` used to be excluded here, which made module repair SINGLE-SHOT: it fell
+        # through to generate_candidate (singular) below while every other target got up to 5
+        # strategy-conditioned candidates. Measured cost over the 20260713T212214Z run: 0
+        # candidate_results across 3,035 module steps, 2.7% acceptance, and 27% of rejections on
+        # the module-only cohort purely mechanical (parse/compile) -- fatal only because there was
+        # no second candidate. The oracle gate still decides which candidate lands.
+        if derived_code_object is not None and hasattr(self.fixer, "generate_candidates"):
+            if SEMANTIC_DETERMINISTIC_OPERATORS and qualname != "<module>":
                 deterministic = leaf_value_candidate(
                     gt_code_object, derived_code_object, derived_source_fragment, repair_context
                 )

@@ -16,6 +16,44 @@ SYSTEM_PROMPT_FOR_LOCAL = (
     "Do NOT fix logic errors, runtime errors, or improve code quality unless doing so is absolutely necessary to resolve a syntax error.\n"
     "Do NOT refactor, reformat, rename symbols, or modify any code that is already syntactically valid.\n\n"
 
+    "SURGICAL EDITS ONLY: change only what is strictly necessary to make the snippet parse. "
+    "Preserve the original COMPACT formatting, spacing, and indentation exactly as given -- "
+    "this code came from a decompiler and is intentionally terse. "
+    "Do NOT reformat it into verbose PEP-8 style, do NOT add blank lines or extra whitespace for readability, "
+    "and do NOT rename any variable, function, class, or argument.\n\n"
+
+    "NEVER INVENT CONTENT: do not add functionality, parameters, return values, docstrings, comments, "
+    "or function/class bodies that are not already present in the snippet. "
+    "If something looks incomplete, fix ONLY the syntax -- never imagine or complete what the code was "
+    "'supposed' to do.\n\n"
+
+    "TRUNCATED STRING OR BYTES LITERALS: if a string or bytes literal is cut off (an unterminated quote), "
+    "close it AS-IS by adding only the missing closing quote(s) at the exact point it was cut off. "
+    "Never invent, guess, or complete the literal's contents with imagined text.\n\n"
+
+    "COMMON DECOMPILER ARTIFACTS -- repair these in place instead of preserving them verbatim:\n"
+    "- An orphan 'continue' or 'break' inside a bare 'if' block (with no enclosing loop) usually means the "
+    "surrounding block was originally a 'while' loop -- restore the minimal loop wrapper needed to make it "
+    "valid.\n"
+    "- A dangling 'except' or 'finally' with no matching 'try' means the preceding block needs a 'try:' "
+    "wrapper added around it.\n"
+    "- Leaked PEP-695 generic-syntax scaffolding such as 'class .type_params(...)', "
+    "'def <generic parameters of X>(...)', or a stray '.defaults' line is decompiler internals, not real "
+    "code -- remove it or minimally rewrite it into valid syntax.\n"
+    "- An identifier that has been corrupted into a stray string/number literal, or a raw (unescaped) "
+    "newline sitting inside a string literal, should be repaired in place to restore a plausible identifier "
+    "or literal.\n\n"
+
+    "ANTI-REPETITION: emit each line of the snippet at most once. Never repeat, duplicate, or loop lines. "
+    "Never re-output unchanged regions more than once.\n\n"
+
+    "MULTI-LINE STRING LITERAL: if a string literal is split across physical lines by a raw newline "
+    "(an unterminated quote followed by more text on the next line), close it on its own line -- do not "
+    "merge unrelated code into the string.\n\n"
+
+    "STRAY TOP-OF-MODULE STATEMENT: a stray orphaned statement at module level with no valid attachment "
+    "(e.g. a leaked expression/argument fragment) should be removed.\n\n"
+
     "The provided error message is for reference only and may point to the wrong line. "
     "You must inspect surrounding lines and earlier code to identify the true root cause of any syntax error. "
     "If the error description does not match the snippet exactly, trust the snippet and its local structure over the reported line number.\n\n"
@@ -77,6 +115,7 @@ USER_PROMPT_TEMPLATE_ROOT_CAUSE = (
 
 USER_PROMPT_TEMPLATE_LOCAL = (
     "Analyze the Python code snippet below and fix all syntax errors.\n\n"
+    "{gt_context}"
     "Initial error message (for reference only; it may point to the wrong line):\n"
     "{error_message}\n\n"
     "Initial code snippet:\n"
@@ -93,6 +132,7 @@ USER_PROMPT_TEMPLATE_LOCAL = (
 
 USER_PROMPT_TEMPLATE_LOCAL_WITHOUT_EXPLANATION = (
     "Analyze the Python code snippet below and fix all syntax errors.\n\n"
+    "{gt_context}"
     "Initial error message (for reference only; it may point to the wrong line):\n"
     "{error_message}\n\n"
     "Initial code snippet:\n"
@@ -105,17 +145,49 @@ USER_PROMPT_TEMPLATE_LOCAL_WITHOUT_EXPLANATION = (
 )
 
 
+USER_PROMPT_TEMPLATE_LOCAL_RETRY = (
+    "Analyze the Python code snippet below and fix all remaining syntax errors.\n\n"
+    "{gt_context}"
+    "This is a RETRY: you already attempted to fix this snippet once, and the result still failed to "
+    "compile.\n\n"
+    "Your previous fix still failed to compile with this exact error: {error_message}\n\n"
+    "Treat the error message above as AUTHORITATIVE feedback describing precisely what is still wrong "
+    "with your previous attempt -- it is NOT a reference-only hint this time. Do not repeat the same "
+    "omission or mistake that produced it.\n\n"
+    "Current code snippet (reflects your previous attempt):\n"
+    "{code_snippet}\n\n"
+    "Fix precisely this error, minimally, without changing anything unrelated to it.\n"
+    "Output ONLY the corrected Python code.\n"
+    "If the code contains no syntax errors or the errors cannot be fixed, return the code unchanged."
+)
+
+
 def build_chat_messages(
     code_snippet: str,
     error_message: str,
     system_prompt: str,
     user_prompt_template: str,
     current_explanation: Optional[str] = "",
+    gt_context: str = "",
 ) -> list[dict]:
     format_kwargs = { "error_message": error_message,   "code_snippet": code_snippet,}
 
     if  len(current_explanation) > 0:
         format_kwargs["current_explanation"] = current_explanation
+
+    # GT-context lever: an optional, best-effort brief of the TRUE structure of the code
+    # object enclosing the error (utils.gt_syntactic_context.build_gt_object_context), read
+    # from the ground-truth .pyc. Rendered as a whole block (header + body + trailing blank
+    # line) ONLY when non-empty, so an empty/omitted gt_context leaves every template
+    # byte-identical to its pre-GT-context rendering -- no dangling header, no empty
+    # section. The {gt_context} placeholder itself is harmless on templates that don't
+    # define it (str.format ignores unused kwargs).
+    format_kwargs["gt_context"] = (
+        "Ground-truth structure of the object being repaired (reconstruct to match this; "
+        f"the broken lines are decompiler artifacts):\n{gt_context}\n\n"
+        if gt_context
+        else ""
+    )
 
     user_prompt = user_prompt_template.format(**format_kwargs)
 

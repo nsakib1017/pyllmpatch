@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import re
 import tokenize
 from collections import deque
@@ -217,6 +218,105 @@ def delete_lines_until_compilable_with_oracle(
     final_text = "".join(lines)
     last_compile_res = compile_check(final_text, out_py_path, out_pyc_path, version)
     return final_text, attempts, last_compile_res
+
+
+def _labeled_scratch_path(base_path: Optional[str], label: str) -> Optional[str]:
+    """Derive a per-candidate scratch path from a canonical base path so
+    concurrent delete-only searches over multiple candidate sources don't
+    clobber each other's `.py`/`.pyc`/error-text files mid-search."""
+    if not base_path:
+        return base_path
+    safe_label = re.sub(r"[^A-Za-z0-9_-]", "_", label) or "candidate"
+    root, ext = os.path.splitext(base_path)
+    return f"{root}.{safe_label}{ext}"
+
+
+def delete_only_best_of(
+    labeled_sources: List[Tuple[str, str]],
+    *,
+    compile_check: CompileOracle,
+    extract_line_number: LineExtractor,
+    get_error_word_message_from_content: ErrWordMsgParser,
+    out_py_path: str,
+    out_pyc_path: str,
+    version: Optional[Any] = None,
+    base_window: int = 0,
+    max_iters: int = 20_000,
+    max_deleted_ratio: float = 0.95,
+    min_remaining_lines: int = 1,
+    err_txt_path: Optional[str] = None,
+) -> Tuple[str, List[DeletionAttempt], Dict[str, Any], Optional[str]]:
+    """Run delete-only recovery independently over several candidate sources
+    and keep the best result -- the "best-of-both" fallback.
+
+    Each entry in `labeled_sources` is `(label, source_str)`, e.g.
+    `[("original", orig), ("llm", llm_out)]`. Every non-empty source is run
+    through `delete_lines_until_compilable_with_oracle` in isolation (using
+    per-candidate scratch `out_py_path`/`out_pyc_path`/`err_txt_path`
+    derived via `_labeled_scratch_path`, so the candidates can't clobber one
+    another mid-search). Empty/falsy sources are skipped entirely.
+
+    Winner selection:
+      1. Among candidates that COMPILE, prefer the one that preserves the
+         MOST content (most remaining lines).
+      2. If none compile, prefer whichever got furthest (the most deletion
+         attempts recorded -- a proxy for "closest to compiling").
+      3. Ties are broken by input order: `max()` returns the first
+         maximal element it encounters, so with the conventional call order
+         `[("original", ...), ("llm", ...)]`, "original" wins ties.
+
+    The winner's fixed source is then (re)compiled to the CANONICAL
+    `out_py_path`/`out_pyc_path` (not the per-candidate scratch paths), so
+    callers that only know about the canonical paths always find the
+    winning candidate there.
+
+    Returns `(fixed_code, del_log, last_res, winning_label)`. If no source
+    in `labeled_sources` was non-empty, returns
+    `("", [], {"is_compiled": False}, None)` without touching
+    `out_py_path`/`out_pyc_path`.
+    """
+    candidates: List[Dict[str, Any]] = []
+
+    for label, source in labeled_sources:
+        if not source:
+            continue
+
+        fixed_code, del_log, last_res = delete_lines_until_compilable_with_oracle(
+            source,
+            compile_check,
+            extract_line_number,
+            get_error_word_message_from_content,
+            out_py_path=_labeled_scratch_path(out_py_path, label),
+            out_pyc_path=_labeled_scratch_path(out_pyc_path, label),
+            version=version,
+            base_window=base_window,
+            max_iters=max_iters,
+            max_deleted_ratio=max_deleted_ratio,
+            min_remaining_lines=min_remaining_lines,
+            err_txt_path=_labeled_scratch_path(err_txt_path, label),
+        )
+        candidates.append(
+            {
+                "label": label,
+                "fixed_code": fixed_code,
+                "del_log": del_log,
+                "last_res": last_res,
+            }
+        )
+
+    if not candidates:
+        return "", [], {"is_compiled": False}, None
+
+    compiled = [c for c in candidates if bool(c["last_res"].get("is_compiled", False))]
+
+    if compiled:
+        winner = max(compiled, key=lambda c: len(_split_keepends(c["fixed_code"])))
+    else:
+        winner = max(candidates, key=lambda c: len(c["del_log"]))
+
+    final_res = compile_check(winner["fixed_code"], out_py_path, out_pyc_path, version)
+
+    return winner["fixed_code"], winner["del_log"], final_res, winner["label"]
 
 
 class _PseudoError:
