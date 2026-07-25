@@ -95,3 +95,58 @@ class AnnotationReconcileEngineTest(unittest.TestCase):
                     gt_source=FX/"gt.py", output_dir=Path(td),
                     fragment_fixer=None, acceptance_mode="distance")
         self.assertGreater(res["final_summary"]["combined_distance"], 0)  # unchanged: still diverges
+
+
+FX_MISSING = Path(__file__).parent / "fixtures" / "annotation" / "missing"
+
+
+def _no_candidates_fixer(*_args, **_kwargs):
+    """A `fragment_fixer` stand-in that never proposes a candidate.
+
+    `<module>.Config` also diverges independently in this fixture (see class docstring), and
+    `repair_mismatching_code_objects`'s MAIN iteration loop has its own pre-existing, unrelated
+    GT-verbatim fallback that activates whenever `fragment_fixer is None` (oracle mode) -- which
+    would fix `<module>.Config` (and, as a side effect, its now-matching `__annotate__` child) all
+    by itself, whether or not the deterministic-prepass annotate-reconcile branch under test does
+    anything. Passing a real (non-None) fixer that always abstains keeps that main-loop fallback
+    out of the picture, so these tests isolate the PREPASS branch these findings are about.
+    """
+    return []
+
+
+class AnnotationReconcileMissingBytecodeTest(unittest.TestCase):
+    """Covers the code-review gap: a `__annotate__` code object entirely ABSENT from
+    derived.pyc surfaces from `compare_pyc` as `message == "Missing bytecode"` (bc_b is
+    None), not `"Different bytecode"` / `"Different control flow"`. `derived.py` here drops
+    the `z: int` bare annotation on `Config` outright (not just reorders it), so PyLingual's
+    "recompile" never synthesizes a `__annotate__` code object for `Config` at all -- the
+    object is missing, not diverged. Because CPython only emits the class-body machinery that
+    installs `__annotate__` when the class has ANY annotation, `<module>.Config` itself also
+    independently shows up as "Different bytecode" (no single offset) here -- so
+    `fragment_fixer` is a real no-op callable (see `_no_candidates_fixer`), not `None`, to keep
+    the main loop's separate GT-verbatim fallback from masking whether the prepass fix works."""
+
+    def setUp(self):
+        self._prev_mode = R.ACCEPTANCE_MODE
+
+    def tearDown(self):
+        R.ACCEPTANCE_MODE = self._prev_mode
+
+    def test_flag_on_reconciles_missing_annotate_object(self):
+        with mock.patch.object(R, "SEMANTIC_ANNOTATION_RECONCILE", True):
+            with tempfile.TemporaryDirectory() as td:
+                res = repair_mismatching_code_objects(
+                    FX_MISSING/"gt.pyc", FX_MISSING/"derived.pyc", FX_MISSING/"derived.py",
+                    gt_source=FX_MISSING/"gt.py", output_dir=Path(td),
+                    fragment_fixer=_no_candidates_fixer, acceptance_mode="distance",
+                    verify_with_pylingual=True, verify_each_step_with_pylingual=True)
+        self.assertEqual(res["final_summary"]["combined_distance"], 0)
+
+    def test_flag_off_leaves_missing_annotate_object_unfixed(self):
+        with mock.patch.object(R, "SEMANTIC_ANNOTATION_RECONCILE", False):
+            with tempfile.TemporaryDirectory() as td:
+                res = repair_mismatching_code_objects(
+                    FX_MISSING/"gt.pyc", FX_MISSING/"derived.pyc", FX_MISSING/"derived.py",
+                    gt_source=FX_MISSING/"gt.py", output_dir=Path(td),
+                    fragment_fixer=_no_candidates_fixer, acceptance_mode="distance")
+        self.assertGreater(res["final_summary"]["combined_distance"], 0)  # unchanged: still diverges

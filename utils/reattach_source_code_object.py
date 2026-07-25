@@ -4131,23 +4131,31 @@ def repair_mismatching_code_objects(
                 # "Different bytecode" with no single offset (e.g. a PyLingual "line too long"
                 # placeholder statement) is also deterministically recoverable in some cases.
                 is_diffbc = tr.message == "Different bytecode"
-                if not (is_leaf or is_struct or is_diffbc):
-                    continue
-                qualname = tr.names()
+                # A code object entirely ABSENT from derived.pyc (bc_b is None) -- e.g. PyLingual
+                # never emitted a synthetic __annotate__ object for a class/def at all, not just a
+                # diverged one. tr.names() glues "name_a, name_b" whenever the two sides differ,
+                # and name_b falls back to the literal string "None" here, so read bc_a.name
+                # directly rather than feeding that glued string into the qualname map below.
+                is_missing = tr.message == "Missing bytecode"
+                raw_qualname = tr.name_a if is_missing else tr.names()
                 # Annotation reconciliation (Stage 1, oracle-source backend, flag-gated): a
-                # diverged/missing synthetic `__annotate__` object has no source representation
-                # of its own, so remap the target to the ENCLOSING def/class whose annotations
-                # produced it and repair that instead, using the verbatim GT source segment as
-                # the deterministic candidate. Falls through to the SAME recompile + oracle gate
-                # below; never fires when the flag is off, there is no GT source, or the qualname
-                # isn't a `__annotate__` leaf (defer, never a guessed annotation).
+                # diverged OR entirely missing synthetic `__annotate__` object has no source
+                # representation of its own, so remap the target to the ENCLOSING def/class whose
+                # annotations produced it and repair that instead, using the verbatim GT source
+                # segment as the deterministic candidate. Falls through to the SAME recompile +
+                # oracle gate below; never fires when the flag is off, there is no GT source, or
+                # the qualname isn't a `__annotate__` leaf (defer, never a guessed annotation).
+                # Computed BEFORE (and folded into) the is_leaf/is_struct/is_diffbc gate below so a
+                # missing __annotate__ object -- which is none of those three message kinds -- still
+                # reaches this branch instead of being filtered out untouched.
                 annotate_enclosing = (
-                    _annotate_enclosing_qualname(qualname)
+                    _annotate_enclosing_qualname(raw_qualname)
                     if (SEMANTIC_ANNOTATION_RECONCILE and gt_source is not None)
                     else None
                 )
-                if annotate_enclosing is not None:
-                    qualname = annotate_enclosing
+                if not (is_leaf or is_struct or is_diffbc or annotate_enclosing is not None):
+                    continue
+                qualname = annotate_enclosing if annotate_enclosing is not None else raw_qualname
                 # The <module> object has no extractable code-object span (its row span is
                 # degenerate/empty), so feed the WHOLE source as its fragment and write the
                 # operator's full output back directly. This lets the deterministic operators
