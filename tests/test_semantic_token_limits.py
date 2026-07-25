@@ -204,7 +204,7 @@ class SemanticTokenLimitTest(unittest.TestCase):
 
             with patch.object(
                 code_object_repair_loop,
-                "fetch_pyllmpatch_source_path",
+                "fetch_pyllmpatch_gt_source_path",
                 side_effect=lambda file_hash, source: paths[file_hash][0],
             ), patch.object(
                 code_object_repair_loop,
@@ -360,7 +360,7 @@ class SemanticTokenLimitTest(unittest.TestCase):
                     }
 
             output = io.StringIO()
-            with patch.object(code_object_repair_loop, "fetch_pyllmpatch_source_path", return_value=gt_source), patch.object(
+            with patch.object(code_object_repair_loop, "fetch_pyllmpatch_gt_source_path", return_value=gt_source), patch.object(
                 code_object_repair_loop,
                 "fetch_pyllmpatch_repair_paths",
                 return_value=(gt_pyc, derived_pyc, derived_source),

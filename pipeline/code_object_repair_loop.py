@@ -29,7 +29,12 @@ from pipeline.config import (
     now_iso,
 )
 from pipeline.logging_utils import append_log
-from utils.file_helpers import fetch_pyllmpatch_repair_paths, fetch_pyllmpatch_source_path, strip_code_fences
+from utils.file_helpers import (
+    fetch_pyllmpatch_gt_source_path,
+    fetch_pyllmpatch_repair_paths,
+    fetch_pyllmpatch_source_path,
+    strip_code_fences,
+)
 from utils.providers import find_llm_config, make_llm_call_from_config
 from utils.token_helpers import count_tokens_safe
 from utils.reattach_source_code_object import (
@@ -2626,10 +2631,10 @@ def _resolve_dataset_repair_paths(row, dataset_base_dir: Path) -> tuple[Path | N
     if gt_pyc is not None and derived_pyc is not None and derived_source is not None:
         gt_source = _dataset_path_cell(row, "gt_source", dataset_base_dir)
         if gt_source is None:
-            gt_source = fetch_pyllmpatch_source_path(row.file_hash, row.source)
+            gt_source = fetch_pyllmpatch_gt_source_path(row.file_hash, row.source)
         return gt_source, gt_pyc, derived_pyc, derived_source
 
-    gt_source = fetch_pyllmpatch_source_path(row.file_hash, row.source)
+    gt_source = fetch_pyllmpatch_gt_source_path(row.file_hash, row.source)
     gt_pyc, derived_pyc, derived_source = fetch_pyllmpatch_repair_paths(row.file_hash, row.source)
     return gt_source, gt_pyc, derived_pyc, derived_source
 

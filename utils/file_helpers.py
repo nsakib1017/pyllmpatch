@@ -203,6 +203,47 @@ def fetch_pyllmpatch_source_path(file_hash: str, source: str) -> Optional[Path]:
     return highest_indented[0] if highest_indented else None
 
 
+def fetch_pyllmpatch_gt_source_path(file_hash: str, source: str) -> Optional[Path]:
+    """Resolve the REAL ground-truth source for a dataset row.
+
+    For PyPi rows, `fetch_pyllmpatch_source_path` already returns the real (non-decompiled)
+    source, so this is a passthrough. For pylingual (adapter) rows, `fetch_pyllmpatch_source_path`
+    returns the DECOMPILED `decompiler_output/indented_*.py` -- the model's own input, not
+    ground truth. The real GT source lives in a separate tree keyed by the base hash (file_hash
+    with its trailing `_<digits>` version suffix stripped): by default
+    `<ROOT_FOR_FILES>/pyllm_final_dataset/pyllm_py_dataset/<base_hash>/*.py`, overridable via
+    `PYLINGUAL_GT_SOURCE_DIR`.
+
+    Falls back to `fetch_pyllmpatch_source_path` (the previous behavior) whenever the GT tree or
+    its `.py` file cannot be resolved -- never a regression, never raises.
+    """
+    norm_source = norm_str(source)
+    if norm_source == "PyPi":
+        return fetch_pyllmpatch_source_path(file_hash, source)
+
+    norm_hash = norm_str(file_hash)
+    if not norm_hash:
+        return fetch_pyllmpatch_source_path(file_hash, source)
+
+    base = re.sub(r"_\d+$", "", norm_hash)
+    gt_root_env = norm_str(os.getenv("PYLINGUAL_GT_SOURCE_DIR"))
+    gt_root = Path(gt_root_env) if gt_root_env else (ROOT_FOR_FILES / "pyllm_final_dataset" / "pyllm_py_dataset")
+
+    gt_dir = gt_root / base
+    candidates = sorted(p for p in gt_dir.glob("*.py") if p.is_file()) if gt_dir.is_dir() else []
+
+    if candidates:
+        if len(candidates) > 1:
+            original_pyc, _ = fetch_pyllmpatch_pyc_paths(file_hash, source)
+            if original_pyc is not None:
+                stem_matches = [p for p in candidates if p.stem == original_pyc.stem]
+                if stem_matches:
+                    return stem_matches[0]
+        return candidates[0]
+
+    return fetch_pyllmpatch_source_path(file_hash, source)
+
+
 def fetch_pyllmpatch_repair_paths(file_hash: str, source: str) -> Tuple[Optional[Path], Optional[Path], Optional[Path]]:
     file_hash = norm_str(file_hash)
     source = norm_str(source)
