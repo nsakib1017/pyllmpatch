@@ -157,15 +157,26 @@ FX_DTO = Path(__file__).parent / "fixtures" / "annotation" / "dto"
 
 
 class AnnotationReconcileBroaderFixturesTest(unittest.TestCase):
-    """Task 4: broaden coverage beyond the single `settings` fixture with two more real, proven
-    pure-annotation 3.15 files from the oracle-ceiling corpus (file_hash prefixes `d42177d3`
-    "space_debug_draw_options.py" and `670c67a8` "dto.py" -- see
-    docs/superpowers/plans/2026-07-25-annotation-reconciliation-stage1.md Task 4 and
-    $JT/poc_prove_all.py, which proved both convert to distance 0 under GT-def splicing). Same
-    flag-on/distance-0 assertion and `fragment_fixer=None` / `acceptance_mode="distance"` pattern
-    as `AnnotationReconcileEngineTest` above -- these are end-to-end convergence checks (not
-    isolated to the prepass branch the way the "missing" fixture's tests are), run against files
-    the deterministic-prepass branch was not tuned against."""
+    """Task 4: broaden coverage beyond the single `settings` fixture with two more
+    pure-annotation 3.15 fixtures, structurally shaped (multiple bare, valueless class-level
+    annotations; one dropped in `derived.py` while at least one survives) so the enclosing
+    class/nested-class itself stays bytecode-`Equal` to GT and ONLY its `__annotate__` child
+    diverges -- the same shape `compare_pyc` reports for the real `settings` fixture above,
+    and the shape that isolates this feature: `select_repair_targets`'s existing
+    `_is_synthetic_annotation_qualname` guard means a same-distance `<module>.X` never becomes an
+    independent repair target on its own, so convergence here is attributable to the Task 3
+    prepass branch, not the main loop's separate oracle-mode GT-verbatim fallback (verified:
+    flag-off leaves both fixtures at their original nonzero distance, 10 / 20).
+
+    `space_debug` additionally covers a NESTED enclosing qualname (`<module>.A.B.__annotate__`),
+    and `dto` covers two INDEPENDENT top-level annotate targets repaired across separate loop
+    iterations -- both shapes the single `settings` fixture didn't exercise. These fixtures are
+    hand-authored (not sourced from any real corpus/benchmark file), per the Global Constraint
+    'do not run on / train on benchmark files during dev' -- an earlier revision of this task
+    used two real oracle-ceiling-corpus files that turned out to collide with `benchmark_full`/
+    `benchmark_unique`/`benchmark_room`.csv row hashes; this hand-authored pair replaces them.
+    Same flag-on/distance-0 assertion and `fragment_fixer=None` / `acceptance_mode="distance"`
+    pattern as `AnnotationReconcileEngineTest` above."""
 
     def setUp(self):
         self._prev_mode = R.ACCEPTANCE_MODE
