@@ -93,6 +93,13 @@ SEMANTIC_CORRECTIVE_FEEDBACK = (
 SEMANTIC_ANNOTATION_RECONCILE = (
     os.getenv("SEMANTIC_ANNOTATION_RECONCILE", "0").strip().lower() in ("1", "true", "yes", "on")
 )
+# Corpus-write kill switch: when TRUE, skip appending accepted steps to the fine-tune
+# training-corpus log (`_append_accepted_code_object_dataset`), e.g. to keep a contaminated or
+# exploratory run out of the corpus. Does NOT affect `_append_accepted_case_telemetry` (a separate
+# log) or any acceptance decision. Off by default (opt-in); off => byte-identical current behavior.
+SEMANTIC_DISABLE_CORPUS_WRITE = (
+    os.getenv("SEMANTIC_DISABLE_CORPUS_WRITE", "0").strip().lower() in ("1", "true", "yes", "on")
+)
 
 
 def _tail_deadline_seconds() -> float:
@@ -3610,6 +3617,8 @@ def _accepted_code_object_dataset_record(
 
 def _append_accepted_code_object_dataset(log_file: Path | None, run_id: str | None, file_hash: str | None, step_record: dict[str, Any]) -> None:
     if not step_record.get("accepted"):
+        return
+    if SEMANTIC_DISABLE_CORPUS_WRITE:
         return
     path = _semantic_repair_code_object_log_path(log_file)
     append_log(
