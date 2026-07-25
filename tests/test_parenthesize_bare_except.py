@@ -68,6 +68,49 @@ class SingleStatementCasesTest(unittest.TestCase):
         self.assertEqual(parenthesize_bare_except(src), expected)
 
 
+class ExceptStarCasesTest(unittest.TestCase):
+    """PEP 654 exception-group ``except*`` clauses: the '(' must land after the
+    '*', not between 'except' and '*'."""
+
+    def test_except_star_bare_two_types_parenthesized(self):
+        src = "try:\n    pass\nexcept* ValueError, TypeError:\n    pass\n"
+        expected = "try:\n    pass\nexcept* (ValueError, TypeError):\n    pass\n"
+        self.assertEqual(parenthesize_bare_except(src), expected)
+
+    def test_except_star_bare_two_types_with_as_parenthesized(self):
+        src = "try:\n    pass\nexcept* X, Y as e:\n    pass\n"
+        expected = "try:\n    pass\nexcept* (X, Y) as e:\n    pass\n"
+        self.assertEqual(parenthesize_bare_except(src), expected)
+
+    def test_except_star_single_type_unchanged(self):
+        src = "try:\n    pass\nexcept* X:\n    pass\n"
+        self.assertEqual(parenthesize_bare_except(src), src)
+
+    def test_except_star_already_parenthesized_unchanged(self):
+        src = "try:\n    pass\nexcept* (X, Y):\n    pass\n"
+        self.assertEqual(parenthesize_bare_except(src), src)
+
+    def test_except_star_no_space_before_star_target(self):
+        # Decompiler artifacts may omit the space between '*' and the type list.
+        src = "try:\n    pass\nexcept*X, Y:\n    pass\n"
+        expected = "try:\n    pass\nexcept*(X, Y):\n    pass\n"
+        self.assertEqual(parenthesize_bare_except(src), expected)
+
+    def test_except_star_result_parses_as_trystar(self):
+        import ast
+
+        src = "try:\n    pass\nexcept* ValueError, TypeError:\n    pass\n"
+        normalized = parenthesize_bare_except(src)
+        compile(normalized, "<test>", "exec")  # must not raise
+        tree = ast.parse(normalized)
+        try_node = tree.body[0]
+        self.assertIsInstance(try_node, ast.TryStar)
+        handler = try_node.handlers[0]
+        self.assertIsInstance(handler.type, ast.Tuple)
+        names = [elt.id for elt in handler.type.elts]
+        self.assertEqual(names, ["ValueError", "TypeError"])
+
+
 class IdempotenceTest(unittest.TestCase):
     def test_running_twice_equals_running_once(self):
         cases = [
@@ -76,6 +119,8 @@ class IdempotenceTest(unittest.TestCase):
             "try:\n    pass\nexcept a.B, c.D, E:\n    pass\n",
             "try:\n    pass\nexcept X:\n    pass\n",
             "try:\n    pass\nexcept (X, Y):\n    pass\n",
+            "try:\n    pass\nexcept* X, Y:\n    pass\n",
+            "try:\n    pass\nexcept* (X, Y):\n    pass\n",
         ]
         for src in cases:
             once = parenthesize_bare_except(src)

@@ -229,6 +229,8 @@ def parenthesize_bare_except(source: str) -> str:
     - ``except X, Y:``         -> ``except (X, Y):``
     - ``except X, Y as e:``    -> ``except (X, Y) as e:``
     - ``except a.B, c.D, E:``  -> ``except (a.B, c.D, E):``
+    - ``except* X, Y:``        -> ``except* (X, Y):`` (PEP 654 exception groups;
+      the inserted ``(`` lands after the ``*``, never between ``except`` and ``*``)
 
     Deliberately does NOT use ``ast.parse`` -- the input may itself contain the very
     ``SyntaxError`` being fixed. Uses ``tokenize`` instead, which lexes without enforcing
@@ -285,6 +287,14 @@ def parenthesize_bare_except(source: str) -> str:
                 k = i + 1
                 while k < n and tokens[k].type in (tokenize.NL, tokenize.COMMENT):
                     k += 1
+                # PEP 654 exception groups: ``except* X, Y:``. The ``*`` is a separate
+                # OP token right after ``except``; skip past it too so the inserted
+                # ``(`` lands after ``except*`` (and its following space), not between
+                # ``except`` and ``*``.
+                if k < n and tokens[k].type == tokenize.OP and tokens[k].string == "*":
+                    k += 1
+                    while k < n and tokens[k].type in (tokenize.NL, tokenize.COMMENT):
+                        k += 1
                 if k < n and close_offset > offset(*tokens[k].start):
                     open_offset = offset(*tokens[k].start)
                     edits.append((open_offset, close_offset))
