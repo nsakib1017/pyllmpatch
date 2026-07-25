@@ -44,6 +44,7 @@ from utils.reattach_source_code_object import (
     compare_code_object_distances,
     extract_source_segment,
     infer_source_from_pyc,
+    parenthesize_bare_except,
     repair_mismatching_code_objects,
     select_extra_repair_targets,
     select_missing_expression_child_parent_records,
@@ -1854,7 +1855,7 @@ class OracleFragmentFixer(FragmentFixer):
     def __init__(self, gt_pyc: Path, gt_source: Path | None = None):
         self.gt_pyc = gt_pyc.expanduser().resolve()
         self.gt_source = gt_source.expanduser().resolve() if gt_source is not None else infer_source_from_pyc(self.gt_pyc)
-        self.gt_source_text = self.gt_source.read_text(encoding="utf-8")
+        self.gt_source_text = parenthesize_bare_except(self.gt_source.read_text(encoding="utf-8"))
 
     def generate_candidate(
         self,

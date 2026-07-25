@@ -4,12 +4,14 @@ import hashlib
 import argparse
 import ast
 import inspect
+import io
 import json
 import os
 import re
 import sys
 import textwrap
 import time
+import tokenize
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -209,6 +211,95 @@ def _line_offsets(text: str) -> list[int]:
     if not text.endswith(("\n", "\r")):
         offsets.append(len(text))
     return offsets
+
+
+def parenthesize_bare_except(source: str) -> str:
+    """Rewrite Python-2-style unparenthesized multi-type ``except`` clauses --
+    ``except A, B:`` -- to the parenthesized Python-3 form ``except (A, B):``.
+
+    This is a decompiler artifact that shows up verbatim in some ground-truth sources:
+    it is a ``SyntaxError`` in Python 3, so any candidate/fragment that carries it fails to
+    (re)compile. The rewrite is semantics-preserving (parenthesized and unparenthesized
+    multi-except are equivalent; parenthesized is the only valid Python 3 spelling) and a
+    no-op for everything else:
+
+    - ``except X:``            -> unchanged
+    - ``except X as e:``       -> unchanged
+    - ``except (X, Y):``       -> unchanged (already parenthesized)
+    - ``except X, Y:``         -> ``except (X, Y):``
+    - ``except X, Y as e:``    -> ``except (X, Y) as e:``
+    - ``except a.B, c.D, E:``  -> ``except (a.B, c.D, E):``
+
+    Deliberately does NOT use ``ast.parse`` -- the input may itself contain the very
+    ``SyntaxError`` being fixed. Uses ``tokenize`` instead, which lexes without enforcing
+    grammar, so it tolerates an otherwise-invalid ``except`` header. Only a top-level
+    (bracket-depth-0) comma between ``except`` and the header-terminating ``:`` (or ``as``)
+    triggers a rewrite, so commas in call args, subscripts, comments, and string literals --
+    anywhere in the file, including on the same line as an ``except`` -- are never touched.
+    Idempotent: an already-parenthesized clause has no top-level comma, so a second pass is
+    a no-op. If the source can't be tokenized at all (e.g. an unterminated string), the
+    input is returned unchanged rather than raising.
+    """
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    except (tokenize.TokenError, IndentationError, SyntaxError, UnicodeDecodeError):
+        return source
+
+    line_offsets = _line_offsets(source)
+
+    def offset(row: int, col: int) -> int:
+        return line_offsets[row - 1] + col
+
+    edits: list[tuple[int, int]] = []
+    n = len(tokens)
+    i = 0
+    while i < n:
+        tok = tokens[i]
+        if tok.type == tokenize.NAME and tok.string == "except":
+            depth = 0
+            has_top_comma = False
+            as_offset: int | None = None
+            colon_offset: int | None = None
+            j = i + 1
+            while j < n:
+                t = tokens[j]
+                if t.type == tokenize.OP:
+                    if t.string in "([{":
+                        depth += 1
+                    elif t.string in ")]}":
+                        depth -= 1
+                    elif t.string == "," and depth == 0:
+                        has_top_comma = True
+                    elif t.string == ":" and depth == 0:
+                        colon_offset = offset(*t.start)
+                        break
+                elif t.type == tokenize.NAME and t.string == "as" and depth == 0 and as_offset is None:
+                    as_offset = offset(*t.start)
+                j += 1
+            if has_top_comma and colon_offset is not None:
+                close_offset = as_offset if as_offset is not None else colon_offset
+                # Trim trailing whitespace so ')' lands right after the last type token,
+                # keeping the original spacing before 'as'/':' intact.
+                while close_offset > 0 and source[close_offset - 1] in " \t":
+                    close_offset -= 1
+                k = i + 1
+                while k < n and tokens[k].type in (tokenize.NL, tokenize.COMMENT):
+                    k += 1
+                if k < n and close_offset > offset(*tokens[k].start):
+                    open_offset = offset(*tokens[k].start)
+                    edits.append((open_offset, close_offset))
+            i = j
+        i += 1
+
+    if not edits:
+        return source
+
+    # Apply right-to-left so earlier offsets stay valid as we insert characters.
+    result = source
+    for open_offset, close_offset in sorted(edits, key=lambda e: e[0], reverse=True):
+        result = result[:close_offset] + ")" + result[close_offset:]
+        result = result[:open_offset] + "(" + result[open_offset:]
+    return result
 
 
 def _span_to_indices(
@@ -3872,7 +3963,7 @@ def repair_mismatching_code_objects(
         if gt_source is None:
             gt_source = infer_source_from_pyc(gt_pyc)
         if gt_source_text is None:
-            gt_source_text = _load_text(gt_source)
+            gt_source_text = parenthesize_bare_except(_load_text(gt_source))
         return gt_source, gt_source_text
 
     if output_dir is None:
@@ -4189,7 +4280,9 @@ def repair_mismatching_code_objects(
                 candidate = None
                 operation = strategy = None
                 if annotate_enclosing is not None:
-                    annotation_candidate_text = _gt_def_source_by_qualname(_load_text(gt_source), qualname)
+                    annotation_candidate_text = _gt_def_source_by_qualname(
+                        parenthesize_bare_except(_load_text(gt_source)), qualname
+                    )
                     if annotation_candidate_text is not None and annotation_candidate_text != fragment:
                         candidate = {
                             "text": annotation_candidate_text,
