@@ -284,7 +284,14 @@ class SourceCodeObjectCollector(ast.NodeVisitor):
 
 
 def collect_source_code_objects(source_path: Path) -> list[SourceCodeObject]:
-    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    # Lazy import: utils.reattach_source_code_object imports this module at module scope
+    # (for MappingError/map_source_to_pyc), so importing it back at module scope here would
+    # create an import cycle. Importing inside the function avoids that while still reusing
+    # the single normalizer implementation instead of duplicating it.
+    from utils.reattach_source_code_object import parenthesize_bare_except
+
+    source_text = parenthesize_bare_except(source_path.read_text(encoding="utf-8"))
+    tree = ast.parse(source_text, filename=str(source_path))
     collector = SourceCodeObjectCollector()
     collector.visit(tree)
     return _populate_immediate_child_counts(collector.records)
