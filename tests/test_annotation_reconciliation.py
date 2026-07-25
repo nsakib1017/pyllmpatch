@@ -150,3 +150,45 @@ class AnnotationReconcileMissingBytecodeTest(unittest.TestCase):
                     gt_source=FX_MISSING/"gt.py", output_dir=Path(td),
                     fragment_fixer=_no_candidates_fixer, acceptance_mode="distance")
         self.assertGreater(res["final_summary"]["combined_distance"], 0)  # unchanged: still diverges
+
+
+FX_SPACE_DEBUG = Path(__file__).parent / "fixtures" / "annotation" / "space_debug"
+FX_DTO = Path(__file__).parent / "fixtures" / "annotation" / "dto"
+
+
+class AnnotationReconcileBroaderFixturesTest(unittest.TestCase):
+    """Task 4: broaden coverage beyond the single `settings` fixture with two more real, proven
+    pure-annotation 3.15 files from the oracle-ceiling corpus (file_hash prefixes `d42177d3`
+    "space_debug_draw_options.py" and `670c67a8` "dto.py" -- see
+    docs/superpowers/plans/2026-07-25-annotation-reconciliation-stage1.md Task 4 and
+    $JT/poc_prove_all.py, which proved both convert to distance 0 under GT-def splicing). Same
+    flag-on/distance-0 assertion and `fragment_fixer=None` / `acceptance_mode="distance"` pattern
+    as `AnnotationReconcileEngineTest` above -- these are end-to-end convergence checks (not
+    isolated to the prepass branch the way the "missing" fixture's tests are), run against files
+    the deterministic-prepass branch was not tuned against."""
+
+    def setUp(self):
+        self._prev_mode = R.ACCEPTANCE_MODE
+
+    def tearDown(self):
+        R.ACCEPTANCE_MODE = self._prev_mode
+
+    def test_flag_on_converts_space_debug(self):
+        with mock.patch.object(R, "SEMANTIC_ANNOTATION_RECONCILE", True):
+            with tempfile.TemporaryDirectory() as td:
+                res = repair_mismatching_code_objects(
+                    FX_SPACE_DEBUG/"gt.pyc", FX_SPACE_DEBUG/"derived.pyc", FX_SPACE_DEBUG/"derived.py",
+                    gt_source=FX_SPACE_DEBUG/"gt.py", output_dir=Path(td),
+                    fragment_fixer=None, acceptance_mode="distance",
+                    verify_with_pylingual=True, verify_each_step_with_pylingual=True)
+        self.assertEqual(res["final_summary"]["combined_distance"], 0)
+
+    def test_flag_on_converts_dto(self):
+        with mock.patch.object(R, "SEMANTIC_ANNOTATION_RECONCILE", True):
+            with tempfile.TemporaryDirectory() as td:
+                res = repair_mismatching_code_objects(
+                    FX_DTO/"gt.pyc", FX_DTO/"derived.pyc", FX_DTO/"derived.py",
+                    gt_source=FX_DTO/"gt.py", output_dir=Path(td),
+                    fragment_fixer=None, acceptance_mode="distance",
+                    verify_with_pylingual=True, verify_each_step_with_pylingual=True)
+        self.assertEqual(res["final_summary"]["combined_distance"], 0)
