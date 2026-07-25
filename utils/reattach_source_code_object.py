@@ -86,6 +86,13 @@ SEMANTIC_POST_LLM_DETERMINISTIC = (
 SEMANTIC_CORRECTIVE_FEEDBACK = (
     os.getenv("SEMANTIC_CORRECTIVE_FEEDBACK", "0").strip().lower() in ("1", "true", "yes", "on")
 )
+# Annotation reconciliation (Stage 1, oracle-source backend): when a PEP-649 `__annotate__`
+# code object diverges/is missing, repair its ENCLOSING class/func from GT source instead of
+# treating the synthetic annotation object itself as an unreattachable target. Off by default
+# (opt-in); off => byte-identical no-op branch in the deterministic prepass.
+SEMANTIC_ANNOTATION_RECONCILE = (
+    os.getenv("SEMANTIC_ANNOTATION_RECONCILE", "0").strip().lower() in ("1", "true", "yes", "on")
+)
 
 
 def _tail_deadline_seconds() -> float:
@@ -1600,6 +1607,18 @@ def _is_synthetic_annotation_qualname(qualname: str | None) -> bool:
     if not qualname:
         return False
     return str(qualname).rsplit(".", 1)[-1] == SYNTHETIC_ANNOTATION_LEAF
+
+
+def _annotate_enclosing_qualname(qualname: str | None) -> str | None:
+    """`<module>.A.B.__annotate__` -> `<module>.A.B` (the def whose annotations produced it).
+    None when the leaf isn't `__annotate__` or the enclosing scope is `<module>` (no def span)."""
+    if not qualname:
+        return None
+    parts = str(qualname).split(".")
+    if parts[-1] != "__annotate__":
+        return None
+    enclosing = ".".join(parts[:-1])
+    return enclosing if enclosing and enclosing != "<module>" else None
 
 
 def _expression_child_parent_qualname(qualname: str | None) -> str | None:

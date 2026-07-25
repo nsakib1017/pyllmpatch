@@ -27,3 +27,13 @@ Goal: LLM window captures the CAUSE (often 5-10 lines above the reported symptom
 - [ ] Task 1: locate_cause (symptom->cause anchoring rules)
 - [ ] Task 2: cause_aware_window (build from cause + preceding header/decorators/statement, capped, round-trip preserved)
 - [ ] Task 3: wire cause_aware_window into runner minimal_window_syntax_context + recompute site
+
+## Annotation Reconciliation Stage 1 (2026-07-25)
+Plan: docs/superpowers/plans/2026-07-25-annotation-reconciliation-stage1.md
+Branch: feat/annotation-reconciliation | Base: 71a7adc
+Constraints: oracle never weakened (reuse existing prepass gate); flag SEMANTIC_ANNOTATION_RECONCILE
+default off -> byte-identical; defer (None) on ambiguity; Python 3.10+; semantic-core edits authorized.
+- [x] Task 1: flag + `_annotate_enclosing_qualname` (`X.__annotate__` -> `X`)
+- [ ] Task 2: `_gt_def_source_by_qualname` (extract GT def source by qualname)
+- [ ] Task 3: annotation branch in run_deterministic_prepass (oracle backend) + engine fixture test (150->0)
+- [ ] Task 4: broaden fixtures + full regression (suite green, flag-off byte-identical)
