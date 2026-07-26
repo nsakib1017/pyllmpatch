@@ -30,4 +30,16 @@ CLAUDE.md
 plans
 docs
 tools
-*.pptx.superpowers/
+*.pptx
+.superpowers/
+
+# Non-source artifacts — keep git minimal (source only, enough to run the pipeline)
+logs/
+*.log
+*.ipynb
+*.joblib
+*.pyc
+.ipynb_checkpoints/
+pyllm_adapter/
+pyllm_final_dataset/
+experiment_outputs/

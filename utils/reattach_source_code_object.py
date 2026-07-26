@@ -88,13 +88,6 @@ SEMANTIC_POST_LLM_DETERMINISTIC = (
 SEMANTIC_CORRECTIVE_FEEDBACK = (
     os.getenv("SEMANTIC_CORRECTIVE_FEEDBACK", "0").strip().lower() in ("1", "true", "yes", "on")
 )
-# Annotation reconciliation (Stage 1, oracle-source backend): when a PEP-649 `__annotate__`
-# code object diverges/is missing, repair its ENCLOSING class/func from GT source instead of
-# treating the synthetic annotation object itself as an unreattachable target. Off by default
-# (opt-in); off => byte-identical no-op branch in the deterministic prepass.
-SEMANTIC_ANNOTATION_RECONCILE = (
-    os.getenv("SEMANTIC_ANNOTATION_RECONCILE", "0").strip().lower() in ("1", "true", "yes", "on")
-)
 # Corpus-write kill switch: when TRUE, skip appending accepted steps to the fine-tune
 # training-corpus log (`_append_accepted_code_object_dataset`), e.g. to keep a contaminated or
 # exploratory run out of the corpus. Does NOT affect `_append_accepted_case_telemetry` (a separate
@@ -1715,48 +1708,6 @@ def _is_synthetic_annotation_qualname(qualname: str | None) -> bool:
     if not qualname:
         return False
     return str(qualname).rsplit(".", 1)[-1] == SYNTHETIC_ANNOTATION_LEAF
-
-
-def _annotate_enclosing_qualname(qualname: str | None) -> str | None:
-    """`<module>.A.B.__annotate__` -> `<module>.A.B` (the def whose annotations produced it).
-    None when the leaf isn't `__annotate__` or the enclosing scope is `<module>` (no def span)."""
-    if not qualname:
-        return None
-    parts = str(qualname).split(".")
-    if parts[-1] != "__annotate__":
-        return None
-    enclosing = ".".join(parts[:-1])
-    return enclosing if enclosing and enclosing != "<module>" else None
-
-
-def _gt_def_source_by_qualname(gt_source_text: str, qualname: str) -> str | None:
-    """Return the exact GT source segment of the class/func at ``qualname``
-    (dotted, rooted at ``<module>``), or None on any ambiguity (parse failure,
-    qualname not rooted at ``<module>``, or any path segment not found)."""
-    import ast as _ast
-    parts = str(qualname).split(".")
-    if not parts or parts[0] != "<module>":
-        return None
-    names = parts[1:]
-    if not names:
-        return None
-    try:
-        tree = _ast.parse(gt_source_text)
-    except SyntaxError:
-        return None
-    node = tree
-    for name in names:
-        body = getattr(node, "body", None)
-        if body is None:
-            return None
-        match = next((c for c in body
-                      if isinstance(c, (_ast.ClassDef, _ast.FunctionDef, _ast.AsyncFunctionDef))
-                      and c.name == name), None)
-        if match is None:
-            return None
-        node = match
-    seg = _ast.get_source_segment(gt_source_text, node)
-    return seg
 
 
 def _expression_child_parent_qualname(qualname: str | None) -> str | None:
@@ -4250,24 +4201,9 @@ def repair_mismatching_code_objects(
                 # directly rather than feeding that glued string into the qualname map below.
                 is_missing = tr.message == "Missing bytecode"
                 raw_qualname = tr.name_a if is_missing else tr.names()
-                # Annotation reconciliation (Stage 1, oracle-source backend, flag-gated): a
-                # diverged OR entirely missing synthetic `__annotate__` object has no source
-                # representation of its own, so remap the target to the ENCLOSING def/class whose
-                # annotations produced it and repair that instead, using the verbatim GT source
-                # segment as the deterministic candidate. Falls through to the SAME recompile +
-                # oracle gate below; never fires when the flag is off, there is no GT source, or
-                # the qualname isn't a `__annotate__` leaf (defer, never a guessed annotation).
-                # Computed BEFORE (and folded into) the is_leaf/is_struct/is_diffbc gate below so a
-                # missing __annotate__ object -- which is none of those three message kinds -- still
-                # reaches this branch instead of being filtered out untouched.
-                annotate_enclosing = (
-                    _annotate_enclosing_qualname(raw_qualname)
-                    if (SEMANTIC_ANNOTATION_RECONCILE and gt_source is not None)
-                    else None
-                )
-                if not (is_leaf or is_struct or is_diffbc or annotate_enclosing is not None):
+                if not (is_leaf or is_struct or is_diffbc):
                     continue
-                qualname = annotate_enclosing if annotate_enclosing is not None else raw_qualname
+                qualname = raw_qualname
                 # The <module> object has no extractable code-object span (its row span is
                 # degenerate/empty), so feed the WHOLE source as its fragment and write the
                 # operator's full output back directly. This lets the deterministic operators
@@ -4289,20 +4225,7 @@ def repair_mismatching_code_objects(
                 }
                 candidate = None
                 operation = strategy = None
-                if annotate_enclosing is not None:
-                    annotation_candidate_text = _gt_def_source_by_qualname(
-                        parenthesize_bare_except(_load_text(gt_source)), qualname
-                    )
-                    if annotation_candidate_text is not None and annotation_candidate_text != fragment:
-                        candidate = {
-                            "text": annotation_candidate_text,
-                            "operator": "annotation_reconcile",
-                            "confidence": "high",
-                        }
-                        operation, strategy = "deterministic_prepass_annotation", "deterministic_annotation"
-                    if candidate is None:
-                        continue
-                elif is_leaf:
+                if is_leaf:
                     candidate = leaf_value_candidate(tr.bc_a, tr.bc_b, fragment, repair_context)
                     if candidate is not None:
                         operation, strategy = "deterministic_prepass_leaf", "deterministic_leaf"
