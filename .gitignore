@@ -43,3 +43,4 @@ logs/
 pyllm_adapter/
 pyllm_final_dataset/
 experiment_outputs/
+malware-meta

@@ -288,6 +288,11 @@ def copy_file(src: Path | str, dst: Path | str) -> None:
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
+    # shutil.copy2 preserves the source mode; decompiler artifacts are often read-only
+    # (0o555). This copy is a working file the repair loop overwrites in place, so it must
+    # be writable regardless of the source's mode -- otherwise the candidate-apply step
+    # raises PermissionError.
+    os.chmod(dst, os.stat(dst).st_mode | 0o200)
 
 
 def read_csv_file(file_name: str) -> pd.DataFrame:
@@ -451,6 +456,48 @@ class SyntaxSegment:
     anchor_indent: str
     segment_kind: str
     line_roles: tuple[str, ...]
+
+
+def clamp_syntax_segment(segment, error_line, max_tokens, count_tokens):
+    """Narrow an oversized `SyntaxSegment` around `error_line` so it fits the generation budget.
+
+    Repair is local: an over-budget window is a reason to look at LESS of the file, not to abandon
+    the file. The compile-and-retry loop re-localizes to the next error each iteration, so the
+    narrowed window slides across the whole file over successive attempts.
+
+    `start_line`/`end_line` are rewritten to describe exactly the retained text -- the repaired
+    window is spliced back at that span, so trimming the text without moving the bounds would write
+    the repair to the wrong lines. Returns the segment unchanged when it already fits (or the budget
+    is disabled), a narrowed segment when it can be clamped, and None when the file is
+    un-windowable: the ERROR LINE ALONE busts the budget (the minified/packer one-liner case).
+    """
+    if segment is None:
+        return None
+    if not max_tokens or max_tokens <= 0:
+        return segment
+
+    lines = segment.text.splitlines(keepends=True)
+    if not lines:
+        return segment
+    if count_tokens(segment.text) <= max_tokens:
+        return segment
+
+    from pipeline.logging_utils import clamp_window_to_budget
+
+    span = clamp_window_to_budget(lines, int(error_line) - int(segment.start_line), max_tokens, count_tokens)
+    if span is None:
+        return None
+    start, end = span
+    kept = lines[start:end]
+    return SyntaxSegment(
+        text="".join(kept),
+        start_line=segment.start_line + start,
+        end_line=segment.start_line + end - 1,
+        base_indent=segment.base_indent,
+        anchor_indent=segment.anchor_indent,
+        segment_kind=segment.segment_kind,
+        line_roles=_syntax_segment_roles(len(kept)),
+    )
 
 
 def _syntax_segment_roles(line_count: int) -> tuple[str, ...]:

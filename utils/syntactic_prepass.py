@@ -64,6 +64,345 @@ _OPEN = {"(": ")", "[": "]", "{": "}"}
 _CLOSE = {v: k for k, v in _OPEN.items()}
 
 
+_SURRENDER_MARKERS = re.compile(r"<mask_\d+>|<Code\d+ code object>")
+
+_MIN_TRUNCATED_LITERAL_CHARS = 80
+
+
+def is_truncated_literal_line(line) -> bool:
+    """True when `line` looks like a decompiler-TRUNCATED literal rather than a merely unbalanced one.
+
+    PyLingual caps constant sequences at 51 elements and stops mid-literal, leaving a long line with
+    a dangling opening quote inside a still-open bracket. Closing that literal makes the file
+    compile while silently discarding the remaining elements -- a repair that scores as
+    "genuine" (no lines deleted) but is not faithful. Callers use this to LABEL such repairs, so the
+    genuine rate can be split into faithful vs lossy instead of over-reporting fidelity.
+
+    Signature (measured on the malware corpus): a long line whose quote count is odd (an unclosed
+    string) AND whose brackets are still net-open. Never raises."""
+    if not line:
+        return False
+    text = str(line).rstrip("\n")
+    if len(text) < _MIN_TRUNCATED_LITERAL_CHARS:
+        return False
+    if (text.count("'") + text.count('"')) % 2 == 0:
+        return False
+    depth = 0
+    for ch in text:
+        if ch in _OPEN:
+            depth += 1
+        elif ch in _CLOSE:
+            depth -= 1
+    return depth > 0
+
+
+_LONG_LITERAL = re.compile(r"('([^'\\\n]|\\.){%d,}'|\"([^\"\\\n]|\\.){%d,}\")")
+_ELIDE_TOKEN = "__PYLLM_PAYLOAD_%d__"
+
+
+def elide_long_string_literals(source, max_literal_chars=2000):
+    """Hide oversized string-literal payloads behind short placeholders.
+
+    The lines that make a decompiled malware file un-windowable are almost always embedded payloads
+    (`encrypted_data = '<744,000 chars of base64>'`): syntactically trivial, never the cause of the
+    syntax error, but large enough that the whole file is discarded for exceeding the generation
+    budget. Eliding them shrinks the window enough to repair the file.
+
+    Returns `(elided_source, mapping)` where `mapping` maps each placeholder back to the ORIGINAL
+    literal text, so `restore_elided_literals` reproduces the input byte-for-byte -- the payload is
+    preserved, merely hidden from the model. Returns `(source, {})` when nothing is oversized.
+    Never raises."""
+    try:
+        if not source:
+            return source, {}
+        pattern = re.compile(_LONG_LITERAL.pattern % (max_literal_chars, max_literal_chars))
+        mapping = {}
+
+        def _swap(m):
+            token = _ELIDE_TOKEN % len(mapping)
+            literal = m.group(0)
+            mapping[token] = literal
+            # keep the same quote style so the result is still a valid string literal
+            quote = literal[0]
+            return f"{quote}{token}{quote}"
+
+        return pattern.sub(_swap, source), mapping
+    except Exception:
+        return source, {}
+
+
+def restore_elided_literals(source, mapping):
+    """Put the original payloads back, undoing `elide_long_string_literals`. Never raises."""
+    try:
+        if not source or not mapping:
+            return source
+        out = source
+        for token, literal in mapping.items():
+            quote = literal[0]
+            out = out.replace(f"{quote}{token}{quote}", literal)
+        return out
+    except Exception:
+        return source
+
+
+def restore_and_verify(source, mapping):
+    """`restore_elided_literals` plus proof that it worked. Returns `(restored, ok)`.
+
+    Elision is only safe if every placeholder comes back. A repair pass can rename, split, or
+    delete one -- and if it does, the payload is unrecoverable. Writing the file anyway would put
+    `__PYLLM_PAYLOAD_0__` where hundreds of kilobytes of base64 used to be: output that still
+    compiles, still reports zero deleted lines, and would score as a genuine repair while being
+    silently corrupt. `ok` is False whenever any placeholder is unaccounted for, so the caller can
+    fail the file instead of shipping it. Never raises."""
+    try:
+        if not mapping:
+            return source, True
+        if not source:
+            return source, False
+        restored = restore_elided_literals(source, mapping)
+        for token, literal in mapping.items():
+            # The payload must be BACK. Checking only that the token is gone would pass vacuously
+            # when a repair pass deleted or renamed the placeholder -- precisely the cases where
+            # the payload is lost.
+            if literal not in restored:
+                return restored, False
+            if token in restored:
+                return restored, False   # a second occurrence survived unrestored
+        return restored, True
+    except Exception:
+        return source, False
+
+
+_TRY = re.compile(r"^(\s*)try\s*:")
+_HANDLER = re.compile(r"^\s*(except|finally)\b")
+_LITERAL_LHS = re.compile(r"^(\s*)(\d+)(\s*=\s*)(?!=)")
+
+
+def complete_orphan_try(source, error=None):
+    """Give a handler-less `try:` an `except Exception: pass` instead of deleting its whole body.
+
+    The dominant structural defect in decompiled malware: 67% of files that only compiled via
+    line-deletion contain a `try:` whose except/finally the decompiler never emitted. The fallback's
+    only recourse is to delete the try AND its entire suite -- a median of 243 real lines across
+    this corpus. Synthesizing the two missing scaffold lines keeps every original statement.
+
+    This ADDS code, so it is not a faithful reconstruction: the caller must report such files in a
+    dedicated "scaffolded" bucket (below genuine, above deletion), never folded into the genuine
+    rate. Returns the rewritten source, or None when there is no orphan `try:`. Never raises."""
+    try:
+        if not source:
+            return None
+        lines = source.splitlines(keepends=True)
+        for i, line in enumerate(lines):
+            m = _TRY.match(line)
+            if not m:
+                continue
+            indent = len(m.group(1))
+            end = len(lines)
+            handled = False
+            for j in range(i + 1, len(lines)):
+                stripped = lines[j].strip()
+                if not stripped:
+                    continue
+                cur = len(lines[j]) - len(lines[j].lstrip())
+                if cur > indent:
+                    continue                      # still inside the try suite
+                if cur == indent and _HANDLER.match(lines[j]):
+                    handled = True
+                end = j
+                break
+            if handled:
+                continue
+            pad = " " * indent
+            patch = [f"{pad}except Exception:\n", f"{pad}    pass\n"]
+            return "".join(lines[:end] + patch + lines[end:])
+        return None
+    except Exception:
+        return None
+
+
+def literal_lhs_rename(source, error=None):
+    """Rewrite `72 = expr` (a literal on the left of `=`) to `_lit_72 = expr`.
+
+    The decompiler sometimes loses a binding's name and emits the constant in its place, producing
+    a line Python can never parse; 13% of delete-only malware files contain one. Deletion throws
+    away the whole statement including its right-hand side -- usually the analytically interesting
+    part (the call chain). Renaming the target keeps the expression intact.
+
+    Only NUMERIC targets are rewritten: they cannot be valid assignment targets under any Python
+    version, so the rewrite can never alter the meaning of otherwise-legal code. Returns the
+    rewritten source, or None when no literal target is present. Never raises."""
+    try:
+        if not source:
+            return None
+        out, changed = [], False
+        for line in source.splitlines(keepends=True):
+            m = _LITERAL_LHS.match(line)
+            if m:
+                out.append(f"{m.group(1)}_lit_{m.group(2)}{m.group(3)}{line[m.end():]}")
+                changed = True
+            else:
+                out.append(line)
+        return "".join(out) if changed else None
+    except Exception:
+        return None
+
+
+_COMPLETE_NUMBER = re.compile(r"(?<![\w.])(\d+)(?![\w.])")
+_COMPLETE_STRING = re.compile(r"'([^'\\]*(?:\\.[^'\\]*)*)'|\"([^\"\\]*(?:\\.[^\"\\]*)*)\"")
+
+
+def recover_truncated_literal(line, gt_sequences):
+    """Rebuild a decompiler-TRUNCATED constant sequence from the ground truth's own constants.
+
+    PyLingual stops emitting a constant sequence after 51 elements, leaving a dangling opening
+    quote inside an unclosed bracket. Closing that literal blind (what `balance_delimiters` does)
+    compiles but DISCARDS the remaining elements, so the repair scores "genuine" while being
+    unfaithful. The complete sequence survives in the GT `.pyc`, so this recovery is exact.
+
+    `line` is the truncated source line; `gt_sequences` is an iterable of tuples/lists/frozensets
+    of constants harvested from the GT code-object tree. Returns the completed line, or None when
+    recovery is not safe: no dangling quote, no GT sequence extending the parsed prefix, or MORE
+    THAN ONE candidate (emitting the wrong constants would look faithful while being wrong, which
+    is worse than leaving the line alone). Never raises.
+    """
+    try:
+        if not line or not gt_sequences:
+            return None
+        text = str(line).rstrip("\n")
+
+        # A truncated literal ends with an unclosed quote: odd quote count on the line.
+        if (text.count("'") + text.count('"')) % 2 == 0:
+            return None
+
+        prefix_elements = [m.group(1) if m.group(1) is not None else m.group(2)
+                           for m in _COMPLETE_STRING.finditer(text)]
+        if not prefix_elements:
+            # Numeric payloads (`[98, 97, 115, 101, ...]`) are common in packed malware and carry
+            # no quotes at all, so the string scanner finds nothing for them.
+            prefix_elements = [int(n) for n in _COMPLETE_NUMBER.findall(text)]
+        if not prefix_elements:
+            return None
+
+        def _candidates(prefix):
+            """GT sequences that extend `prefix`. Ordered containers must match positionally;
+            a frozenset has NO source order, so positional matching would reject the very
+            sequence we are looking for -- those match by containment instead."""
+            found = []
+            for seq in gt_sequences:
+                try:
+                    items = list(seq)
+                except TypeError:
+                    continue
+                if len(items) <= len(prefix):
+                    continue  # nothing was lost -- not the truncation case
+                if not all(isinstance(x, (str, int, bytes)) for x in items):
+                    continue
+                if isinstance(seq, frozenset) or isinstance(seq, set):
+                    if set(prefix) <= set(items):
+                        rest = [x for x in items if x not in set(prefix)]
+                        found.append(list(prefix) + rest)   # keep the source's observed order
+                elif items[:len(prefix)] == list(prefix):
+                    found.append(items)
+            return found
+
+        matches = _candidates(prefix_elements)
+        if not matches and len(prefix_elements) > 1:
+            # The decompiler may have stopped MID-element, so the last thing we parsed is a
+            # fragment rather than a real element; retry without it. The candidate must still
+            # extend BEYOND what the source already shows -- otherwise this "recovers" a literal
+            # that was never truncated, which is how the retry first went wrong.
+            matches = [m for m in _candidates(prefix_elements[:-1])
+                       if len(m) > len(prefix_elements)]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            # Ambiguous: prefer a single longest candidate (the most complete recovery). Only
+            # decline when even that is tied, since emitting the wrong constants would look
+            # faithful while being wrong.
+            longest = max(len(m) for m in matches)
+            top = [m for m in matches if len(m) == longest]
+            if len(top) != 1:
+                return None
+            matches = top
+
+        full = matches[0]
+        head = text[:text.index(_COMPLETE_STRING.search(text).group(0))]
+        depth = 0
+        for ch in head:
+            if ch in _OPEN:
+                depth += 1
+            elif ch in _CLOSE:
+                depth -= 1
+        if depth <= 0:
+            return None  # the elements are not inside an open bracket
+
+        closers = ""
+        stack = []
+        for ch in head:
+            if ch in _OPEN:
+                stack.append(ch)
+            elif ch in _CLOSE and stack:
+                stack.pop()
+        for opener in reversed(stack):
+            closers += _OPEN[opener]
+
+        return head + ", ".join(repr(x) for x in full) + closers
+    except Exception:
+        return None
+
+
+def splice_truncated_literals(source, error, gt_sequences):
+    """Whole-file wrapper around `recover_truncated_literal`: rebuild ONE truncated constant
+    sequence from the ground truth's own constants.
+
+    Repairs a single line per call so the driver re-probes between steps -- a file can carry
+    several truncated payloads, and splicing them blind in one pass would hide a bad candidate
+    behind a good one. The line the parser is complaining about is tried first (that is the one
+    blocking compilation); otherwise every line the truncation signature matches is tried in order.
+
+    Returns the rewritten source, or None when nothing was recovered. Never raises.
+    """
+    try:
+        if not source or not gt_sequences:
+            return None
+        lines = str(source).splitlines(keepends=True)
+        if not lines:
+            return None
+
+        order = []
+        lineno = getattr(error, "lineno", None)
+        if lineno and 1 <= int(lineno) <= len(lines):
+            order.append(int(lineno) - 1)
+        order.extend(i for i in range(len(lines)) if i not in order)
+
+        for index in order:
+            line = lines[index]
+            if not is_truncated_literal_line(line):
+                continue
+            recovered = recover_truncated_literal(line, gt_sequences)
+            if not recovered:
+                continue
+            newline = "\n" if line.endswith("\n") else ""
+            lines[index] = recovered.rstrip("\n") + newline
+            return "".join(lines)
+        return None
+    except Exception:
+        return None
+
+
+def has_decompiler_surrender_markers(source) -> bool:
+    """True when the decompiler explicitly reported it never recovered some content.
+
+    `<mask_N>` and `<CodeNNN code object>` are PyLingual's own surrender markers: the bytes behind
+    them were never turned into source. No prompt, operator, or amount of sampling can invent them,
+    so spending the full retry budget on such a file is wasted compute (measured: 16.8% of the
+    delete-only set). Never raises."""
+    if not source:
+        return False
+    return bool(_SURRENDER_MARKERS.search(str(source)))
+
+
 def balance_delimiters(source: str, error: SyntaxErrorInfo) -> str | None:
     """Close unbalanced ()[]{} and unterminated strings, or None if nothing unbalanced."""
     stack: list[str] = []
@@ -192,19 +531,53 @@ class PrepassResult:
     rounds: int = 0
 
 
-_OPERATORS = [balance_delimiters, dedent_stray_block, fix_line_continuation, fix_numeric_literal]
+# Ordered by FIDELITY, most faithful first. `literal_lhs_rename` only rewrites targets that could
+# never be valid Python, so it is as safe as the existing operators. `complete_orphan_try` is LAST
+# because it is the only operator that SYNTHESIZES code: it must never pre-empt a transform that
+# repairs the file without adding anything.
+_OPERATORS = [balance_delimiters, dedent_stray_block, fix_line_continuation, fix_numeric_literal,
+              literal_lhs_rename, complete_orphan_try]
+
+# Decompiled malware carries many independent defects per file (a median of 243 deleted lines in the
+# delete-only set), and each round fixes at most one. Six rounds stops long before the operators run
+# out of work -- measured: they keep making progress on 70% of non-parsing files well past round 6.
+_DEFAULT_PREPASS_ROUNDS = 24
 
 
-def run_syntactic_prepass(source: str, compile_fn=host_compile, max_rounds: int = 6) -> PrepassResult:
+def _operators_for(gt_sequences):
+    """The operator list, with the GT literal splice FIRST when ground truth is available.
+
+    Position is the whole point. `balance_delimiters` also makes a truncated-literal file compile,
+    by closing the bracket and discarding every element the decompiler never emitted -- a repair
+    that deletes no source line and so scores "genuine" while being unfaithful. The splice restores
+    those elements exactly. Whichever operator fires first wins, so the splice must precede it.
+    With no ground truth the list is the shipped one, unchanged.
+    """
+    if not gt_sequences:
+        return _OPERATORS
+
+    def splice(source, error):
+        return splice_truncated_literals(source, error, gt_sequences)
+
+    splice.__name__ = "splice_truncated_literals"
+    return [splice] + _OPERATORS
+
+
+def run_syntactic_prepass(source: str, compile_fn=host_compile, max_rounds: int = _DEFAULT_PREPASS_ROUNDS, gt_sequences=None) -> PrepassResult:
     """Try operators in order each round, accepting the first candidate that
-    compiles or strictly advances past the current error. Never regresses."""
+    compiles or strictly advances past the current error. Never regresses.
+
+    `gt_sequences` are constant sequences harvested from the ground-truth `.pyc`
+    (`gt_syntactic_context.harvest_constant_sequences`). When supplied they enable the truncated-
+    literal splice ahead of every other operator; when omitted the behaviour is the shipped one."""
     cur = source; ops: list[str] = []
+    operators = _operators_for(gt_sequences)
     for rnd in range(1, max_rounds + 1):
         before = probe_syntax(cur, compile_fn)
         if before is None:
             return PrepassResult(cur, True, ops, rnd - 1)
         applied = False
-        for op in _OPERATORS:
+        for op in operators:
             cand = op(cur, before)
             if cand is None or cand == cur:
                 continue

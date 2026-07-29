@@ -657,3 +657,39 @@ def structural_repair_directive(gt_code_object, derived_code_object) -> str | No
 def structural_directive_or_empty(gt_code_object, derived_code_object) -> str:
     """Thin wrapper returning ``""`` instead of None, for easy prompt concatenation."""
     return structural_repair_directive(gt_code_object, derived_code_object) or ""
+
+
+def gt_structure_directive(gt_bytecode, max_clauses: int = 4) -> str:
+    """GT-STRUCTURE-ONLY control-flow directive for the SYNTACTIC-repair prompt.
+
+    Unlike ``structural_repair_directive`` (which diffs GT vs a derived code object), syntactic
+    repair runs on source that does NOT compile, so there is no derived code object to diff.
+    This renders the ground truth's OWN control-flow constructs (try/if/for/while/with, recovered
+    from ``bc_to_cft`` plus the window/exception-table fallbacks via ``_constructs``) as readable
+    reconstruction clauses -- the nesting the LLM needs to re-attach orphaned statements and
+    dangling ``else:``/``except:`` that the decompiler mangled, and that the offset-based brief
+    ("loop @1..@318") cannot convey.
+
+    ``gt_bytecode`` is the EditableBytecode node (NOT the raw code object). Returns "" on any
+    failure or when the object is straight-line. Clause-capped at ``max_clauses`` (offset order)
+    so a large object can't blow the prompt budget. NEVER raises -- callers treat "" as ordinary
+    graceful degradation."""
+    try:
+        records = _constructs(gt_bytecode)
+    except Exception:  # noqa: BLE001 - advisory only; never break the caller.
+        return ""
+    if not records:
+        return ""
+    clauses: list[str] = []
+    for rec in sorted(records, key=lambda r: r.get("offset", 0)):
+        clause = _clause(rec)
+        if clause:
+            clauses.append(clause)
+        if len(clauses) >= max_clauses:
+            break
+    if not clauses:
+        return ""
+    if len(clauses) == 1:
+        return "Ground-truth control flow to reconstruct: " + clauses[0] + "."
+    body = "; ".join(f"({n + 1}) {c}" for n, c in enumerate(clauses))
+    return f"Ground-truth control flow to reconstruct ({len(clauses)} constructs): " + body + "."

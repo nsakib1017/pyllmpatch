@@ -170,7 +170,15 @@ def test_prepass_fixes_file_llm_never_called(tmp_path, monkeypatch):
     assert rec["compiled_success"] is True
     assert rec.get("llm_calls") == 0
     assert rec.get("deterministic_prepass_used") is True
-    assert "balance_delimiters" in rec.get("deterministic_prepass_operations", [])
+    # The sweep cascade reaches this file before the shipped error-driven prepass does and reports
+    # the same operator under its own namespace ("legacy:balance_delimiters"), so match on the
+    # operator rather than the namespace -- what this test asserts is that the fix was mechanical
+    # and attributed, not which of the two deterministic drivers got there first.
+    operations = rec.get("deterministic_prepass_operations", [])
+    assert any(op.endswith("balance_delimiters") for op in operations), operations
+    # Stage 1 is the code-preserving stage; a bracket close must never be attributed to synthesis.
+    assert rec.get("deterministic_cascade_stage") == 1
+    assert rec.get("deterministic_control_flow_rewrites") == []
 
     out_content = Path(rec["_abs_out"]).read_text()
     assert out_content == "x = f(1, 2)\n"

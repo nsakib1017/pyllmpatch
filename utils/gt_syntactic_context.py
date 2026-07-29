@@ -21,7 +21,9 @@ missing file, load error, module-scope error with no enclosing object, no name m
 """
 from __future__ import annotations
 
+import os
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -160,6 +162,121 @@ def build_gt_object_context(broken_source: str, error_line: int, gt_pyc_path: st
         if control_flow:
             result += "\nControl flow (nesting to reconstruct):\n" + control_flow
 
+        # Lever 1 (SYNTACTIC_CFR_DIRECTIVE, default OFF): a SOURCE-LEVEL control-flow directive
+        # recovered from the GT bytecode's construct tree (try/if/for/while/with with recovered
+        # headers, via structural_directive.gt_structure_directive) -- the readable nesting the
+        # offset-based brief above cannot convey. Targets the ~47% of malware decompilations
+        # whose failure is decompiler control-flow-reconstruction damage (orphaned statements,
+        # dangling else/except). Purely additive; absorbs its own failures.
+        if os.getenv("SYNTACTIC_CFR_DIRECTIVE", "0") == "1":
+            try:
+                from utils.semantic_operators.structural_directive import gt_structure_directive
+
+                directive = gt_structure_directive(node)
+            except Exception:
+                directive = ""
+            if directive:
+                result += "\n" + directive
+
         return result
     except Exception:
         return ""
+
+
+# ---------------------------------------------------------------------------
+# Constant-sequence harvest (GT co_consts splice)
+# ---------------------------------------------------------------------------
+# PyLingual truncates a constant sequence after 51 elements, leaving a dangling opening quote
+# inside an unclosed bracket. `balance_delimiters` closes it, so the file compiles and the repair
+# reports zero deleted lines -- while every element past the 51st is gone. The complete sequence
+# is still in the GT `.pyc` the pipeline already has on disk, so the faithful repair is mechanical.
+# These helpers supply `syntactic_prepass.recover_truncated_literal` with its candidate pool.
+
+_MIN_SEQUENCE_LENGTH = 2
+_MAX_SEQUENCES = 5000
+_MAX_WALK_NODES = 20000
+
+
+def constant_sequences_from_code(code_object, max_sequences=_MAX_SEQUENCES,
+                                 min_length=_MIN_SEQUENCE_LENGTH):
+    """Every tuple/frozenset constant in `code_object`'s tree, as a de-duplicated list.
+
+    Walks nested code objects, because the truncated literal is usually inside a function rather
+    than at module scope. Only sequences of str/int/bytes are kept -- those are what a source-level
+    literal can be rebuilt from, and admitting anything else would offer `recover_truncated_literal`
+    candidates it must reject anyway.
+
+    Both the node walk and the result set are bounded: packed malware routinely carries thousands
+    of constants, and an unbounded harvest would turn a per-file prepass into a memory problem.
+    Returns [] for anything that is not a code object; never raises.
+    """
+    try:
+        if code_object is None or not hasattr(code_object, "co_consts"):
+            return []
+        found, seen = [], set()
+        pending, visited = [code_object], 0
+        while pending and len(found) < max_sequences and visited < _MAX_WALK_NODES:
+            current = pending.pop()
+            visited += 1
+            for const in getattr(current, "co_consts", ()) or ():
+                if hasattr(const, "co_consts"):
+                    pending.append(const)
+                    continue
+                if not isinstance(const, (tuple, frozenset)):
+                    continue
+                items = tuple(const)
+                if len(items) < min_length:
+                    continue
+                if not all(isinstance(x, (str, int, bytes)) for x in items):
+                    continue
+                key = (isinstance(const, frozenset), items)
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(const)
+                if len(found) >= max_sequences:
+                    break
+        return found
+    except Exception:
+        return []
+
+
+def _harvest_uncached(gt_pyc_path, max_sequences):
+    """Load the `.pyc` and harvest. Returns a tuple so the cache holds an immutable value."""
+    try:
+        path = Path(gt_pyc_path)
+        if not path.is_file():
+            return ()
+        # Deferred: pyc loading pulls in xdis and the vendored pylingual package.
+        from utils.pyc_code_object_distance import load_editable_bytecode_from_pyc
+
+        root = load_editable_bytecode_from_pyc(path)
+        code_object = getattr(root, "codeobj", None) or root
+        return tuple(constant_sequences_from_code(code_object, max_sequences=max_sequences))
+    except Exception:
+        return ()
+
+
+@lru_cache(maxsize=4)
+def _harvest_cached(gt_pyc_path, max_sequences):
+    return _harvest_uncached(gt_pyc_path, max_sequences)
+
+
+def harvest_constant_sequences(gt_pyc_path, max_sequences=_MAX_SEQUENCES):
+    """`constant_sequences_from_code` over the code-object tree of the `.pyc` at `gt_pyc_path`.
+
+    A single file is probed by the prepass once before the LLM and again after each LLM candidate,
+    so the same ground truth is asked for repeatedly; loading it through xdis every time would
+    multiply a seconds-long load by the retry budget. The cache is deliberately tiny (4 entries):
+    the access pattern is one file at a time, and packed-malware constant pools are large enough
+    that retaining more would cost real memory for no hit-rate.
+
+    Returns [] on ANY failure (no path, missing file, unreadable/foreign-version bytecode) -- a
+    missing ground truth must degrade the repair to the blind close, never abort the file.
+    """
+    if not gt_pyc_path:
+        return []
+    return list(_harvest_cached(str(gt_pyc_path), max_sequences))
+
+
+harvest_constant_sequences.cache_clear = _harvest_cached.cache_clear

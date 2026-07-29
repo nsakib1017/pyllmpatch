@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import shutil
 import tempfile
 import time
@@ -16,11 +17,12 @@ from pipeline.config import (
     now_iso,
 )
 from pipeline.dataset import filter_dataset_rows, prepare_snippets_for_repair, resolve_syntax_dataset_source_path
-from pipeline.logging_utils import append_log, extract_line_number, failure_cleanup
+from pipeline.logging_utils import append_log, choose_initial_error, extract_line_number, failure_cleanup, window_exceeds_token_budget
 from utils.delete_only_compilation import delete_only_best_of, delete_lines_until_compilable_with_oracle
 from utils.file_helpers import (
     SyntaxSegment,
     align_indentation,
+    clamp_syntax_segment,
     copy_file,
     create_file_from_response,
     get_error_word_message_from_content,
@@ -30,9 +32,15 @@ from utils.file_helpers import (
     segment_syntax_context,
 )
 from utils.generate_bytecode import CompileError, compile_version
-from utils.gt_syntactic_context import build_gt_object_context
+from utils.gt_syntactic_context import build_gt_object_context, harvest_constant_sequences
 from utils.providers import Colors
-from utils.syntactic_prepass import SyntaxErrorInfo, cause_aware_window, codeobject_window, reattach_window
+from utils.syntactic_prepass import (SyntaxErrorInfo, cause_aware_window, codeobject_window,
+                                     elide_long_string_literals, is_truncated_literal_line,
+                                     reattach_window, restore_and_verify,
+                                     splice_truncated_literals)
+from utils.exhaustive_repair import SearchBudget, exhaustive_repair
+from utils.structural_repair import STRUCT_OPS
+from utils.syntactic_sweeps import CONTROL_FLOW_REWRITES, PURE_OPS, SYNTH_OPS, parse_error, run_stack
 from utils.version import PythonVersion
 
 SYNTACTIC_DETERMINISTIC_PREPASS_ENV = "SYNTACTIC_DETERMINISTIC_PREPASS"
@@ -146,6 +154,72 @@ def syntactic_max_tokens_override() -> int | None:
         return None
 
 
+def _clamped_context_provider(provider, max_tokens, count_tokens):
+    """Wrap a syntax-context provider so the window the LLM sees is clamped to the generation
+    budget around the error line, instead of the file being discarded for an oversized window.
+
+    Returns the provider unchanged when the budget is disabled. The wrapped provider yields None
+    when the window is un-windowable (error line alone over budget), which the caller treats as
+    out of scope."""
+    if not max_tokens or max_tokens <= 0:
+        return provider
+
+    def wrapped(path, error_line, error_description, expansion_level):
+        segment = provider(path, error_line, error_description, expansion_level)
+        return clamp_syntax_segment(segment, error_line, max_tokens, count_tokens)
+
+    return wrapped
+
+
+def syntactic_max_window_tokens() -> int:
+    """Window-discard threshold in TOKENS (SYNTACTIC_MAX_WINDOW_TOKENS, default 2048 = the LLM
+    generation budget). When a file's repair window tokenizes to more than this, the model
+    cannot regenerate it in one shot (the fix is truncated), so the file is DISCARDED (not
+    attempted) and EXCLUDED from the analyzability denominator (logged compiled_success=None,
+    skipped_due_to_blob_window=True). Set to 0 to disable. Read fresh every call."""
+    raw = os.getenv("SYNTACTIC_MAX_WINDOW_TOKENS", "2048").strip()
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 2048
+
+
+_WINDOW_TOKENIZER = None
+_WINDOW_TOKENIZER_FAILED = False
+
+
+def count_window_tokens(text: str) -> int:
+    """Token count of `text` using the repair model's tokenizer (Qwen3-Coder;
+    SYNTACTIC_WINDOW_TOKENIZER overrides the HF id/path). Lazily loaded and cached per process.
+    Fast guards avoid tokenizing the extremes: <=1 char/token is impossible so chars <= budget*1
+    is trivially under; a >40KB window is a giant blob far past any budget (return a huge count
+    without tokenizing). Falls back to a chars/3.3 estimate if the tokenizer can't load, so the
+    guard degrades gracefully rather than crashing the run."""
+    global _WINDOW_TOKENIZER, _WINDOW_TOKENIZER_FAILED
+    if not text:
+        return 0
+    n = len(text)
+    if n > 40000:
+        return 10 ** 9  # giant blob -- definitely over budget, don't tokenize it
+    if _WINDOW_TOKENIZER_FAILED:
+        return int(n / 3.3)
+    if _WINDOW_TOKENIZER is None:
+        try:
+            from transformers import AutoTokenizer
+
+            _WINDOW_TOKENIZER = AutoTokenizer.from_pretrained(
+                os.getenv("SYNTACTIC_WINDOW_TOKENIZER", "unsloth/qwen3-coder-30b-a3b-instruct"),
+                trust_remote_code=True,
+            )
+        except Exception:
+            _WINDOW_TOKENIZER_FAILED = True
+            return int(n / 3.3)
+    try:
+        return len(_WINDOW_TOKENIZER(text, add_special_tokens=False)["input_ids"])
+    except Exception:
+        return int(n / 3.3)
+
+
 def syntactic_generation_config(base_generation_config: dict | None) -> dict | None:
     """Merges the OUTPUT_OVERFLOW repetition-penalty lever (syntactic_repetition_penalty) on
     TOP of `base_generation_config`, COMPOSING with -- never replacing -- whatever sampling
@@ -188,7 +262,320 @@ def maybe_gt_context(gt_pyc_value: str | None, error_description, copy_dir) -> s
     return build_gt_object_context(full_source, error_line, gt_pyc_value)
 
 
-def maybe_prepass(source: str, version: str, compile_version_fn):
+GT_LITERAL_SPLICE_ENV = "SYNTACTIC_GT_LITERAL_SPLICE"
+SWEEP_CASCADE_ENV = "SYNTACTIC_SWEEP_CASCADE"
+PAYLOAD_ELISION_ENV = "SYNTACTIC_PAYLOAD_ELISION"
+
+# Literals below this are left alone: they cost little window and eliding them would churn the
+# source for no benefit. The un-windowable files carry payloads orders of magnitude larger.
+_ELISION_MIN_LITERAL_CHARS = 2000
+
+
+def maybe_elide_payloads(source):
+    """Hide oversized string-literal payloads so an un-windowable file becomes repairable.
+
+    327 malware files are excluded from repair entirely because their window busts the generation
+    budget, and the cause is nearly always an embedded payload (`data = '<744,000 chars>'`) --
+    syntactically trivial, never the reason the file fails to parse, and useless to the model.
+    Replacing it with a short placeholder shrinks the window enough to attempt the file; the exact
+    bytes go back afterwards via `restore_and_verify`.
+
+    Returns `(source, mapping)`, with an empty mapping when nothing was oversized -- in which case
+    the source is returned byte-identical and the repair path is unchanged. Enabled by default;
+    SYNTACTIC_PAYLOAD_ELISION=0 restores the discard-the-file behaviour. Never raises."""
+    if os.getenv(PAYLOAD_ELISION_ENV, "1") != "1":
+        return source, {}
+    if not source:
+        return source, {}
+    try:
+        return elide_long_string_literals(source, max_literal_chars=_ELISION_MIN_LITERAL_CHARS)
+    except Exception:
+        return source, {}
+
+_MAX_SPLICE_PASSES = 8
+
+
+def control_flow_rewrites_in(operations):
+    """The operators in `operations` that preserved every line but changed what the code DOES.
+
+    Reporting needs this separable. `clause_to_if_true` rewrites a dangling `else:` into
+    `if True:`: it deletes nothing, so the repair is genuine by the project's definition, but the
+    reconstructed control flow is not the original's -- and it is the largest single contributor in
+    stage 1. Folding it into an undifferentiated "deterministic fix" count would overstate fidelity.
+    """
+    if not operations:
+        return []
+    return [op for op in operations if op in CONTROL_FLOW_REWRITES]
+
+
+def _splice_to_fixpoint(source, gt_sequences):
+    """Apply the GT constant splice until it stops firing. Returns `(source, operations)`.
+
+    Runs BEFORE the cascade because `balance_delimiters` lives inside the cascade's legacy sweep
+    and will close a truncated literal by discarding every element past the 51st -- a repair that
+    removes no source line and so scores genuine while losing content. A file can carry several
+    truncated payloads, hence the loop.
+    """
+    if not gt_sequences:
+        return source, []
+    current, operations = source, []
+    for _ in range(_MAX_SPLICE_PASSES):
+        spliced = splice_truncated_literals(current, parse_error(current), gt_sequences)
+        if not spliced or spliced == current:
+            break
+        current = spliced
+        operations.append("splice_truncated_literals")
+    return current, operations
+
+
+POST_LLM_EXHAUSTIVE_ENV = "SYNTACTIC_POST_LLM_EXHAUSTIVE"
+
+# Every deterministic rewrite we have, as uniform (name, fn) pairs, so the search covers all orders.
+_ALL_DETERMINISTIC_OPS = None
+
+
+def _all_deterministic_ops():
+    """The full operator set, built once: whole-file sweeps + structural + the shipped prepass."""
+    global _ALL_DETERMINISTIC_OPS
+    if _ALL_DETERMINISTIC_OPS is None:
+        from utils.syntactic_prepass import _OPERATORS as _PREPASS_OPS
+
+        def _wrap(fn):
+            return lambda source, err: fn(source, parse_error(source))
+
+        _ALL_DETERMINISTIC_OPS = (
+            [("sweep:" + o.name, _wrap(o.fn)) for o in PURE_OPS + SYNTH_OPS]
+            + [("struct:" + o.name, o.fn) for o in STRUCT_OPS]
+            + [("prepass:" + f.__name__, _wrap(f)) for f in _PREPASS_OPS]
+        )
+    return _ALL_DETERMINISTIC_OPS
+
+
+def maybe_post_llm_repair(source, version, compile_version_fn):
+    """Run the EXHAUSTED deterministic layer on an LLM generation. Returns `(source, ok, ops)`.
+
+    The runner already had a post-LLM pass, but it called the shipped `maybe_prepass` -- the weak
+    driver that converts ~0.9% of files. The exhaustive search converts 21.7% of files that driver
+    cannot, so the old "post-LLM prepass is worthless" result (0/57) does not apply to it.
+
+    Measured on real artifacts: over the LLM's last output on files that then fell to the delete-only
+    fallback, this rescues 10 of 75 (13.3%) -- each one turning a delete-only compile into a GENUINE
+    repair. The model gets a file nearly right and misses one bracket or one handler body; the search
+    finishes it. That is why it belongs after EVERY generation rather than once at the end.
+
+    Same discipline as the pre-LLM pass: every candidate is gated on the file's own Python version,
+    and a generation that already compiles is returned untouched. Never raises.
+    """
+    if os.getenv(POST_LLM_EXHAUSTIVE_ENV, "1") != "1":
+        return source, False, []
+    if not source:
+        return source, False, []
+    # Validate the PROBE before searching. `compile_version` takes (py_path, out_path, version) --
+    # file paths -- and wiring it here as a (source, version) probe raised TypeError on every call,
+    # which the blanket except below swallowed into a silent permanent "no fix". A probe that cannot
+    # accept known-good source is a WIRING bug, not a repair failure, and must be visible.
+    try:
+        compile_version_fn("x = 1\n", version)
+    except TypeError as exc:
+        print(f"[post-llm] BROKEN PROBE, layer disabled: {exc}", file=sys.stderr, flush=True)
+        return source, False, []
+    except Exception:
+        pass  # a probe that rejects valid source for version reasons is still usable
+    try:
+        repaired, path = exhaustive_repair(
+            source, compile_version_fn, version, _all_deterministic_ops(),
+            budget=SearchBudget(max_depth=4, max_states=250),
+        )
+        if repaired is None:
+            return source, False, []
+        return repaired, True, list(path)
+    except Exception:
+        return source, False, []
+
+
+_MAX_STRUCT_ROUNDS = 8
+
+
+def _structural_fixpoint(source, rounds=_MAX_STRUCT_ROUNDS):
+    """Run the structural operators to a fixpoint. Returns `(source, operators_fired)`.
+
+    Separate from `run_stack` because these operators rewrite BLOCK STRUCTURE (they split and
+    re-nest lines) rather than repairing a line in place, and a file routinely carries several
+    instances of the same reconstruction defect."""
+    current, fired = source, []
+    for _ in range(rounds):
+        changed = False
+        for op in STRUCT_OPS:
+            candidate = op.fn(current, None)
+            if candidate and candidate != current:
+                current = candidate
+                fired.append(op.name)
+                changed = True
+                if parse_error(current) is None:
+                    return current, fired
+        if not changed:
+            break
+    return current, fired
+
+
+def maybe_sweep_cascade(source, version, compile_version_fn, gt_sequences=None):
+    """Run the two-stage deterministic cascade. Returns `(source, compiled, operations, stage)`.
+
+    Stage 1 (`PURE_OPS`) is code-preserving; stage 2 (`SYNTH_OPS`) scaffolds and runs only after
+    stage 1 has failed. `stage` is 1, 2, or 0 when nothing was adopted.
+
+    Two guarantees the sweep module itself cannot provide:
+
+      * The cascade decides with `ast.parse` on the HOST interpreter, but the file targets a
+        specific CPython version. A rewrite is adopted only once `compile_version_fn` accepts it,
+        so a host/target disagreement can never ship a broken "fix".
+      * If the cascade does not reach a parse, the ORIGINAL is returned -- never the partial
+        rewrite. Measured: on files the stack does not finish it reduces the error-site count on
+        only 19/250, so the partial pass is not an LLM aid, and deploying one regresses 7/233
+        currently-genuine files.
+
+    Enabled by default; SYNTACTIC_SWEEP_CASCADE=0 makes it a passthrough. Never raises.
+    """
+    if os.getenv(SWEEP_CASCADE_ENV, "1") != "1":
+        return source, False, [], 0
+    if not source:
+        return source, False, [], 0
+
+    try:
+        if parse_error(source) is None:
+            return source, False, [], 0  # already parses -- not this stack's business
+
+        spliced, operations = _splice_to_fixpoint(source, gt_sequences)
+
+        def _adopt(candidate, fired, stage):
+            if parse_error(candidate) is not None:
+                return None
+            try:
+                compile_version_fn(candidate, version)
+            except Exception:
+                return None  # host accepted it, the target did not
+            return candidate, True, operations + list(fired), stage
+
+        after_pure, pure_fired = run_stack(spliced, PURE_OPS)
+        adopted = _adopt(after_pure, pure_fired, 1)
+        if adopted:
+            return adopted
+
+        after_synth, synth_fired = run_stack(after_pure, SYNTH_OPS)
+        adopted = _adopt(after_synth, list(pure_fired) + list(synth_fired), 2)
+        if adopted:
+            return adopted
+
+        # STAGE 3 -- PyLingual control-flow RECONSTRUCTION defects (utils.structural_repair):
+        # a compound header whose body was never emitted, a for-loop flattened into comprehension
+        # shape, a doubled for-clause. Measured on the 410-file residual: rescues 10 (2.4%), all
+        # with ZERO lines deleted.
+        #
+        # It is adopt-only-if-it-parses for a hard reason: the same measurement showed the pass
+        # makes files WORSE on average (median defects 61 -> 74; 76 of 150 files worsened, 4
+        # improved, and NOT ONE crossed into LLM-winnable range). `renest_flattened_for` fires on
+        # 354 of 410 files but is right on ~10, and each wrong split manufactures a new broken line.
+        # So this must never be forwarded as a partial "LLM aid" -- only a complete fix is taken.
+        after_struct, struct_fired = _structural_fixpoint(after_synth)
+        if struct_fired:
+            adopted = _adopt(
+                after_struct, list(pure_fired) + list(synth_fired) + struct_fired, 3
+            )
+            if adopted:
+                return adopted
+
+        return source, False, [], 0
+    except Exception:
+        return source, False, [], 0
+
+
+def maybe_gt_sequences(gt_pyc_value, source):
+    """Constant sequences from the ground-truth `.pyc`, but only when they can possibly be used.
+
+    Harvesting means loading the `.pyc` through xdis and the vendored pylingual package -- seconds
+    per file. Only a file carrying a decompiler-TRUNCATED constant sequence can benefit, and that
+    is decidable from the text alone, so the cheap check runs first and the load is skipped for
+    every other row.
+
+    Enabled by default: where it fires, the alternative is `balance_delimiters` closing the bracket
+    and discarding every element past the 51st -- a repair that reports zero deleted lines while
+    losing content. Set SYNTACTIC_GT_LITERAL_SPLICE=0 to fall back to that behaviour. Returns []
+    on any failure; a missing or unreadable ground truth must never abort the file.
+    """
+    if os.getenv(GT_LITERAL_SPLICE_ENV, "1") != "1":
+        return []
+    if not gt_pyc_value or not source:
+        return []
+    try:
+        if not any(is_truncated_literal_line(line) for line in str(source).splitlines()):
+            return []
+        return harvest_constant_sequences(gt_pyc_value) or []
+    except Exception:
+        return []
+
+
+def elide_to_fit_window(source, error_line, max_tokens, count_tokens):
+    """Hide payloads ONLY when doing so rescues a file that is otherwise un-windowable.
+
+    A file is out of scope when its ERROR LINE ALONE busts the generation budget -- the minified
+    packer one-liner, which no window granularity can shrink. That line is almost always carrying an
+    embedded payload, so eliding it brings the file back into scope.
+
+    Deliberately narrow: it fires only for files already destined to be discarded, and returns
+    `(source, {})` -- byte-identical -- for everything else. The 1,218 files already in scope must
+    not change behaviour to chase the 327 that are thrown away.
+
+    Returns `(source, mapping)`. An empty mapping means nothing was done. Never raises."""
+    if os.getenv(PAYLOAD_ELISION_ENV, "1") != "1":
+        return source, {}
+    if not source or not max_tokens or max_tokens <= 0 or not error_line:
+        return source, {}
+    try:
+        lines = source.splitlines(keepends=True)
+        index = int(error_line) - 1
+        if not (0 <= index < len(lines)):
+            return source, {}
+        if count_tokens(lines[index]) <= max_tokens:
+            return source, {}  # windowable already -- not our business
+
+        elided, mapping = maybe_elide_payloads(source)
+        if not mapping:
+            return source, {}
+
+        elided_lines = elided.splitlines(keepends=True)
+        if not (0 <= index < len(elided_lines)):
+            return source, {}
+        if count_tokens(elided_lines[index]) > max_tokens:
+            # Still oversized: the bulk is not a string payload (a giant numeric tuple, a
+            # thousand-argument call). Churning the source buys nothing -- leave it out of scope.
+            return source, {}
+        return elided, mapping
+    except Exception:
+        return source, {}
+
+
+def finalize_and_compile(source, out_py_path, out_pyc_path, version, elision_mapping=None):
+    """The single write boundary for an accepted repair: restore payloads, verify, then compile.
+
+    Every route that writes the final output goes through here, so the restoration guarantee lives
+    in one place instead of being re-implemented at each site. A file whose placeholders the repair
+    mangled is reported as a COMPILE FAILURE and never written: shipping it would put
+    `__PYLLM_PAYLOAD_0__` where the payload was -- output that compiles, deletes no line, and would
+    score as a genuine repair while being silently corrupt.
+    """
+    if elision_mapping:
+        restored, ok = restore_and_verify(source, elision_mapping)
+        if not ok:
+            return {
+                "is_compiled": False,
+                "error_description": "payload restoration failed: placeholder lost during repair",
+                "payload_restoration_failed": True,
+            }
+        source = restored
+    return compile_new_pyc(source, out_py_path, out_pyc_path, version)
+
+
+def maybe_prepass(source: str, version: str, compile_version_fn, gt_sequences=None):
     """Pure, testable wrapper around utils.syntactic_prepass.run_syntactic_prepass.
 
     Behind env flag SYNTACTIC_DETERMINISTIC_PREPASS (default "1"): runs the
@@ -197,6 +584,10 @@ def maybe_prepass(source: str, version: str, compile_version_fn):
     on failure -- the same contract `utils.syntactic_prepass.probe_syntax`
     expects of a compile_fn). Flag "0" => no-op passthrough: (source, False, []),
     matching the pre-Task-6 code path byte-for-byte.
+
+    `gt_sequences` are constant sequences harvested from the ground-truth `.pyc`; supplying them
+    lets the prepass rebuild a decompiler-truncated constant sequence exactly, instead of closing
+    the bracket and silently dropping everything past the 51st element.
     """
     if not deterministic_prepass_enabled():
         return source, False, []
@@ -206,7 +597,7 @@ def maybe_prepass(source: str, version: str, compile_version_fn):
     def _cf(s: str) -> None:
         compile_version_fn(s, version)
 
-    r = run_syntactic_prepass(source, compile_fn=_cf)
+    r = run_syntactic_prepass(source, compile_fn=_cf, gt_sequences=gt_sequences)
     return r.source, r.compiled, r.operations
 
 
@@ -410,11 +801,33 @@ def run_experiment(config: RuntimeConfig, *, source: str | None = None, limit: i
                 continue
 
             path_to_err_file = str(file_dir)
-            initial_error_description = row.get("error_description") or row.get("error_message") or row.get("error")
+            initial_error_description = (
+                row.get("error_description")
+                or row.get("error_message")
+                or row.get("error")
+                or row.get("syntactic_error_message")
+            )
             error_word = row.get("syntactic_error_word") or row.get("error")
             gt_pyc_value = norm_str(row.get("gt_pyc"))
             copy_dir = log_base / decompiler_name / dataset_name / bytecode_version / file_hash / f"copy_for_run_id_{run_id}_of_{file_name}"
             copy_file(path_to_err_file, copy_dir)
+
+            # The row's error may lack a resolvable line number (e.g. the malware manifest
+            # stores only "unexpected indent"); the repair loop localizes via
+            # extract_line_number and can't proceed without one. Derive a line-numbered error
+            # from the file itself -- the source of truth for its current syntax error -- via a
+            # single compile probe, only when the row error has no line number.
+            if extract_line_number(initial_error_description) is None:
+                _probe_source = read_file(copy_dir) or ""
+                if _probe_source:
+                    with tempfile.TemporaryDirectory(prefix="init_err_probe_") as _probe_dir:
+                        _probe_result = compile_new_pyc(
+                            _probe_source,
+                            os.path.join(_probe_dir, "probe.py"),
+                            os.path.join(_probe_dir, "probe.pyc"),
+                            bytecode_version,
+                        )
+                    initial_error_description = choose_initial_error(initial_error_description, _probe_result)
 
             version = bytecode_version
             max_retries = config.max_retries_default
@@ -442,6 +855,57 @@ def run_experiment(config: RuntimeConfig, *, source: str | None = None, limit: i
                 "delete_only_base_window": int(config.delete_only_base_window),
                 "delete_only_max_deleted_ratio": float(config.delete_only_max_deleted_ratio),
             }
+
+            # Window-budget discard: if the repair window AT THE ERROR already exceeds the LLM
+            # generation budget (2048 tokens), the model can't regenerate it in one shot --
+            # discard the file, do not attempt it, and EXCLUDE it from the analyzability
+            # denominator (compiled_success=None). Gated by SYNTACTIC_MAX_WINDOW_TOKENS (0=off).
+            _win_cap = syntactic_max_window_tokens()
+            _win_err_line = extract_line_number(initial_error_description)
+            # Payloads hidden from the model for this file, restored by finalize_and_compile before
+            # any output is written. Empty for every file that was already windowable.
+            elision_mapping = {}
+            if _win_cap > 0 and _win_err_line is not None:
+                if syntactic_codeobject_window_enabled():
+                    _win_seg = codeobject_window_syntax_context(copy_dir, _win_err_line, initial_error_description, 0)
+                else:
+                    _win_seg = minimal_window_syntax_context(copy_dir, _win_err_line, initial_error_description, 0)
+                # An over-budget window is a reason to look at LESS of the file, not to abandon it:
+                # clamp around the error line and let the retry loop slide the window across the
+                # file. Only a file whose ERROR LINE ALONE busts the budget (minified/packer
+                # one-liner) is genuinely un-windowable and therefore out of scope.
+                if _win_seg is not None and window_exceeds_token_budget(_win_seg.text, _win_cap, count_window_tokens):
+                    if clamp_syntax_segment(_win_seg, _win_err_line, _win_cap, count_window_tokens) is None:
+                        # LAST CHANCE before discarding: the error line is almost always oversized
+                        # because it carries an embedded payload, not because it is complex. Hide
+                        # the payload and re-check; the exact bytes are restored by
+                        # finalize_and_compile before anything is written. Fires only here, so a
+                        # file that was already in scope never takes this path.
+                        _elided_source, elision_mapping = elide_to_fit_window(
+                            read_file(copy_dir) or "", _win_err_line, _win_cap, count_window_tokens
+                        )
+                        if elision_mapping:
+                            with open(copy_dir, "w", encoding="utf-8") as f:
+                                f.write(_elided_source)
+                            log_rec.update(
+                                {
+                                    "payload_elision_used": True,
+                                    "payload_elision_count": len(elision_mapping),
+                                }
+                            )
+                        else:
+                            _win_tok = count_window_tokens(_win_seg.text)
+                            log_rec.update(
+                                {
+                                    "skipped_due_to_blob_window": True,
+                                    "unwindowable_error_line": True,
+                                    "blob_window_tokens": _win_tok if _win_tok < 10 ** 9 else None,
+                                    "blob_window_chars": len(_win_seg.text),
+                                    "compiled_success": None,
+                                }
+                            )
+                            append_log(log_file, log_rec)
+                            continue
 
             t_begin = time.monotonic()
             compilation_candidate = ""
@@ -525,12 +989,33 @@ def run_experiment(config: RuntimeConfig, *, source: str | None = None, limit: i
                             if not probe_result["is_compiled"]:
                                 raise CompileError(probe_result["error_description"] or "syntactic prepass probe: compile failed")
 
-                        prepass_fixed_source, prepass_is_compiled, prepass_ops = maybe_prepass(
-                            prepass_current_source, version, _prepass_probe_compile_fn
+                        # GT co_consts splice: only harvested when this file actually carries a
+                        # truncated constant sequence, so the .pyc load is paid for by the rows
+                        # that can use it (see maybe_gt_sequences).
+                        prepass_gt_sequences = maybe_gt_sequences(gt_pyc_value, prepass_current_source)
+
+                        # Two-stage sweep cascade FIRST: it converts 30.2% of non-parsing files
+                        # against the shipped error-driven prepass's 0.9%, because it sweeps the
+                        # whole file to a fixpoint instead of chasing the single error the parser
+                        # currently reports. Only when it cannot finish the file does the shipped
+                        # prepass get its turn -- it still owns two operators the cascade excludes.
+                        cascade_source, cascade_compiled, cascade_ops, cascade_stage = maybe_sweep_cascade(
+                            prepass_current_source, version, _prepass_probe_compile_fn,
+                            gt_sequences=prepass_gt_sequences,
                         )
 
+                        if cascade_compiled:
+                            prepass_fixed_source, prepass_is_compiled, prepass_ops = (
+                                cascade_source, True, cascade_ops
+                            )
+                        else:
+                            prepass_fixed_source, prepass_is_compiled, prepass_ops = maybe_prepass(
+                                prepass_current_source, version, _prepass_probe_compile_fn,
+                                gt_sequences=prepass_gt_sequences,
+                            )
+
                     if prepass_is_compiled:
-                        compilation_result = compile_new_pyc(prepass_fixed_source, out_py_path, out_pyc_path, version)
+                        compilation_result = finalize_and_compile(prepass_fixed_source, out_py_path, out_pyc_path, version, elision_mapping)
                         is_compiled = compilation_result["is_compiled"]
                         initial_error_description = compilation_result["error_description"]
                         attempt_number = total_attempts_completed + 1
@@ -547,6 +1032,13 @@ def run_experiment(config: RuntimeConfig, *, source: str | None = None, limit: i
                                 "total_attempts_completed": attempt_number,
                                 "deterministic_prepass_used": True,
                                 "deterministic_prepass_operations": list(prepass_ops),
+                                # Sub-reporting: which stage carried the file, and whether the fix
+                                # rewrote control flow. Stage 2 SYNTHESIZES a handler (genuine --
+                                # nothing is deleted -- but it is scaffolding, not recovery), and
+                                # `clause_to_if_true` preserves every line while changing what the
+                                # code does. Both must stay separable from a plain stage-1 repair.
+                                "deterministic_cascade_stage": cascade_stage,
+                                "deterministic_control_flow_rewrites": control_flow_rewrites_in(prepass_ops),
                             }
                         )
 
@@ -590,6 +1082,39 @@ def run_experiment(config: RuntimeConfig, *, source: str | None = None, limit: i
                     syntax_context_provider = codeobject_window_syntax_context
                 else:
                     syntax_context_provider = minimal_window_syntax_context if llm_use_minimal_window else segment_syntax_context
+
+                # Window-budget discard (in-loop): the window grows as expansion widens to outer
+                # code objects across retries. Whenever the window the LLM would actually see
+                # exceeds the generation budget (2048 tokens), discard the file -- stop
+                # attempting it and EXCLUDE it from the analyzability denominator
+                # (compiled_success=None). Gated by SYNTACTIC_MAX_WINDOW_TOKENS (0=off).
+                _win_cap = syntactic_max_window_tokens()
+                if _win_cap > 0:
+                    _win_err_line = extract_line_number(initial_error_description)
+                    _win_seg = (
+                        syntax_context_provider(copy_dir, _win_err_line, initial_error_description, total_attempts_completed)
+                        if _win_err_line is not None
+                        else None
+                    )
+                    if _win_seg is not None and window_exceeds_token_budget(_win_seg.text, _win_cap, count_window_tokens):
+                        if clamp_syntax_segment(_win_seg, _win_err_line, _win_cap, count_window_tokens) is None:
+                            _win_tok = count_window_tokens(_win_seg.text)
+                            log_rec.update(
+                                {
+                                    "skipped_due_to_blob_window": True,
+                                    "unwindowable_error_line": True,
+                                    "blob_window_tokens": _win_tok if _win_tok < 10 ** 9 else None,
+                                    "blob_window_chars": len(_win_seg.text),
+                                    "compiled_success": None,
+                                }
+                            )
+                            append_log(log_file, log_rec)
+                            break
+                        # Windowable: the LLM sees a budget-clamped view of the window. Successive
+                        # retries re-localize to the next error, sliding the window over the file.
+                        syntax_context_provider = _clamped_context_provider(
+                            syntax_context_provider, _win_cap, count_window_tokens
+                        )
 
                 # GT-context lever (SYNTACTIC_GT_CONTEXT, default OFF): computed once per
                 # attempt, from the FULL current file source and the full-file error line,
@@ -730,10 +1255,58 @@ def run_experiment(config: RuntimeConfig, *, source: str | None = None, limit: i
                             copied_content = read_file(copy_dir)
                             candidate_compilation_candidate = copied_content if copied_content else read_file(path_to_err_file)
 
-                        compilation_result = compile_new_pyc(candidate_compilation_candidate, out_py_path, out_pyc_path, version)
+                        compilation_result = finalize_and_compile(candidate_compilation_candidate, out_py_path, out_pyc_path, version, elision_mapping)
                         candidate_compile_ms = int((time.perf_counter() - t_candidate) * 1000)
                         candidate_is_compiled = compilation_result["is_compiled"]
                         candidate_error_description = compilation_result["error_description"]
+
+                        # POST-LLM deterministic pass: the model's output is frequently ALMOST
+                        # parseable -- one unclosed bracket, a handler-less `try:`, a literal
+                        # assignment target. The same compile-gated operators that clean the input
+                        # can finish the job here, turning a near-miss into a compiling file
+                        # instead of burning another retry (or falling through to deletion).
+                        # Compile-gated end to end: only adopted if it actually compiles.
+                        if not candidate_is_compiled and candidate_compilation_candidate:
+                            # The EXHAUSTED deterministic layer, after this generation. Measured
+                            # on real artifacts: rescues 13.3% of LLM outputs that would otherwise
+                            # fall to the delete-only fallback, turning each into a GENUINE repair.
+                            # The weak `maybe_prepass` used to run here; it is kept as a fallback
+                            # because it carries the GT literal splice, which the search does not.
+                            # `compile_version` takes (py_path, out_path, version) -- FILE PATHS.
+                            # Passing it as a (source, version) probe raises TypeError on EVERY
+                            # call, and the blanket try/except swallows it, so the layer silently
+                            # reported "no fix" for every file. This defect predates the exhaustive
+                            # layer: the original maybe_prepass call here had it too, which means
+                            # the historical "post-LLM prepass 0/57" result measured a broken call
+                            # rather than a useless idea. Probe source TEXT, like the pre-LLM site.
+                            def _post_llm_probe(candidate_source: str, candidate_version: str) -> None:
+                                with tempfile.TemporaryDirectory(prefix="post_llm_probe_") as _d:
+                                    _r = compile_new_pyc(candidate_source,
+                                                         os.path.join(_d, "probe.py"),
+                                                         os.path.join(_d, "probe.pyc"),
+                                                         candidate_version)
+                                if not _r["is_compiled"]:
+                                    raise CompileError(_r.get("error_description") or "post-LLM probe: compile failed")
+
+                            post_source, post_compiled, post_ops = maybe_post_llm_repair(
+                                candidate_compilation_candidate, version, _post_llm_probe
+                            )
+                            if not post_compiled:
+                                post_source, post_compiled, post_ops = maybe_prepass(
+                                    candidate_compilation_candidate, version, _post_llm_probe,
+                                    gt_sequences=maybe_gt_sequences(
+                                        gt_pyc_value, candidate_compilation_candidate
+                                    ),
+                                )
+                            if post_compiled and post_source:
+                                create_file_from_response(copy_dir, post_source)
+                                post_result = finalize_and_compile(post_source, out_py_path, out_pyc_path, version, elision_mapping)
+                                if post_result["is_compiled"]:
+                                    candidate_compilation_candidate = post_source
+                                    candidate_is_compiled = True
+                                    candidate_error_description = None
+                                    log_rec.setdefault("post_llm_prepass_operations", []).extend(post_ops or [])
+                                    log_rec["post_llm_prepass_fixed"] = True
                     except Exception:
                         candidate_is_compiled = False
                         candidate_compile_exception = traceback.format_exc()
@@ -891,6 +1464,24 @@ def run_experiment(config: RuntimeConfig, *, source: str | None = None, limit: i
                             )
 
                             if last_res.get("is_compiled"):
+                                # The fallback writes its own output path, bypassing
+                                # finalize_and_compile, so an elided file rescued here would ship
+                                # with placeholders where its payload belongs. Restore in place;
+                                # if a placeholder was lost, this is not a repair.
+                                if elision_mapping:
+                                    _do_src = read_file(delete_only_out_py_path) or ""
+                                    _do_restored, _do_ok = restore_and_verify(_do_src, elision_mapping)
+                                    if _do_ok:
+                                        with open(delete_only_out_py_path, "w", encoding="utf-8") as f:
+                                            f.write(_do_restored)
+                                    else:
+                                        last_res = {
+                                            "is_compiled": False,
+                                            "error_description": "payload restoration failed after delete-only fallback",
+                                        }
+                                        log_rec.update({"payload_restoration_failed": True})
+
+                            if last_res.get("is_compiled"):
                                 is_compiled = True
                                 log_rec.update({"compiled_success": True, "path_out": delete_only_out_py_path})
                                 try:
@@ -907,7 +1498,13 @@ def run_experiment(config: RuntimeConfig, *, source: str | None = None, limit: i
                         log_rec.update({"delete_only_fallback_used": False})
 
                     try:
-                        failure_cleanup(affected_file_path, compilation_candidate, file_name[:-3], error_word, error_message, log_rec)
+                        # The failure artifact is a diagnostic the analyst reads; write the real
+                        # source into it, not placeholders. Restoration failure is irrelevant here
+                        # -- the file already failed -- so keep whatever we have.
+                        _failed_source = compilation_candidate
+                        if elision_mapping:
+                            _failed_source = restore_and_verify(compilation_candidate, elision_mapping)[0]
+                        failure_cleanup(affected_file_path, _failed_source, file_name[:-3], error_word, error_message, log_rec)
                         if elapsed > MAX_EXAMPLE_RUNTIME_SEC:
                             log_rec.update({"compiled_success": None})
                         append_log(log_file, log_rec)
