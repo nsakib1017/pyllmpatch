@@ -63,3 +63,31 @@ class ClassifyRepairOutcomeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ForcedCompileNeutralisationTest(unittest.TestCase):
+    """The forced-compile (neutralise-not-delete) fallback must never count as genuine.
+
+    A forced-compiled file compiles WITHOUT deletion, but unparseable regions were turned into inert
+    string literals -- it is analysable, not repaired, so it gets its own bucket disqualified from
+    the genuine numerator exactly like deletion.
+    """
+
+    def test_forced_compile_is_its_own_bucket_not_genuine(self):
+        rec = {"compiled_success": True, "forced_compile_used": True,
+               "forced_compile_neutralised_lines": 12}
+        self.assertEqual(classify_repair_outcome(rec), "neutralised_compile")
+
+    def test_forced_compile_disqualifies_even_with_zero_deletion(self):
+        rec = {"compiled_success": True, "forced_compile_used": True,
+               "forced_compile_neutralised_lines": 1, "delete_only_fallback_used": False}
+        self.assertNotIn(classify_repair_outcome(rec), ("genuine", "genuine_lossy"))
+
+    def test_deletion_still_takes_precedence_if_both_somehow_set(self):
+        rec = {"compiled_success": True, "forced_compile_used": True,
+               "delete_only_fallback_used": True, "delete_only_deletions": 5}
+        self.assertIn(classify_repair_outcome(rec), ("light_deletion", "heavy_deletion"))
+
+    def test_absent_forced_compile_still_genuine(self):
+        rec = {"compiled_success": True}
+        self.assertEqual(classify_repair_outcome(rec), "genuine")

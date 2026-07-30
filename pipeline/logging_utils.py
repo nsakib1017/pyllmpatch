@@ -139,6 +139,12 @@ def classify_repair_outcome(record):
         deletions = 0
     if record.get("delete_only_fallback_used") and deletions > 0:
         return "light_deletion" if deletions <= _LIGHT_DELETION_MAX_LINES else "heavy_deletion"
+    # The forced-compile fallback neutralises unparseable code into inert string literals instead of
+    # deleting it. It compiles WITHOUT removing a line, but the neutralised regions do not execute, so
+    # it is analysable-not-repaired: its own bucket, disqualified from the genuine numerator. Deletion
+    # (checked above) still wins if both are somehow set.
+    if record.get("forced_compile_used"):
+        return "neutralised_compile"
     # Synthesized scaffolding (an `except Exception: pass` for a handler-less `try:`) DELETES
     # nothing and preserves the entire original body, so it is a real repair by the same rule --
     # only mechanical deletion disqualifies. The synthesis is still recorded in

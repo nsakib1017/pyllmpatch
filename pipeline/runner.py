@@ -1412,7 +1412,50 @@ def run_experiment(config: RuntimeConfig, *, source: str | None = None, limit: i
                 if max_retries < 0 or elapsed > MAX_EXAMPLE_RUNTIME_SEC:
                     print(f"{Colors.FAIL}    -> Max retries reached. Could not compile the file. {Colors.ENDC}")
 
-                    if config.enable_delete_only_fallback:
+                    if config.enable_forced_compile_fallback:
+                        print(f"{Colors.WARNING}    -> Engaging forced-compile fallback (neutralise unparseable code, NO deletion)...  {Colors.ENDC}")
+                        try:
+                            from utils.forced_compile import force_compile, _whole_file_literal
+
+                            fc_out_py_path = str(affected_file_path / f"forced_compile_{file_name[:-3]}.py")
+                            fc_out_pyc_path = str(affected_file_path / f"forced_compile_{file_name[:-3]}.pyc")
+                            original_src = read_file(path_to_err_file) or ""
+                            fc_text, fc_led = force_compile(original_src, None, version)
+
+                            # Restore any elided payloads before the authoritative compile.
+                            if elision_mapping:
+                                _fc_restored, _fc_ok = restore_and_verify(fc_text, elision_mapping)
+                                if _fc_ok:
+                                    fc_text = _fc_restored
+
+                            # compile_new_pyc(content, out_py_path, out_pyc_path, version) writes the
+                            # .py from the content string itself -- pass fc_text, not the path.
+                            fc_res = compile_new_pyc(fc_text, fc_out_py_path, fc_out_pyc_path, version)
+
+                            if not fc_res.get("is_compiled"):
+                                # force_compile's internal guarantee is host-version; if the TARGET
+                                # version still rejects it, the whole-file literal compiles at every
+                                # version and preserves every byte. Guarantees this fallback compiles.
+                                fc_text = _whole_file_literal(original_src)
+                                fc_res = compile_new_pyc(fc_text, fc_out_py_path, fc_out_pyc_path, version)
+                                fc_led["fallback"] = "whole-file"
+                                fc_led["lines_in_neutralised_chunks"] = original_src.count("\n")
+
+                            log_rec.update({
+                                "forced_compile_used": True,
+                                "forced_compile_neutralised_lines": int(fc_led.get("lines_in_neutralised_chunks", 0)),
+                                "forced_compile_fallback_kind": fc_led.get("fallback"),
+                                "forced_compile_output_path": fc_out_py_path,
+                                "delete_only_fallback_used": False,
+                            })
+                            if fc_res.get("is_compiled"):
+                                is_compiled = True
+                                log_rec.update({"compiled_success": True, "path_out": fc_out_py_path})
+                            else:
+                                log_rec.update({"forced_compile_failed": True})
+                        except Exception as e:
+                            log_rec.update({"forced_compile_used": True, "forced_compile_exception": str(e)})
+                    elif config.enable_delete_only_fallback:
                         print(f"{Colors.WARNING}    -> Engaging delete-only fallback (best-of original + last llm output)...  {Colors.ENDC}")
                         try:
                             llm_snapshot_path = affected_file_path / f"llm_last_output_{file_name[:-3]}.py"

@@ -52,6 +52,9 @@ class RuntimeConfig:
     max_retries_default: int
     local_llm_idx: int
     run_timestamp: str
+    # Default-valued (must stay last): when on, the non-destructive forced-compile fallback replaces
+    # delete-only. Defaulted so existing RuntimeConfig constructors keep working.
+    enable_forced_compile_fallback: bool = False
 
 
 def load_runtime_config() -> RuntimeConfig:
@@ -68,6 +71,12 @@ def load_runtime_config() -> RuntimeConfig:
         previous_run_log_path=previous_run_log_path,
         delete_only_mode=flag("DELETE_ONLY_MODE"),
         enable_delete_only_fallback=flag("ENABLE_DELETE_ONLY_FALLBACK", "1"),
+        # DEFAULT ON: the non-destructive forced-compile fallback (neutralise-not-delete) runs in
+        # place of delete-only. It takes precedence in the runner, so delete-only now only engages if
+        # this is explicitly disabled (ENABLE_FORCED_COMPILE_FALLBACK=0). Forced-compile preserves the
+        # code (compiles WITHOUT deletion) but its output is unfaithful -- classified
+        # "neutralised_compile", never "genuine".
+        enable_forced_compile_fallback=flag("ENABLE_FORCED_COMPILE_FALLBACK", "1"),
         enable_syntax_explanation=flag("ENABLE_SYNTAX_EXPLANATION", "1"),
         enable_whole_file_repair=flag("ENABLE_WHOLE_FILE_REPAIR"),
         use_local_llm=flag("USE_LOCAL_LLM", "True"),
