@@ -88,6 +88,12 @@ SEMANTIC_REPAIR_TOKEN_HEADROOM = _bounded_int_env("SEMANTIC_REPAIR_TOKEN_HEADROO
 SEMANTIC_DETERMINISTIC_OPERATORS = (
     os.getenv("SEMANTIC_DETERMINISTIC_OPERATORS", "0").strip().lower() in ("1", "true", "yes", "on")
 )
+# Skip (defer) any file whose preflight surfaces a `<module>` (module-body) repair
+# target. Module-body repair is slow and rarely reaches file-perfect; deferring those
+# files frees workers for winnable ones. Off by default (no behavior change).
+SEMANTIC_SKIP_MODULE_BODY_REPAIR = (
+    os.getenv("SEMANTIC_SKIP_MODULE_BODY_REPAIR", "0").strip().lower() in ("1", "true", "yes", "on")
+)
 # Resume: skip any dataset row whose result.json already exists (re-emit its CSV row from cache).
 # Makes a multi-day 3000-file run crash-safe — a reboot resumes instead of restarting from scratch.
 SEMANTIC_RESUME = os.getenv("SEMANTIC_RESUME", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -2560,6 +2566,11 @@ def _semantic_repair_preflight(gt_pyc: Path, derived_pyc: Path) -> dict[str, Any
     }
 
 
+def _preflight_has_module_body_target(preflight: dict[str, Any] | None) -> bool:
+    """True if preflight surfaces a `<module>` (module-body) repair target."""
+    return "<module>" in (preflight or {}).get("repair_targets", [])
+
+
 def _preflight_defer_reason(
     preflight: dict[str, Any],
     *,
@@ -2723,6 +2734,7 @@ def run_dataset_repair_loop(
     sample_timeout_min_improvement_delta: int = SEMANTIC_REPAIR_TIMEOUT_MIN_IMPROVEMENT_DELTA,
     defer_preflight_risky_samples: bool = False,
     defer_timeout_no_improvement: bool = False,
+    skip_module_body_repair: bool = SEMANTIC_SKIP_MODULE_BODY_REPAIR,
     process_easy_cases_first: bool = False,
     preflight_max_repair_targets: int | None = SEMANTIC_REPAIR_PREFLIGHT_MAX_REPAIR_TARGETS,
     preflight_max_initial_combined_distance: int | None = SEMANTIC_REPAIR_PREFLIGHT_MAX_INITIAL_COMBINED_DISTANCE,
@@ -2769,6 +2781,7 @@ def run_dataset_repair_loop(
             "sample_timeout_min_improvement_delta": sample_timeout_min_improvement_delta,
             "defer_preflight_risky_samples": defer_preflight_risky_samples,
             "defer_timeout_no_improvement": defer_timeout_no_improvement,
+            "skip_module_body_repair": skip_module_body_repair,
             "process_easy_cases_first": process_easy_cases_first,
             "preflight_max_repair_targets": preflight_max_repair_targets,
             "preflight_max_initial_combined_distance": preflight_max_initial_combined_distance,
@@ -2893,6 +2906,43 @@ def run_dataset_repair_loop(
                     )
                     failed += 1
                     continue
+
+                if skip_module_body_repair:
+                    if preflight is None:
+                        preflight = _semantic_repair_preflight(gt_pyc, derived_pyc)
+                    if _preflight_has_module_body_target(preflight):
+                        defer_reason = "module_body repair target (<module>) present"
+                        deferred_row = _dataset_deferred_row(
+                            row,
+                            gt_pyc,
+                            derived_pyc,
+                            derived_source,
+                            defer_stage="module_body_repair",
+                            defer_reason=defer_reason,
+                            preflight=preflight,
+                            sample_timeout_seconds=sample_timeout_seconds,
+                            sample_hard_timeout_seconds=sample_hard_timeout_seconds,
+                            sample_timeout_min_improvement_delta=sample_timeout_min_improvement_delta,
+                        )
+                        deferred_writer.writerow(deferred_row)
+                        append_log(
+                            log_file,
+                            {
+                                "run_id": run_id,
+                                "timestamp": now_iso(),
+                                "mode": "semantic_repair",
+                                "stage": "deferred",
+                                "defer_policy": "module_body_repair",
+                                "preflight": preflight,
+                                **deferred_row,
+                            },
+                        )
+                        print(
+                            f"[semantic_repair] file_hash={row.file_hash} -> deferred: {defer_reason}",
+                            flush=True,
+                        )
+                        deferred += 1
+                        continue
 
                 if defer_preflight_risky_samples:
                     preflight = plan.get("preflight")
@@ -3112,6 +3162,7 @@ def run_dataset_repair_loop(
         "sample_timeout_min_improvement_delta": sample_timeout_min_improvement_delta,
         "defer_preflight_risky_samples": defer_preflight_risky_samples,
         "defer_timeout_no_improvement": defer_timeout_no_improvement,
+        "skip_module_body_repair": skip_module_body_repair,
         "process_easy_cases_first": process_easy_cases_first,
         "preflight_max_repair_targets": preflight_max_repair_targets,
         "preflight_max_initial_combined_distance": preflight_max_initial_combined_distance,
@@ -3214,6 +3265,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "In dataset mode, write timeout-without-improvement samples to "
             "semantic_repair_deferred_*.csv instead of the main results CSV."
+        ),
+    )
+    parser.add_argument(
+        "--skip-module-body-repair",
+        action="store_true",
+        default=SEMANTIC_SKIP_MODULE_BODY_REPAIR,
+        help=(
+            "In dataset mode, defer any file whose preflight surfaces a <module> (module-body) "
+            "repair target to semantic_repair_deferred_*.csv instead of processing it. "
+            "Defaults to the SEMANTIC_SKIP_MODULE_BODY_REPAIR env flag."
         ),
     )
     parser.add_argument(
@@ -3326,6 +3387,7 @@ def main() -> int:
             sample_timeout_min_improvement_delta=args.sample_timeout_min_improvement_delta,
             defer_preflight_risky_samples=args.defer_preflight_risky_samples,
             defer_timeout_no_improvement=args.defer_timeout_no_improvement,
+            skip_module_body_repair=args.skip_module_body_repair,
             process_easy_cases_first=args.process_easy_cases_first,
             preflight_max_repair_targets=args.preflight_max_repair_targets,
             preflight_max_initial_combined_distance=args.preflight_max_initial_combined_distance,
