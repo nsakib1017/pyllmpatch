@@ -97,3 +97,32 @@ The driver is a pure state machine over a fake handoff directory:
 - Not replacing the local-Qwen path; this is an alternative fixer backend.
 - Not automating the agent call itself — SendMessage belongs to the driving session, so
   the driver exposes prompts and the session relays them.
+
+## Amendment (2026-08-02): durable persistence + module repair
+
+Two requirements added after the first build:
+
+### 1. Module repairs ARE attempted (confirmed, add a guard)
+Single-case `semantic-repair` with `--llm-provider ClaudeAgent` DOES repair `<module>`
+targets (the smoke that reached perfect was a `<module>` target). The dataset-mode
+`SEMANTIC_SKIP_MODULE_BODY_REPAIR` skip does not apply here and MUST NOT be set by the
+driver. Add a regression test asserting the driver never sets that flag.
+
+### 2. Persist result + improved source + improved pyc under results/experiment_outputs
+Today `claude_serve` runs each file in an ephemeral work dir and copies only
+`result.json`+`prompts/` out — WITHOUT rewriting the paths inside `result.json`, so
+`final_source`/`final_pyc` point at deleted job-tmp (verified: `exists=False`). That is why
+95 claude_fixer files were unusable in the vLLM union.
+
+Fix: the driver runs each case with its pipeline output dir **directly under**
+`results/experiment_outputs/malware_agent_fixer/cases/<hash>/`, so `result.json`,
+`prompts/` (the improved `final_source`), `__pycache__/` (the improved `final_pyc`) and
+`derived.pyc` all persist with valid absolute paths — same durability as the union runs.
+On file completion the driver: (a) backfills `final_pyc` by compiling `final_source` at the
+file's version if the pyc is missing, and (b) appends a union-scan-compatible row to
+`malware_agent_fixer/run_index.jsonl` (`file_hash, python_version, gt_pyc, final_source,
+final_pyc, all_equal, final_combined_distance`). `init` gains an optional `results_root`
+(default the above) so tests stay hermetic.
+
+New tests: case dir resolves under results_root; harvest backfills a missing final_pyc;
+index row paths exist on disk; driver does not set the module-skip flag.
