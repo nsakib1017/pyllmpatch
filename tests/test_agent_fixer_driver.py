@@ -70,14 +70,14 @@ class PumpTest(unittest.TestCase):
         csvp = root / "t.csv"
         write_csv(csvp, rows or [("aaa", "3.12", 5)])
         work = root / "work"
-        mod.init(str(csvp), str(work))
+        mod.init(str(csvp), str(work), results_root=str(root / "res"))
         return mod, work
 
     def test_pump_surfaces_pending_request_as_prompt(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             mod, work = self._campaign(root)
-            handoff = work / "cases" / "aaa" / "handoff"
+            handoff = mod._case_dir(str(work), "aaa") / "handoff"
             handoff.mkdir(parents=True)
             (handoff / "req_7.json").write_text(json.dumps(
                 {"id": "7", "system": "SYS", "user": "USR"}))
@@ -94,7 +94,7 @@ class PumpTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             mod, work = self._campaign(root)
-            (work / "cases" / "aaa" / "handoff").mkdir(parents=True)
+            (mod._case_dir(str(work), "aaa") / "handoff").mkdir(parents=True)
             with patch.object(mod, "_launch_current", return_value=None), \
                  patch.object(mod, "_pipeline_alive", return_value=True):
                 out = mod.pump(str(work))
@@ -104,7 +104,7 @@ class PumpTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             mod, work = self._campaign(root)
-            handoff = work / "cases" / "aaa" / "handoff"
+            handoff = mod._case_dir(str(work), "aaa") / "handoff"
             handoff.mkdir(parents=True)
             (handoff / "req_7.json").write_text(json.dumps({"id": "7", "system": "S", "user": "U"}))
             frag = root / "fix.txt"
@@ -124,7 +124,7 @@ class PumpTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             mod, work = self._campaign(root, rows=[("aaa", "3.12", 5), ("bbb", "3.11", 9)])
-            (work / "cases" / "aaa" / "handoff").mkdir(parents=True)
+            (mod._case_dir(str(work), "aaa") / "handoff").mkdir(parents=True)
             with patch.object(mod, "_launch_current", return_value=None), \
                  patch.object(mod, "_pipeline_alive", return_value=False), \
                  patch.object(mod, "_harvest_current", return_value={"added": 3, "perfect": True}):
@@ -170,6 +170,86 @@ class LaunchMaxIterationsTest(unittest.TestCase):
                 cs.launch("/gt.pyc", "/s.py", "3.12", td, max_iterations=2)
             self.assertIn("--max-iterations", captured["cmd"])
             self.assertEqual(captured["cmd"][captured["cmd"].index("--max-iterations") + 1], "2")
+
+
+class PersistenceTest(unittest.TestCase):
+    def test_case_dir_resolves_under_results_root(self):
+        mod = load_driver()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            csvp = root / "t.csv"
+            write_csv(csvp, [("aaa", "3.12", 5)])
+            work = root / "work"
+            res = root / "results" / "malware_agent_fixer"
+            mod.init(str(csvp), str(work), results_root=str(res))
+            case = mod._case_dir(str(work), "aaa")
+            self.assertTrue(str(case).startswith(str(res)))
+            self.assertIn("aaa", str(case))
+
+    def test_launch_does_not_skip_module_body_repair(self):
+        mod = load_driver()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            csvp = root / "t.csv"
+            write_csv(csvp, [("aaa", "3.12", 5)])
+            work = root / "work"
+            mod.init(str(csvp), str(work), results_root=str(root / "res"))
+            entry = json.loads((work / "campaign.json").read_text())["files"][0]
+            os.environ.pop("SEMANTIC_SKIP_MODULE_BODY_REPAIR", None)
+            captured = {}
+
+            def fake_launch(gt, src, ver, wd, max_iterations=1):
+                captured["skip"] = os.environ.get("SEMANTIC_SKIP_MODULE_BODY_REPAIR")
+                captured["det"] = os.environ.get("SEMANTIC_DETERMINISTIC_OPERATORS")
+
+            import claude_serve
+            with patch.object(claude_serve, "launch", side_effect=fake_launch):
+                mod._launch_current(str(work), entry)
+            # module repairs must be attempted -> the skip flag is never turned on
+            self.assertNotIn(captured.get("skip"), ("1", "true", "yes", "on"))
+            self.assertEqual(captured.get("det"), "true")
+
+    def test_harvest_backfills_missing_final_pyc_and_writes_valid_index(self):
+        mod = load_driver()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            csvp = root / "t.csv"
+            write_csv(csvp, [("aaa", "3.12", 5)])
+            work = root / "work"
+            res = root / "res"
+            mod.init(str(csvp), str(work), results_root=str(res))
+            entry = json.loads((work / "campaign.json").read_text())["files"][0]
+            case = mod._case_dir(str(work), "aaa")
+            case.mkdir(parents=True)
+            final_src = case / "prompts" / "step1_cand0.py"
+            final_src.parent.mkdir(parents=True)
+            final_src.write_text("x = 1\n")
+            gone_pyc = case / "prompts" / "__pycache__" / "missing.pyc"  # recorded but absent
+            (case / "result.json").write_text(json.dumps({
+                "final_source": str(final_src),
+                "final_pyc": str(gone_pyc),
+                "gt_pyc": "/gt/aaa.pyc",
+                "target_python_version": "3.12",
+                "final_summary": {"combined_distance": 0, "all_equal": True},
+                "pylingual_verification": {"all_equal": True},
+                "steps": [{"accepted": True}],
+            }))
+
+            def fake_compile(src, out, ver):
+                Path(out).write_bytes(b"PYC")
+
+            with patch("utils.generate_bytecode.compile_version", side_effect=fake_compile), \
+                 patch.object(__import__("claude_serve"), "harvest", return_value=None):
+                out = mod._harvest_current(str(work), entry)
+
+            self.assertTrue(out["perfect"])
+            idx = res / "run_index.jsonl"
+            self.assertTrue(idx.exists())
+            row = json.loads(idx.read_text().splitlines()[-1])
+            self.assertEqual(row["file_hash"], "aaa")
+            self.assertTrue(row["all_equal"])
+            self.assertTrue(Path(row["final_source"]).exists())
+            self.assertTrue(Path(row["final_pyc"]).exists())   # backfilled
 
 
 if __name__ == "__main__":
