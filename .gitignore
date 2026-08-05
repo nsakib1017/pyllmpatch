@@ -15,7 +15,6 @@ unsloth_compiled_cache
 pylingual
 .codex
 .claude
-CLAUDE.local.md
 .cursor
 .cursor-cache
 *.agent.json
@@ -48,16 +47,4 @@ malware-meta
 tests
 docs
 
-# Not required to launch the pipeline (main.py syntactic-repair / semantic-repair).
-# Untracked 2026-08-03; files remain on disk. Verified: the remaining 68 tracked
-# files import cleanly and both subcommands run standalone.
 finetuning/
-utils/dataset_helpers/
-utils/chunk_helpers.py
-utils/compare_cfg_heuristic_vs_ged.py
-utils/evaluate_semantic_action_pattern_retrieval.py
-utils/indentation_fixer.py
-utils/mine_semantic_repair_actions.py
-utils/prune_pyllmpatch_directories.py
-utils/rebuild_semantic_prompt_refresh_dataset.py
-utils/run_pyllmpatch_semantic_distance.py
