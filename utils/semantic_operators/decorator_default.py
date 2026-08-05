@@ -1,0 +1,390 @@
+from __future__ import annotations
+
+import ast
+import textwrap
+
+from utils.semantic_operators import opcode_families
+from utils.semantic_operators.leaf import _instructions, _round_trips
+
+# MAKE_FUNCTION oparg flag bits (CPython 3.10-3.12).
+_FLAG_DEFAULTS = 0x01      # a tuple of positional defaults on the stack
+_FLAG_KWDEFAULTS = 0x02    # a dict of keyword-only defaults
+_FLAG_ANNOTATIONS = 0x04   # annotations
+_FLAG_CLOSURE = 0x08       # a tuple of cells (closure)
+
+_STORE_OPCODES = {"STORE_NAME", "STORE_FAST", "STORE_GLOBAL", "STORE_DEREF"}
+_CALL_OPCODES = {"CALL", "CALL_FUNCTION", "CALL_METHOD", "CALL_FUNCTION_EX"}
+# additive union with the version-agnostic local-load family (adds 3.14+ LOAD_FAST_BORROW etc.)
+_NAME_LOAD_OPCODES = {"LOAD_NAME", "LOAD_GLOBAL", "LOAD_DEREF", "LOAD_FAST", "LOAD_CLASSDEREF"} | opcode_families.LOCAL_LOAD_OPS
+_ATTR_LOAD_OPCODES = {"LOAD_ATTR", "LOAD_METHOD"}
+
+
+def _argint(ins):
+    a = getattr(ins, "arg", None)
+    if isinstance(a, int):
+        return a
+    v = getattr(ins, "argval", None)
+    return v if isinstance(v, int) else 0
+
+
+def _clean_ident(text) -> str | None:
+    if text is None:
+        return None
+    s = str(text).strip()
+    if s.startswith("NULL + "):
+        s = s[len("NULL + "):].strip()
+    if s.startswith("NULL|"):
+        s = s.split("|", 1)[1].strip()
+    return s if s.isidentifier() else None
+
+
+def _name_of(ins) -> str | None:
+    v = getattr(ins, "argval", None)
+    if isinstance(v, str):
+        c = _clean_ident(v)
+        if c is not None:
+            return c
+    return _clean_ident(getattr(ins, "argrepr", None))
+
+
+def _is_code_object(value) -> bool:
+    return hasattr(value, "co_argcount") and hasattr(value, "co_varnames")
+
+
+class _DefSite:
+    __slots__ = ("name", "flags", "codeobj", "defaults", "defaults_ok",
+                 "decorator", "decorator_count", "clean")
+
+    def __init__(self, name, flags, codeobj):
+        self.name = name
+        self.flags = flags
+        self.codeobj = codeobj
+        self.defaults = None          # recovered const tuple of positional defaults (or None)
+        self.defaults_ok = False      # True iff a clean const-tuple defaults was recovered
+        self.decorator = None         # recovered decorator expression string (or None)
+        self.decorator_count = 0      # number of decorator-application CALLs after MAKE_FUNCTION
+        self.clean = True             # False if the region was too tangled to interpret
+
+
+def _decorator_expr_before(seq: list, code_idx: int) -> str | None:
+    k = code_idx - 1
+    attrs: list[str] = []
+    while k >= 0 and getattr(seq[k], "opname", None) in _ATTR_LOAD_OPCODES:
+        a = _name_of(seq[k])
+        if a is None:
+            return None
+        attrs.append(a)
+        k -= 1
+    if k < 0 or getattr(seq[k], "opname", None) not in _NAME_LOAD_OPCODES:
+        return None
+    base = _name_of(seq[k])
+    if base is None:
+        return None
+    parts = [base] + list(reversed(attrs))
+    expr = ".".join(parts)
+    # Validate the expression is a clean Name / dotted-Attribute (never a call/subscript).
+    try:
+        node = ast.parse(expr, mode="eval").body
+    except SyntaxError:
+        return None
+    cur = node
+    while isinstance(cur, ast.Attribute):
+        cur = cur.value
+    if not isinstance(cur, ast.Name):
+        return None
+    return expr
+
+
+def _def_sites(insts: list) -> dict[str, _DefSite]:
+    seq = [i for i in insts if getattr(i, "opname", None) not in (None, "CACHE")]
+    sites: dict[str, _DefSite] = {}
+    for idx, ins in enumerate(seq):
+        if getattr(ins, "opname", None) != "MAKE_FUNCTION":
+            continue
+        if idx == 0:
+            continue
+        code_ins = seq[idx - 1]
+        if getattr(code_ins, "opname", None) != "LOAD_CONST":
+            continue
+        codeobj = getattr(code_ins, "argval", None)
+        if not _is_code_object(codeobj):
+            continue
+        flags = _argint(ins)
+
+        # Walk MAKE_FUNCTION -> STORE, counting decorator-application CALLs and folding in any
+        # SET_FUNCTION_ATTRIBUTE bits (3.13+ applies defaults/annotations/etc. via these ops
+        # AFTER make_function instead of via the flags arg). Anything else in between (a nested
+        # expr, a def used as an argument) makes this site un-interpretable.
+        j = idx + 1
+        store_name = None
+        decorator_count = 0
+        clean = True
+        while j < len(seq):
+            op = getattr(seq[j], "opname", None)
+            if op == "SET_FUNCTION_ATTRIBUTE":
+                flags |= _argint(seq[j])   # unify 3.13+ form into the same flag bits
+                j += 1
+                continue
+            if op in _CALL_OPCODES:
+                decorator_count += 1
+                j += 1
+                continue
+            if op in _STORE_OPCODES:
+                store_name = _name_of(seq[j])
+                break
+            clean = False
+            break
+        if store_name is None:
+            continue
+
+        site = _DefSite(store_name, flags, codeobj)
+        site.decorator_count = decorator_count
+        site.clean = clean
+
+        # DEFAULTS recovery. Function attributes are pushed below the code load in bit order
+        # (defaults 0x01, kwdefaults 0x02, annotations 0x04, closure 0x08), so the positional
+        # defaults tuple — when present — is the BOTTOM-most attribute slot, at
+        # ``code_idx - popcount(flags)``. This holds for BOTH the <=3.12 flags-arg form and the
+        # 3.13+ SET_FUNCTION_ATTRIBUTE form (values are still loaded before the code). Recover
+        # only when every attribute slot is a plain LOAD_CONST and the defaults slot is a tuple;
+        # any multi-instruction attribute (e.g. a BUILD_TUPLE annotation) can't be positively
+        # located, so we defer. The oracle gate is the final backstop.
+        if flags & _FLAG_DEFAULTS:
+            n_attrs = bin(flags & 0x0F).count("1")
+            code_idx = idx - 1
+            first = code_idx - n_attrs
+            if first >= 0 and all(
+                getattr(seq[k], "opname", None) == "LOAD_CONST"
+                for k in range(first, code_idx)
+            ):
+                defaults_val = getattr(seq[first], "argval", None)
+                if isinstance(defaults_val, tuple):
+                    site.defaults = defaults_val
+                    site.defaults_ok = True
+
+        # DECORATOR recovery: a single decorator, no other MAKE_FUNCTION attributes (flags == 0)
+        # so the pre-code region is purely the decorator load(s).
+        if flags == 0 and decorator_count == 1 and clean:
+            site.decorator = _decorator_expr_before(seq, idx - 1)
+
+        if store_name in sites:
+            sites[store_name].clean = False  # duplicate name -> ambiguous
+        else:
+            sites[store_name] = site
+    return sites
+
+
+def _positional_params(fn: ast.AST) -> list[ast.arg]:
+    args = fn.args
+    return list(getattr(args, "posonlyargs", [])) + list(args.args)
+
+
+def _unique_funcdef(tree: ast.AST, name: str) -> ast.AST | None:
+    matches = [
+        n for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _line_maps(fragment: str):
+    orig = fragment.splitlines(keepends=True)
+    dedented = textwrap.dedent(fragment)
+    ded = dedented.splitlines(keepends=True)
+    return orig, dedented, ded
+
+
+def _orig_col(orig: list, ded: list, lineno: int, ded_col: int) -> int | None:
+    li = lineno - 1
+    if li < 0 or li >= len(orig) or li >= len(ded):
+        return None
+    if not orig[li].isascii() or not ded[li].isascii():
+        return None
+    return ded_col + (len(orig[li]) - len(ded[li]))
+
+
+def _apply_default_edits(fragment: str, fn: ast.AST, targets: list[tuple[ast.arg, str]]) -> str | None:
+    orig, _dedented, ded = _line_maps(fragment)
+    edits: list[tuple[int, int, str]] = []
+    for arg, rhs in targets:
+        li = (arg.end_lineno or 0) - 1
+        col = _orig_col(orig, ded, arg.end_lineno, arg.end_col_offset)
+        if col is None or li < 0 or li >= len(orig):
+            return None
+        edits.append((li, col, f"={rhs}"))
+    lines = list(orig)
+    for li, col, text in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
+        line = lines[li]
+        if col > len(line):
+            return None
+        lines[li] = line[:col] + text + line[col:]
+    return "".join(lines)
+
+
+def _apply_decorator_edit(fragment: str, fn: ast.AST, expr: str) -> str | None:
+    orig, _dedented, ded = _line_maps(fragment)
+    li = (fn.lineno or 0) - 1
+    if li < 0 or li >= len(orig):
+        return None
+    def_line = orig[li]
+    indent = def_line[:len(def_line) - len(def_line.lstrip())]
+    new_line = f"{indent}@{expr}\n"
+    lines = list(orig)
+    lines.insert(li, new_line)
+    return "".join(lines)
+
+
+def _default_candidate(gt_site: _DefSite, der_site: _DefSite, tree: ast.AST,
+                       fragment: str) -> dict | None:
+    if not gt_site.defaults_ok or gt_site.defaults is None:
+        return None
+    if der_site.flags & _FLAG_DEFAULTS:
+        return None  # derived already has positional defaults; not a clean "dropped" case
+    # The sole difference must be the positional-defaults bit.
+    if gt_site.flags != (der_site.flags | _FLAG_DEFAULTS):
+        return None
+
+    defaults = gt_site.defaults
+    if not defaults:
+        return None
+    # Every default value must round-trip so we re-emit it verbatim.
+    rendered: list[str] = []
+    for value in defaults:
+        if not _round_trips(value):
+            return None
+        rhs = repr(value)
+        try:
+            if ast.literal_eval(rhs) != value:
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+        rendered.append(rhs)
+
+    fn = _unique_funcdef(tree, gt_site.name)
+    if fn is None:
+        return None
+    # No positional param may already carry a default in the derived def.
+    if fn.args.defaults:
+        return None
+    positional = _positional_params(fn)
+    argcount = getattr(gt_site.codeobj, "co_argcount", None)
+    if argcount is None or len(positional) != argcount:
+        return None
+    # Parameter names must match GT's positional varnames (strong alignment).
+    gt_names = list(getattr(gt_site.codeobj, "co_varnames", ()))[:argcount]
+    if [p.arg for p in positional] != gt_names:
+        return None
+    k = len(defaults)
+    if k > len(positional):
+        return None
+    target_params = positional[len(positional) - k:]
+    targets = list(zip(target_params, rendered))
+
+    new_fragment = _apply_default_edits(fragment, fn, targets)
+    if new_fragment is None or new_fragment == fragment:
+        return None
+    try:
+        ast.parse(textwrap.dedent(new_fragment))
+    except SyntaxError:
+        return None
+
+    preview = ", ".join(f"{p.arg}={r}" for p, r in targets)
+    if len(preview) > 60:
+        preview = preview[:57] + "..."
+    return {
+        "text": new_fragment,
+        "operator": f"restore default(s) {gt_site.name}({preview})",
+        "opname": "MAKE_FUNCTION",
+        "kind": "decorator_default",
+        "confidence": "unique",
+    }
+
+
+def _decorator_candidate(gt_site: _DefSite, der_site: _DefSite, tree: ast.AST,
+                         fragment: str) -> dict | None:
+    if gt_site.decorator is None or gt_site.decorator_count != 1:
+        return None
+    if der_site.decorator_count != 0:
+        return None
+    # Pure decorator difference: no default/annotation/closure entanglement on either side.
+    if gt_site.flags != 0 or der_site.flags != 0:
+        return None
+
+    fn = _unique_funcdef(tree, gt_site.name)
+    if fn is None:
+        return None
+    if getattr(fn, "decorator_list", None):
+        return None  # derived def already decorated; not a clean "dropped" case
+
+    new_fragment = _apply_decorator_edit(fragment, fn, gt_site.decorator)
+    if new_fragment is None or new_fragment == fragment:
+        return None
+    try:
+        ast.parse(textwrap.dedent(new_fragment))
+    except SyntaxError:
+        return None
+
+    return {
+        "text": new_fragment,
+        "operator": f"restore decorator @{gt_site.decorator} on {gt_site.name}",
+        "opname": "MAKE_FUNCTION",
+        "kind": "decorator_default",
+        "confidence": "unique",
+    }
+
+
+def decorator_default_candidate(gt_code_object, derived_code_object, fragment: str,
+                                repair_context: dict | None) -> dict | None:
+    try:
+        return _decorator_default_candidate(gt_code_object, derived_code_object, fragment, repair_context)
+    except Exception:  # noqa: BLE001 - a bad candidate is rejected by the oracle gate; a
+        # raised exception would crash the repair loop, so swallow everything.
+        return None
+
+
+def _decorator_default_candidate(gt_code_object, derived_code_object, fragment: str, repair_context: dict | None) -> dict | None:
+    if not repair_context:
+        return None
+    failed = repair_context.get("pylingual_failed_result") or {}
+    if failed.get("message") != "Different bytecode":
+        return None
+
+    gt = _instructions(gt_code_object)
+    der = _instructions(derived_code_object)
+    if not gt:
+        return None
+
+    gt_sites = _def_sites(gt)
+    der_sites = _def_sites(der)
+    if not gt_sites:
+        return None
+
+    try:
+        tree = ast.parse(textwrap.dedent(fragment))
+    except SyntaxError:
+        return None
+
+    # Collect every name that diverges in a repairable way. Unique-or-defer: exactly one
+    # candidate across BOTH regimes may apply.
+    candidates: list[dict] = []
+    for name, gt_site in gt_sites.items():
+        if not gt_site.clean:
+            continue
+        der_site = der_sites.get(name)
+        if der_site is None or not der_site.clean:
+            continue
+        cand = _default_candidate(gt_site, der_site, tree, fragment)
+        if cand is not None:
+            candidates.append(cand)
+        cand = _decorator_candidate(gt_site, der_site, tree, fragment)
+        if cand is not None:
+            candidates.append(cand)
+
+    if not candidates:
+        return None
+    # Multiple diverging functions: fix ONE — the first in bytecode/source order (gt_sites is
+    # insertion-ordered, candidates appended in that order) — and defer the rest. The prepass
+    # loops to a fixpoint and re-invokes on the residual, so all get restored across
+    # iterations, each independently oracle-gated. (Previously any multi-divergence deferred
+    # entirely, so files where several functions dropped defaults were never repaired.)
+    return candidates[0]

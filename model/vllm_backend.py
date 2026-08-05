@@ -1,0 +1,146 @@
+from __future__ import annotations
+
+import os
+from typing import Any
+
+
+class VllmUnavailable(RuntimeError):
+    pass
+
+
+def select_inference_backend() -> str:
+    value = os.getenv("SEMANTIC_LLM_ENGINE", "hf").strip().lower()
+    return "vllm" if value == "vllm" else "hf"
+
+
+def _int_or(config: dict, key: str, default: int) -> int:
+    try:
+        return int(config.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_or_none(config: dict, key: str) -> float | None:
+    if config.get(key) is None:
+        return None
+    try:
+        return float(config[key])
+    except (TypeError, ValueError):
+        return None
+
+
+def build_sampling_params(generation_config: dict[str, Any] | None, max_tokens: int) -> dict:
+    config = dict(generation_config or {})
+    max_tokens = int(max_tokens)
+    new_tokens = min(max_tokens, _int_or(config, "max_new_tokens", min(max_tokens, 2048)))
+
+    params: dict[str, Any] = {"max_tokens": new_tokens}
+    do_sample = bool(config.get("do_sample", False))
+    if not do_sample:
+        params["temperature"] = 0.0
+        # Forward repetition_penalty for greedy too (temperature 0.0 + penalty stays
+        # deterministic but breaks decode repetition loops) -- the server transport
+        # otherwise silently drops it on the greedy candidate.
+        greedy_rep = _float_or_none(config, "repetition_penalty")
+        if greedy_rep is not None:
+            params["repetition_penalty"] = greedy_rep
+        return params
+
+    temperature = _float_or_none(config, "temperature")
+    params["temperature"] = temperature if temperature is not None else 1.0
+    top_p = _float_or_none(config, "top_p")
+    if top_p is not None:
+        params["top_p"] = top_p
+    top_k = config.get("top_k")
+    params["top_k"] = _int_or(config, "top_k", -1) if top_k is not None else -1
+    repetition_penalty = _float_or_none(config, "repetition_penalty")
+    if repetition_penalty is not None:
+        params["repetition_penalty"] = repetition_penalty
+    return params
+
+
+def is_vllm_available() -> bool:
+    try:
+        import vllm  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+# --- Engine load + generate (GPU; import-guarded; covered by the deferred smoke test) ------
+_ENGINE = None
+_ENGINE_KEY = None
+
+
+def _gpu_memory_fraction() -> float:
+    try:
+        return float(os.getenv("SEMANTIC_VLLM_GPU_MEM_FRACTION", "0.6"))
+    except (TypeError, ValueError):
+        return 0.6
+
+
+def _int_env(name: str, default):
+    val = os.getenv(name)
+    if val is None or val.strip() == "":
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
+def load_vllm_once(model_path: str, max_model_len: int):
+    global _ENGINE, _ENGINE_KEY
+    key = (str(model_path), int(max_model_len))
+    if _ENGINE is not None and _ENGINE_KEY == key:
+        return _ENGINE
+    if not is_vllm_available():
+        raise VllmUnavailable("vllm is not installed")
+    try:
+        from vllm import LLM
+
+        # On the unified-memory GB10 the 61GB MoE leaves little headroom; bound the KV-cache
+        # profiling forward-pass (max_num_batched_tokens) and concurrent sequences (max_num_seqs)
+        # so the transient profiling peak can't exhaust system RAM. All env-tunable.
+        kwargs = dict(
+            model=str(model_path),
+            dtype="bfloat16",
+            gpu_memory_utilization=_gpu_memory_fraction(),
+            max_model_len=int(max_model_len),
+            max_num_seqs=_int_env("SEMANTIC_VLLM_MAX_NUM_SEQS", 8),
+            enforce_eager=os.getenv("SEMANTIC_VLLM_ENFORCE_EAGER", "false").strip().lower() in ("1", "true", "yes", "on"),
+            trust_remote_code=True,
+        )
+        # On this 121GB UNIFIED box the 57GB bf16 weights + ~45GB MoE forward working set do
+        # not fit. FP8 halves the weights (~28GB) so the model + KV cache fit with headroom.
+        # FP8 is near-lossless but NOT bit-identical -> callers MUST gate it behind a file-perfect
+        # parity check vs the HF path. Off unless SEMANTIC_VLLM_QUANTIZATION is set (e.g. "fp8").
+        _quant = os.getenv("SEMANTIC_VLLM_QUANTIZATION", "").strip()
+        if _quant:
+            kwargs["quantization"] = _quant
+        _mnbt = _int_env("SEMANTIC_VLLM_MAX_NUM_BATCHED_TOKENS", None)
+        if _mnbt is not None:
+            kwargs["max_num_batched_tokens"] = _mnbt
+        # Setting an explicit KV-cache size makes vLLM SKIP the memory-profiling dummy forward
+        # pass, whose transient activation spike (~45GB for this MoE) can't fit alongside the
+        # 57GB weights on the 121GB unified box. Bounds total memory deterministically.
+        _kv_gb = _int_env("SEMANTIC_VLLM_KV_CACHE_GB", None)
+        if _kv_gb is not None:
+            kwargs["kv_cache_memory_bytes"] = _kv_gb * (1024 ** 3)
+        engine = LLM(**kwargs)
+    except Exception as exc:  # pragma: no cover - requires GPU
+        raise VllmUnavailable(f"could not construct vLLM engine: {exc}") from exc
+    _ENGINE, _ENGINE_KEY = engine, key
+    return engine
+
+
+def vllm_generate(*, messages, model_path, max_tokens, tokenizer_path=None, generation_config=None) -> str:  # pragma: no cover - requires GPU
+    from vllm import SamplingParams
+    from transformers import AutoTokenizer
+
+    engine = load_vllm_once(model_path, max_model_len=int(max_tokens))
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path or model_path, trust_remote_code=True)
+    prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    sampling = SamplingParams(**build_sampling_params(generation_config, max_tokens))
+    outputs = engine.generate([prompt], sampling)
+    return outputs[0].outputs[0].text.strip()
